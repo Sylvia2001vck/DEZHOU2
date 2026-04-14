@@ -19,14 +19,21 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(asio)
 
-# WebSocket++：使用系统头文件（apt: libwebsocketpp-dev）。FetchContent 拉取的版本在部分环境下易与 GCC/宏污染冲突。
-find_path(
-  WEBSOCKETPP_INCLUDE_DIR
-  NAMES websocketpp/server.hpp
-  DOC "Path to WebSocket++ headers (parent of the websocketpp/ directory)"
-)
-if(NOT WEBSOCKETPP_INCLUDE_DIR)
-  message(FATAL_ERROR "WebSocket++ headers not found. Install: sudo apt install libwebsocketpp-dev")
+# WebSocket++：Ubuntu jammy 的 libwebsocketpp-dev 多为 0.8.2，在 GCC 11+ 下与部分头/宏组合会解析失败。
+# 默认从 GitHub 拉取 master（或设 extern/websocketpp 离线使用）。
+set(_WSPP_LOCAL "${CMAKE_CURRENT_SOURCE_DIR}/extern/websocketpp")
+if(EXISTS "${_WSPP_LOCAL}/websocketpp/server.hpp")
+  set(WEBSOCKETPP_ROOT "${_WSPP_LOCAL}")
+  message(STATUS "WebSocket++: using local ${_WSPP_LOCAL}")
+else()
+  FetchContent_Declare(
+    websocketpp
+    GIT_REPOSITORY https://github.com/zaphoyd/websocketpp.git
+    GIT_TAG master
+  )
+  FetchContent_MakeAvailable(websocketpp)
+  set(WEBSOCKETPP_ROOT "${websocketpp_SOURCE_DIR}")
+  message(STATUS "WebSocket++: FetchContent from GitHub master -> ${WEBSOCKETPP_ROOT}")
 endif()
 
 find_package(Threads REQUIRED)
@@ -70,7 +77,7 @@ target_include_directories(
     ${CMAKE_CURRENT_BINARY_DIR}/proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${asio_SOURCE_DIR}/asio/include
-    ${WEBSOCKETPP_INCLUDE_DIR}
+    ${WEBSOCKETPP_ROOT}
 )
 
 target_compile_definitions(

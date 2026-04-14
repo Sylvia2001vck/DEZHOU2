@@ -5,5 +5,8 @@ build/
 *.o
 bin/
 
+# Optional local WebSocket++ clone (see backend-cpp CMakeLists.txt)
+backend-cpp/extern/
+
 # Large local asset — not tracked (use CDN or manual copy on server)
 assets/ifcan.mp3
