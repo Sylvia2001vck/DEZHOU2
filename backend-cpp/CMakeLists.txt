@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NebulaPatchWebSocketPP.cmake")
 include(FetchContent)
 
 option(NEBULA_ENABLE_MYSQL "Enable MySQL-backed user persistence" ON)
@@ -39,6 +40,9 @@ else()
   set(WEBSOCKETPP_ROOT "${websocketpp_SOURCE_DIR}")
   message(STATUS "WebSocket++: FetchContent Populate (headers only) -> ${WEBSOCKETPP_ROOT}")
 endif()
+
+# 必须在 unistd.h 再次 #define access 之后仍生效：对头文件打补丁（-Uaccess 单独不够）。
+nebula_patch_websocketpp_headers("${WEBSOCKETPP_ROOT}")
 
 find_package(Threads REQUIRED)
 
