@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
-POSIX unistd.h #defines `access` (and sometimes collides with `error` / `value`).
-That breaks websocketpp/logger/levels.hpp:
+POSIX macros (access, error, basic, names, value) break websocketpp headers.
 
-  struct channel_type_hint {
-    typedef uint32_t value;
-    static value const access = 1;
-    static value const error = 2;
-  };
-
-core.hpp includes <websocketpp/logger/stub.hpp> before <.../basic.hpp>; stub.hpp
-uses channel_type_hint::value in constructors, so we also patch:
-  - config/core.hpp: undef right after the `// Loggers` line (before stub/basic includes)
-  - logger/stub.hpp: undef before namespace (after its #includes)
-  - logger/levels.hpp: undef immediately before `struct channel_type_hint`
+See NEBULA_POSIX_MACRO_UNDO_V6 in SNIPPET. basic.hpp needs TWO undef regions:
+  1) before the first `namespace websocketpp` (after this file's #includes)
+  2) immediately before `template ... class basic` — macros can be reintroduced
+     by includes pulled in before core.hpp includes this file, and GCC still
+     chokes on constructor/destructor names if `basic` is a macro.
 
 Requires: Python 3.6+.
 """
@@ -22,7 +15,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
-MARKER = "NEBULA_POSIX_MACRO_UNDO_V5"
+MARKER = "NEBULA_POSIX_MACRO_UNDO_V6"
+TEMPLATE_GUARD = "NEBULA_TEMPLATE_BASIC_GUARD"
 
 SNIPPET = """// {m}: POSIX macros break channel_type_hint::access/error/value and template name `basic`
 #undef access
@@ -33,8 +27,33 @@ SNIPPET = """// {m}: POSIX macros break channel_type_hint::access/error/value an
 
 """.format(m=MARKER)
 
+SNIPPET_BEFORE_TEMPLATE_BASIC = """// {tg}: repeat undef right before template class basic (macro may return)
+#undef access
+#undef error
+#undef value
+#undef basic
+#undef names
+
+""".format(tg=TEMPLATE_GUARD)
+
 # Older patch snippets (strip before re-applying)
 _STRIP_BLOCKS = (
+    # V5
+    """// NEBULA_POSIX_MACRO_UNDO_V5: POSIX macros break channel_type_hint::access/error/value and template name `basic`
+#undef access
+#undef error
+#undef value
+#undef basic
+#undef names
+
+""",
+    """// NEBULA_POSIX_MACRO_UNDO_V5: POSIX macros break channel_type_hint::access/error/value and template name `basic`
+#undef access
+#undef error
+#undef value
+#undef basic
+#undef names
+""",
     # V4
     """// NEBULA_POSIX_MACRO_UNDO_V4: POSIX macros break channel_type_hint::access/error/value and template name `basic`
 #undef access
@@ -90,6 +109,8 @@ _STRIP_BLOCKS = (
 def _strip_old(text: str) -> str:
     for b in _STRIP_BLOCKS:
         text = text.replace(b, "")
+    # remove second guard block from older runs if we change wording
+    text = text.replace(SNIPPET_BEFORE_TEMPLATE_BASIC, "")
     return text
 
 
@@ -112,7 +133,6 @@ def _insert_before_line_starting_with(text: str, line_prefix: str) -> str:
 
 
 def _insert_after_line_containing(text: str, line_substr: str) -> str:
-    """Insert SNIPPET after the first line that contains line_substr (e.g. '// Loggers')."""
     lines = text.splitlines(keepends=True)
     insert_at = None
     for i, line in enumerate(lines):
@@ -149,8 +169,56 @@ def _insert_before_first_namespace_websocketpp(text: str) -> str:
     return "".join(out)
 
 
+def _insert_before_template_class_basic(text: str) -> str:
+    """Insert SNIPPET_BEFORE_TEMPLATE_BASIC before `template ...` line that precedes `class basic`."""
+    lines = text.splitlines(keepends=True)
+    insert_at = None
+    for i in range(len(lines) - 1):
+        if lines[i].lstrip().startswith("template") and "class basic" in lines[i + 1]:
+            insert_at = i
+            break
+    if insert_at is None:
+        for i in range(1, len(lines)):
+            if "class basic" in lines[i] and "template" in lines[i - 1]:
+                insert_at = i - 1
+                break
+    if insert_at is None:
+        for i, line in enumerate(lines):
+            if "template" in line and "class basic" in line:
+                insert_at = i
+                break
+    if insert_at is None:
+        raise RuntimeError("template/class basic pair not found")
+
+    out = lines[:insert_at]
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    out.append("\n")
+    out.append(SNIPPET_BEFORE_TEMPLATE_BASIC)
+    out.extend(lines[insert_at:])
+    return "".join(out)
+
+
 def _patch_file(path: pathlib.Path, mode: str) -> bool:
     raw = path.read_text(encoding="utf-8")
+
+    if mode == "basic_hpp_twice":
+        # Idempotent: need both main marker and template guard.
+        if MARKER in raw and TEMPLATE_GUARD in raw:
+            print(f"skip (already {MARKER}+{TEMPLATE_GUARD}): {path}", file=sys.stderr)
+            return False
+
+        text = _strip_old(raw)
+
+        if MARKER not in text:
+            text = _insert_before_first_namespace_websocketpp(text)
+        if TEMPLATE_GUARD not in text:
+            text = _insert_before_template_class_basic(text)
+
+        path.write_text(text, encoding="utf-8")
+        print(f"patched: {path}", file=sys.stderr)
+        return True
+
     if MARKER in raw:
         print(f"skip (already {MARKER}): {path}", file=sys.stderr)
         return False
@@ -180,12 +248,11 @@ def main() -> int:
         print(f"ERROR: not a directory: {root}", file=sys.stderr)
         return 1
 
-    # Order matters for human readability only; each file is independent.
     jobs = (
         ("websocketpp/config/core.hpp", "after_loggers_in_core"),
         ("websocketpp/logger/levels.hpp", "before_struct_channel_type_hint"),
         ("websocketpp/logger/stub.hpp", "before_namespace"),
-        ("websocketpp/logger/basic.hpp", "before_namespace"),
+        ("websocketpp/logger/basic.hpp", "basic_hpp_twice"),
         ("websocketpp/endpoint.hpp", "before_namespace"),
         ("websocketpp/roles/server_endpoint.hpp", "before_namespace"),
     )
