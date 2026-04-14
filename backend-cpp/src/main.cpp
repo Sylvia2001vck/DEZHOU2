@@ -28,13 +28,15 @@
 #include <vector>
 
 #include <asio/steady_timer.hpp>
-// WebSocket++ must come before Protobuf: some transitive headers define macros that break
-// websocketpp/logger/basic.hpp. Also unistd.h may #define access — conflicts with param names.
-#ifdef access
+// POSIX <unistd.h> often #defines `access` — breaks websocketpp::log::channel_type_hint::access
+// Nested includes may re-introduce the macro between our headers; #undef before each WSPP include.
 #undef access
-#endif
 #include <websocketpp/config/asio_no_tls.hpp>
+#undef access
 #include <websocketpp/server.hpp>
+#undef access
+
+// WebSocket++ must come before Protobuf (some protobuf deps pollute macros).
 
 #include <google/protobuf/message.h>
 

@@ -102,5 +102,6 @@ target_link_libraries(
 if(MSVC)
   target_compile_options(nebula-poker-server PRIVATE /W4 /permissive-)
 else()
-  target_compile_options(nebula-poker-server PRIVATE -Wall -Wextra -Wpedantic)
+  # POSIX headers expose `access` as a macro; WebSocket++ uses channel_type_hint::access (enum).
+  target_compile_options(nebula-poker-server PRIVATE -Wall -Wextra -Wpedantic -Uaccess)
 endif()
