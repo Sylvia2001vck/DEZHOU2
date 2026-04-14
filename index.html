@@ -1002,7 +1002,7 @@
         </div>
     </div>
 
-    <audio id="bgm" src="assets/ifcan.mp3" loop preload="auto"></audio>
+    <audio id="bgm" src="assets/ifcan.mp3" loop preload="none" playsinline></audio>
 
     <div id="history-panel" class="panel">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -1687,6 +1687,10 @@
                 if (ctx.state === 'suspended') {
                     try { await ctx.resume(); } catch (_) {}
                 }
+                // Some browsers pause <audio> BGM when Web Audio starts; nudge BGM back if user left it on
+                try {
+                    if (typeof window.__nebulaResumeBgm === 'function') window.__nebulaResumeBgm();
+                } catch (_) {}
                 return ctx;
             };
 
@@ -2046,6 +2050,8 @@
             isProcessing: false, // 动作锁，防止快速重复触发
             processingSince: 0,  // 记录动作锁开始时间，用于watchdog兜底
             mpInitialized: false,
+            /** 当前牌桌圆柱半径（与 createTable/rebuildTable 一致），用于牌池筹码散落范围等 */
+            tableRadius: 7,
             mpHandNum: 0
         };
 
@@ -3229,6 +3235,23 @@
             el.style.display = 'block';
         }
 
+        /** 牌池筹码：圆心略小于半桌径；先偏中间，筹码多了再逐渐接近均匀圆盘往边上铺 */
+        function getPotChipEndPosition(stackIndex) {
+            const tr = (Number.isFinite(gameState.tableRadius) && gameState.tableRadius > 0)
+                ? gameState.tableRadius
+                : getDynamicTableRadius(Math.max(3, gameState.players?.length || 10));
+            const R_MAX = tr * 0.42;
+            const u = Math.random();
+            const theta = Math.random() * Math.PI * 2;
+            const densityFactor = Math.min(1, stackIndex / 42);
+            const pow = 2.35 * (1 - densityFactor) + 0.5 * densityFactor;
+            const r = R_MAX * Math.pow(u, pow);
+            const x = r * Math.cos(theta);
+            const z = r * Math.sin(theta);
+            const y = 0.022 + (stackIndex % 4) * 0.006 + Math.random() * 0.014;
+            return new THREE.Vector3(x, y, z);
+        }
+
         function animateBetToPot(seatIdx, text) {
             if (!IS_MULTIPLAYER) return;
             const upper = String(text || '').toUpperCase();
@@ -3247,10 +3270,7 @@
 
             for (let i = 0; i < chipCount; i++) {
                 const stackIndex = existingPotChips + i;
-                const slotIdx = Math.floor(stackIndex / 6);
-                const layerIdx = stackIndex % 6;
-                const target = getPotChipSlotPosition(slotIdx);
-                target.y += layerIdx * 0.028;
+                const target = getPotChipEndPosition(stackIndex);
 
                 const chip = new THREE.Mesh(
                     new THREE.CylinderGeometry(0.21, 0.21, 0.05, 24),
@@ -3268,8 +3288,8 @@
                 potChipFX.push(chip);
 
                 gsap.to(chip.position, {
-                    x: target.x + (Math.random() - 0.5) * 0.12,
-                    z: target.z + (Math.random() - 0.5) * 0.12,
+                    x: target.x,
+                    z: target.z,
                     y: target.y,
                     duration: 0.65 + Math.random() * 0.15,
                     ease: "power2.out",
@@ -3657,6 +3677,7 @@
 
             // 根据人数动态调整桌子/围坐半径，保证少人时更紧凑、更易看清牌桌
             const tableRadius = getDynamicTableRadius(totalActive);
+            gameState.tableRadius = tableRadius;
             const seatRadius = Math.max(4.4, tableRadius - 1.1);
             try { rebuildTable(tableRadius); } catch (_) {}
 
@@ -4944,34 +4965,6 @@
             return tex;
         }
 
-        function getPotChipSlotPosition(slotIdx = 0) {
-            const slots = [
-                new THREE.Vector3(-2.55, 0.045, -1.08),
-                new THREE.Vector3(-1.15, 0.045, -1.18),
-                new THREE.Vector3(0.35, 0.045, -1.14),
-                new THREE.Vector3(1.85, 0.045, -1.02),
-                new THREE.Vector3(2.55, 0.045, -0.12),
-                new THREE.Vector3(2.35, 0.045, 1.02),
-                new THREE.Vector3(0.95, 0.045, 1.18),
-                new THREE.Vector3(-0.55, 0.045, 1.18),
-                new THREE.Vector3(-2.05, 0.045, 1.04),
-                new THREE.Vector3(-2.65, 0.045, 0.08),
-                new THREE.Vector3(-2.05, 0.045, -0.32),
-                new THREE.Vector3(2.02, 0.045, 0.4),
-                new THREE.Vector3(-1.75, 0.045, -1.58),
-                new THREE.Vector3(1.65, 0.045, -1.56),
-                new THREE.Vector3(-1.55, 0.045, 1.56),
-                new THREE.Vector3(1.55, 0.045, 1.56)
-            ];
-            if (slotIdx < slots.length) return slots[slotIdx].clone();
-            const extra = slotIdx - slots.length;
-            const ring = Math.floor(extra / 8);
-            const angle = (extra % 8) / 8 * Math.PI * 2 + ring * 0.16;
-            const radiusX = 2.85 + ring * 0.42;
-            const radiusZ = 1.55 + ring * 0.28;
-            return new THREE.Vector3(Math.cos(angle) * radiusX, 0.045, Math.sin(angle) * radiusZ);
-        }
-
         function createFoldParticles(player) {
             try { SFX.fold(); } catch (_) {}
             player.meshCards.forEach(mesh => {
@@ -5057,10 +5050,7 @@
             const existingPotChips = potChipFX.length;
             for (let i = 0; i < chipCount; i++) {
                 const stackIndex = existingPotChips + i;
-                const slotIdx = Math.floor(stackIndex / 6);
-                const layerIdx = stackIndex % 6;
-                const target = getPotChipSlotPosition(slotIdx);
-                target.y += layerIdx * 0.028;
+                const target = getPotChipEndPosition(stackIndex);
                 const chip = new THREE.Mesh(
                     new THREE.CylinderGeometry(0.21, 0.21, 0.05, 24),
                     createTransientChipMaterial(p.id)
@@ -5075,9 +5065,9 @@
                 chipsGroup.add(chip);
                 potChipFX.push(chip);
                 gsap.to(chip.position, {
-                    x: target.x + (Math.random() - 0.5) * 0.14,
+                    x: target.x,
                     y: target.y,
-                    z: target.z + (Math.random() - 0.5) * 0.14,
+                    z: target.z,
                     duration: 0.65 + Math.random() * 0.12,
                     ease: "power2.out",
                     onComplete: () => {
@@ -5611,6 +5601,8 @@
                 const bgm = document.getElementById('bgm');
                 const bgmBtn = document.getElementById('bgm-toggle');
                 let bgmFadeTimer = null;
+                /** True after error event (missing file, 404, decode error) — do not auto-play or retry forever */
+                let bgmAssetMissing = false;
                 // Default ON (用户可手动关闭). Browsers may block audible autoplay, so we:
                 // 1) try normal play; 2) fallback to muted autoplay; 3) unmute on first user gesture.
                 const saved = localStorage.getItem('nebula_bgm') || 'on';
@@ -5619,9 +5611,65 @@
                 if (bgm) {
                     bgm.volume = 0;
                     bgm.muted = false;
+                    bgm.addEventListener('error', () => {
+                        bgmAssetMissing = true;
+                        try { bgm.pause(); } catch (_) {}
+                        try { clearInterval(bgmFadeTimer); } catch (_) {}
+                        console.warn('[bgm] asset missing or failed to load — BGM disabled');
+                        setLabel(false);
+                    }, { once: true });
                 }
+                window.__nebulaResumeBgm = () => {
+                    if (!bgm || bgmAssetMissing) return;
+                    if ((localStorage.getItem('nebula_bgm') || 'on') !== 'on') return;
+                    if (bgm.paused) {
+                        bgm.play().catch(() => {});
+                    }
+                };
+                /** 等待 play()；超时只放弃等待，绝不 pause（否则在部分浏览器里 play 的 Promise 晚于实际出声，5s 会误停正在播的 BGM） */
+                const playWithTimeout = (audio, ms = 15000) => {
+                    if (!audio || bgmAssetMissing) return Promise.reject(new Error('bgm-unavailable'));
+                    return new Promise((resolve, reject) => {
+                        let settled = false;
+                        const done = (fn) => { if (settled) return; settled = true; fn(); };
+                        const tid = setTimeout(() => {
+                            audio.removeEventListener('playing', onPlaying);
+                            done(() => reject(new Error('bgm-play-timeout')));
+                        }, ms);
+                        const onPlaying = () => {
+                            done(() => {
+                                clearTimeout(tid);
+                                audio.removeEventListener('playing', onPlaying);
+                                resolve();
+                            });
+                        };
+                        audio.addEventListener('playing', onPlaying, { once: true });
+                        const p = audio.play();
+                        if (p && typeof p.then === 'function') {
+                            p.then(() => {
+                                done(() => {
+                                    clearTimeout(tid);
+                                    audio.removeEventListener('playing', onPlaying);
+                                    resolve();
+                                });
+                            }).catch((e) => {
+                                done(() => {
+                                    clearTimeout(tid);
+                                    audio.removeEventListener('playing', onPlaying);
+                                    reject(e);
+                                });
+                            });
+                        } else {
+                            done(() => {
+                                clearTimeout(tid);
+                                audio.removeEventListener('playing', onPlaying);
+                                resolve();
+                            });
+                        }
+                    });
+                };
                 const fadeToVolume = (target = 0.32, durationMs = 1800) => {
-                    if (!bgm) return;
+                    if (!bgm || bgmAssetMissing) return;
                     try { clearInterval(bgmFadeTimer); } catch (_) {}
                     const start = Number.isFinite(bgm.volume) ? bgm.volume : 0;
                     const startedAt = Date.now();
@@ -5635,19 +5683,20 @@
                     }, 60);
                 };
                 const tryAutoPlay = async () => {
-                    if (!bgm) return;
+                    if (!bgm || bgmAssetMissing) return;
                     if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
                     try {
                         bgm.muted = false;
                         bgm.volume = 0;
-                        await bgm.play();
+                        await playWithTimeout(bgm, 5000);
                         fadeToVolume(0.32, 2400);
                         return;
                     } catch (_) {
+                        if (bgmAssetMissing) return;
                         // Audible autoplay likely blocked. Try muted autoplay.
                         try {
                             bgm.muted = true;
-                            await bgm.play();
+                            await playWithTimeout(bgm, 5000);
                             return;
                         } catch (e2) {
                             console.warn('[bgm] autoplay failed', e2);
@@ -5657,12 +5706,12 @@
                 // Always: on first user gesture, ensure audio is playing (no need to toggle Off->On).
                 const ensurePlayingOnGesture = async () => {
                     try {
-                        if (!bgm) return;
+                        if (!bgm || bgmAssetMissing) return;
                         if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
                         if (bgm.paused) {
                             bgm.muted = false;
                             bgm.volume = 0;
-                            await bgm.play();
+                            await playWithTimeout(bgm, 5000);
                             fadeToVolume(0.32, 1800);
                         } else if (bgm.muted) {
                             bgm.muted = false;
@@ -5677,6 +5726,10 @@
                 if (bgmBtn) {
                     bgmBtn.onclick = async () => {
                         if (!bgm) return;
+                        if (bgmAssetMissing) {
+                            console.warn('[bgm] no audio file');
+                            return;
+                        }
                         const wantOn = !(localStorage.getItem('nebula_bgm') === 'on');
                         localStorage.setItem('nebula_bgm', wantOn ? 'on' : 'off');
                         setLabel(wantOn);
@@ -5684,7 +5737,7 @@
                             if (wantOn) {
                                 bgm.muted = false;
                                 bgm.volume = 0;
-                                await bgm.play();
+                                await playWithTimeout(bgm, 8000);
                                 fadeToVolume(0.32, 1600);
                             } else {
                                 try { clearInterval(bgmFadeTimer); } catch (_) {}
@@ -5693,15 +5746,17 @@
                                 bgm.volume = 0;
                             }
                         } catch (e) {
-                            // Most common: autoplay blocked or codec unsupported
                             console.warn('[bgm] play failed', e);
-                            alert('BGM failed to play. If autoplay is blocked, tap once and try again.');
+                            if (e && e.message === 'bgm-play-timeout') {
+                                console.warn('[bgm] play timed out — leaving BGM off');
+                            }
                             localStorage.setItem('nebula_bgm', 'off');
                             setLabel(false);
+                            try { bgm.pause(); } catch (_) {}
                         }
                     };
                 }
-                // attempt autoplay on load (default ON)
+                // attempt autoplay on load (default ON) — skipped if asset missing (error handler runs first)
                 if (saved === 'on') {
                     setTimeout(() => { tryAutoPlay(); }, 0);
                 }
