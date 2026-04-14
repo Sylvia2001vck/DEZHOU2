@@ -113,11 +113,11 @@ target_link_libraries(
 if(MSVC)
   target_compile_options(nebula-poker-server PRIVATE /W4 /permissive-)
 else()
-  # BEFORE：确保 -Uaccess 早于任何会 #define access 的系统头（unistd.h）。
+  # BEFORE 必须紧跟在 target 名之后；若写成 PRIVATE BEFORE …，会把字面量 BEFORE 传给 c++。
+  # -Uaccess / -Uerror：避免 unistd.h 等把 access / error 定义成宏，破坏 channel_type_hint::access|error。
   target_compile_options(
     nebula-poker-server
-    PRIVATE
-    BEFORE
+    BEFORE PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Uaccess>
     $<$<COMPILE_LANGUAGE:CXX>:-Uerror>
     -Wall
