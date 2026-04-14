@@ -17,13 +17,19 @@ FetchContent_Declare(
   GIT_TAG asio-1-30-2
 )
 
-FetchContent_Declare(
-  websocketpp
-  GIT_REPOSITORY https://github.com/zaphoyd/websocketpp.git
-  GIT_TAG 0.8.2
-)
+FetchContent_MakeAvailable(asio)
 
-FetchContent_MakeAvailable(asio websocketpp)
+# WebSocket++：使用系统头文件（apt: libwebsocketpp-dev）。FetchContent 拉取的版本在部分环境下易与 GCC/宏污染冲突。
+find_path(
+  WEBSOCKETPP_INCLUDE_DIR
+  NAMES websocketpp/server.hpp
+  DOC "Path to WebSocket++ headers (parent of the websocketpp/ directory)"
+)
+if(NOT WEBSOCKETPP_INCLUDE_DIR)
+  message(FATAL_ERROR "WebSocket++ headers not found. Install: sudo apt install libwebsocketpp-dev")
+endif()
+
+find_package(Threads REQUIRED)
 
 # 使用系统 Protobuf（apt: protobuf-compiler libprotobuf-dev）。
 # 从源码 Fetch Protobuf 后再 find_package(Protobuf MODULE) 往往找不到，且依赖 CMake 3.24+ 的 OVERRIDE_FIND_PACKAGE。
@@ -64,7 +70,7 @@ target_include_directories(
     ${CMAKE_CURRENT_BINARY_DIR}/proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${asio_SOURCE_DIR}/asio/include
-    ${websocketpp_SOURCE_DIR}
+    ${WEBSOCKETPP_INCLUDE_DIR}
 )
 
 target_compile_definitions(
@@ -90,6 +96,7 @@ target_link_libraries(
   nebula-poker-server
   PRIVATE
     protobuf::libprotobuf
+    Threads::Threads
 )
 
 if(MSVC)
