@@ -74,6 +74,19 @@ REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 ```
 
+## Performance & scalability notes
+
+**Threading:** The server uses a **single-threaded** `boost::asio::io_context::run()` loop; all handlers touch `sessions_` / `rooms_` on that thread. If you scale to **multiple** `io_context` worker threads:
+
+- Prefer a **`boost::asio::strand`** (or executor-bound strand) so each connection’s async chain stays **serialized** (read → write ordering per `WsSession`).
+- Protect **shared** maps (`sessions_`, `rooms_`, etc.) with synchronization — e.g. **`std::shared_mutex`** if you split read-heavy vs write-heavy paths, or a single mutex while profiling.
+
+**Buffers:** `WsSession` uses `beast::flat_buffer` with an initial **`reserve(65536)`** to cut reallocations under bursty traffic. Binary frames are parsed with **`google::protobuf::MessageLite::ParseFromArray`** on the **contiguous** Beast buffer segment when possible (fallback to a concat path if the readable region spans multiple chunks).
+
+**Timeouts:** WebSocket streams use **`websocket::stream_base::timeout::suggested(beast::role_type::server)`** so Beast applies idle/read timeouts and helps clear stuck peers (still pair with app-level heartbeats if you need liveness guarantees).
+
+**Frontend (Three.js):** Treat network updates as **targets**, not instantaneous state: store server positions in a `targetPosition` and **lerp** in `requestAnimationFrame` instead of snapping meshes on every `onmessage` for smoother 3D motion.
+
 ## Notes
 
 - If MySQL or Redis development libraries are not installed, the backend still builds with in-memory fallback stores.

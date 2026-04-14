@@ -2078,61 +2078,103 @@ class PokerServer {
     reply.body = "Not Found";
   }
 
-  void on_ws_message(const std::string& socket_id, const std::string& payload) {
+  /// Returns false if the connection is being closed (do not schedule another async_read).
+  /// `data`/`len` refer to one complete WebSocket binary frame (same bytes as ParseFromString).
+  bool on_ws_message(const std::string& socket_id, const char* data, std::size_t len) {
     auto sit = sessions_.find(socket_id);
-    if (sit == sessions_.end()) return;
+    if (sit == sessions_.end()) return false;
+    if (!data || len == 0) {
+      close_ws_protocol_error(socket_id);
+      return false;
+    }
 
     nebula::poker::Envelope env;
-    if (!env.ParseFromString(payload)) return;
+    if (!env.ParseFromArray(data, static_cast<int>(len))) {
+      close_ws_protocol_error(socket_id);
+      return false;
+    }
 
     const std::string& event_name = env.event_name();
     Session& session = sit->second;
 
     if (event_name == "join_room") {
       nebula::poker::JoinRoomRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_join_room(session, req);
     } else if (event_name == "take_seat") {
       nebula::poker::SeatRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_take_seat(session, req.seatidx(), req.reconnecttoken());
     } else if (event_name == "toggle_ai") {
       nebula::poker::SeatRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_toggle_ai(session, req.seatidx());
     } else if (event_name == "kick_seat") {
       nebula::poker::SeatRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_kick_seat(session, req.seatidx());
     } else if (event_name == "start_game") {
       nebula::poker::StartGameRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_start_game(session, req);
     } else if (event_name == "action") {
       nebula::poker::ActionRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_player_action(session, req);
     } else if (event_name == "next_hand") {
       handle_next_hand(session);
     } else if (event_name == "rebuy") {
       nebula::poker::AmountRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_rebuy(session, req.amount());
     } else if (event_name == "rebuy_request") {
       nebula::poker::AmountRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_rebuy_request(session, req.amount());
     } else if (event_name == "rebuy_approve") {
       nebula::poker::RebuyApproveRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_rebuy_approve(session, req.seatidx(), req.amount());
     } else if (event_name == "rebuy_deny") {
       nebula::poker::SeatRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_rebuy_deny(session, req.seatidx());
     } else if (event_name == "set_decor") {
       nebula::poker::DecorRequest req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_set_decor(session, req.decor());
     } else if (event_name == "ack_match_over") {
       handle_ack_match_over(session);
@@ -2142,9 +2184,13 @@ class PokerServer {
       handle_voice_leave(session);
     } else if (event_name == "voice_signal") {
       nebula::poker::VoiceSignalMessage req;
-      if (!req.ParseFromString(env.payload())) return;
+      if (!req.ParseFromString(env.payload())) {
+        close_ws_protocol_error(socket_id);
+        return false;
+      }
       handle_voice_signal(session, req);
     }
+    return true;
   }
 
   std::string next_socket_id() {
@@ -3645,6 +3691,9 @@ class PokerServer {
 #endif
   }
 
+  // Single-threaded model: one io_context::run() thread — all handlers touch sessions_/rooms_
+  // on that thread. If you scale to multiple io_context worker threads, add a mutex (or
+  // per-connection strand) around shared maps before cross-thread access.
   net::io_context ioc_;
   std::optional<tcp::acceptor> acceptor_;
   std::unordered_map<std::string, Session> sessions_;
@@ -3653,6 +3702,7 @@ class PokerServer {
   void do_accept();
   void register_ws_session(std::shared_ptr<WsSession> sess);
   void unregister_ws_session(const std::string& socket_id);
+  void close_ws_protocol_error(const std::string& socket_id);
   std::unordered_map<std::string, Room> rooms_;
   std::unordered_map<std::string, std::mutex> room_mutexes_;
   std::unordered_map<std::string, UserProfileData> cached_users_;
@@ -3689,12 +3739,22 @@ struct WsSession : std::enable_shared_from_this<WsSession> {
 
   void start() {
     auto self = shared_from_this();
+    buffer_.reserve(65536);
     ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
     ws_.max_read_message_size(16 * 1024 * 1024);
     ws_.async_accept(req_, [self](beast::error_code ec) {
-      if (ec) return;
+      if (ec) return;  // handshake failed — no session registered yet
       self->server_->register_ws_session(self);
       self->read_loop();
+    });
+  }
+
+  /// Close the WebSocket with an RFC6455 close code, then remove session from server maps (idempotent).
+  void async_close_and_disconnect(websocket::close_code code) {
+    auto self = shared_from_this();
+    ws_.async_close(code, [self](beast::error_code ec) {
+      (void)ec;
+      self->server_->unregister_ws_session(self->socket_id_);
     });
   }
 
@@ -3724,18 +3784,36 @@ struct WsSession : std::enable_shared_from_this<WsSession> {
   void read_loop() {
     auto self = shared_from_this();
     ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t n) {
+      // Any error (incl. websocket::error::closed) ends the connection — drop maps to avoid zombies.
       if (ec) {
         self->server_->unregister_ws_session(self->socket_id_);
         return;
       }
+      (void)n;
       if (self->ws_.got_text()) {
         self->buffer_.consume(self->buffer_.size());
         self->read_loop();
         return;
       }
-      std::string payload = beast::buffers_to_string(self->buffer_.data());
-      self->buffer_.consume(self->buffer_.size());
-      self->server_->on_ws_message(self->socket_id_, payload);
+      const std::size_t total = self->buffer_.size();
+      if (total == 0) {
+        self->read_loop();
+        return;
+      }
+      const auto bufs = self->buffer_.data();
+      const auto first = beast::buffers_front(bufs);
+      bool keep_reading = false;
+      if (first.size() >= total) {
+        // Hot path: one contiguous readable segment — ParseFromArray without std::string copy.
+        keep_reading = self->server_->on_ws_message(
+            self->socket_id_, static_cast<const char*>(first.data()), total);
+      } else {
+        // Rare: readable bytes span multiple const_buffer chunks — single concat then parse.
+        std::string tmp = beast::buffers_to_string(bufs);
+        keep_reading = self->server_->on_ws_message(self->socket_id_, tmp.data(), tmp.size());
+      }
+      self->buffer_.consume(total);
+      if (!keep_reading) return;
       self->read_loop();
     });
   }
@@ -3836,6 +3914,7 @@ void PokerServer::register_ws_session(std::shared_ptr<WsSession> sess) {
   send_auth_state(session.socket_id, sessions_[session.socket_id]);
 }
 
+// Idempotent: safe if also called from read/write after async_close (duplicate teardown).
 void PokerServer::unregister_ws_session(const std::string& socket_id) {
   if (socket_id.empty()) return;
   ws_by_socket_id_.erase(socket_id);
@@ -3843,6 +3922,12 @@ void PokerServer::unregister_ws_session(const std::string& socket_id) {
   if (it == sessions_.end()) return;
   handle_disconnect(it->second);
   sessions_.erase(it);
+}
+
+void PokerServer::close_ws_protocol_error(const std::string& socket_id) {
+  auto it = ws_by_socket_id_.find(socket_id);
+  if (it == ws_by_socket_id_.end()) return;
+  it->second->async_close_and_disconnect(websocket::close_code::protocol_error);
 }
 
 }  // namespace
