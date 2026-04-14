@@ -1,3 +1,7 @@
+#ifndef ASIO_STANDALONE
+#define ASIO_STANDALONE
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -24,8 +28,11 @@
 #include <vector>
 
 #include <asio/steady_timer.hpp>
-// WebSocket++ must come before Protobuf: some protobuf transitive headers define macros
-// that break websocketpp/logger/basic.hpp (constructors parse as invalid syntax on GCC).
+// WebSocket++ must come before Protobuf: some transitive headers define macros that break
+// websocketpp/logger/basic.hpp. Also unistd.h may #define access — conflicts with param names.
+#ifdef access
+#undef access
+#endif
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 
