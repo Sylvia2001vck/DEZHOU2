@@ -1041,6 +1041,7 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { ParametricGeometry } from 'three/addons/geometries/ParametricGeometry.js';
+        import { SyncManager, createFrameTimer } from './frontend/src/utils/SyncManager.js';
 
         const CONFIG = {
             numPlayers: 10,
@@ -1064,6 +1065,8 @@
         let starField = null;
         let tableParticles = null;
         let hudData = [];
+        const smoothSyncRegistry = [];
+        const nextSmoothDt = createFrameTimer(0.05);
         let currentRaiseInput = 50;
         const DEFAULT_VIEW = {
             cameraPos: new THREE.Vector3(0, 11, 15),
@@ -3379,6 +3382,8 @@
             environmentGroup = new THREE.Group();
             playerStacksGroup = new THREE.Group();
             scene.add(cardsGroup, chipsGroup, tableGroup, environmentGroup, playerStacksGroup);
+            // Smoothing hook: add more SyncManager instances and call setTarget* from socket handlers.
+            smoothSyncRegistry.push(new SyncManager(tableGroup, { lambda: 10 }));
 
             // Add a subtle procedural environment for natural reflections (improves glass sheen).
             try {
@@ -6447,6 +6452,8 @@
 
         function animate() {
             requestAnimationFrame(animate);
+            const dt = nextSmoothDt();
+            for (const s of smoothSyncRegistry) s.update(dt);
             controls.update();
             if(starField) {
                 starField.rotation.y += 0.0005;

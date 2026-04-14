@@ -85,7 +85,35 @@ REDIS_PORT=6379
 
 **Timeouts:** WebSocket streams use **`websocket::stream_base::timeout::suggested(beast::role_type::server)`** so Beast applies idle/read timeouts and helps clear stuck peers (still pair with app-level heartbeats if you need liveness guarantees).
 
-**Frontend (Three.js):** Treat network updates as **targets**, not instantaneous state: store server positions in a `targetPosition` and **lerp** in `requestAnimationFrame` instead of snapping meshes on every `onmessage` for smoother 3D motion.
+**Frontend (Three.js) — smooth sync:** For chips flying to seats, table panning, or any moving prop, avoid snapping transforms on every `onmessage`. Keep **server truth** in a target and **interpolate** the visible object in the render loop.
+
+- Use **`socket.binaryType = 'arraybuffer'`** so `event.data` is an `ArrayBuffer`; decode with **protobufjs** after unpacking your `Envelope` + payload (same binary framing as the C++ server).
+- **Pattern:** update only `targetPosition` / `targetQuaternion` in `onmessage`; in `requestAnimationFrame`, lerp/slerp toward the target.
+
+Frame-rate friendly smoothing (exponential decay — stable across 60 Hz vs 120 Hz):
+
+```javascript
+const targetPosition = new THREE.Vector3();
+const smoothPosition = new THREE.Vector3();
+let lastTime = performance.now();
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.05, (now - lastTime) / 1000); // cap dt to avoid huge jumps after tab background
+  lastTime = now;
+  const lambda = 12; // higher = snappier (tune 8–20 for poker UI)
+  const alpha = 1 - Math.exp(-lambda * dt);
+  smoothPosition.lerp(targetPosition, alpha);
+
+  mesh.position.copy(smoothPosition);
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+```
+
+Simpler fixed-step lerp (more lag if FPS drops): `mesh.position.lerp(targetPosition, 0.12)` each frame — fine for lobby-level motion; prefer the `dt` version above for consistent feel.
+
+**Handoff (repo root):** the same exponential smoothing is implemented as **`frontend/src/utils/SyncManager.js`** (used from `index.html` + documented in **`docs/three-smooth.md`**). Prefer importing that module instead of duplicating math in the client.
 
 ## Notes
 

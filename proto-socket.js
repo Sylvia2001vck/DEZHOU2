@@ -1,3 +1,7 @@
+/**
+ * Binary WebSocket client: `nebula.poker.Envelope` encode/decode + event dispatch.
+ * No Three.js here — keep protocol separate from view (see `frontend/src/utils/SyncManager.js`, `docs/three-smooth.md`).
+ */
 const OUTGOING_TYPES = {
   join_room: "JoinRoomRequest",
   take_seat: "SeatRequest",
