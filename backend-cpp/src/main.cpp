@@ -2,16 +2,9 @@
 #define ASIO_STANDALONE
 #endif
 
-// WebSocket++ 必须尽量靠前：任何先包含的系统头都可能通过 unistd.h 定义 access 宏，
-// 破坏 websocketpp::log::channel_type_hint::access / error 等枚举成员名。
-#undef access
-#undef error
+// WebSocket++ 尽量靠前包含。POSIX access/error 宏冲突由 patches/websocketpp_*.patch 与编译选项 -Uaccess/-Uerror 处理。
 #include <websocketpp/config/asio_no_tls.hpp>
-#undef access
-#undef error
 #include <websocketpp/server.hpp>
-#undef access
-#undef error
 
 #include <algorithm>
 #include <array>

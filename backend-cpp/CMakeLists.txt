@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NebulaPatchWebSocketPP.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyWebSocketPPPatch.cmake")
 include(FetchContent)
 
 option(NEBULA_ENABLE_MYSQL "Enable MySQL-backed user persistence" ON)
@@ -20,8 +20,8 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(asio)
 
-# WebSocket++：Ubuntu jammy 的 libwebsocketpp-dev 多为 0.8.2，在 GCC 11+ 下与部分头/宏组合会解析失败。
-# 默认从 GitHub 拉取 master（或设 extern/websocketpp 离线使用）。
+# WebSocket++：POSIX 宏（access/error/…）会破坏头文件解析；固定 0.8.2 + patches/*.patch（git apply），与 CMake 3.22 兼容。
+# 离线：将 upstream 0.8.2 树放到 extern/websocketpp（与补丁一致）。
 set(_WSPP_LOCAL "${CMAKE_CURRENT_SOURCE_DIR}/extern/websocketpp")
 if(EXISTS "${_WSPP_LOCAL}/websocketpp/server.hpp")
   set(WEBSOCKETPP_ROOT "${_WSPP_LOCAL}")
@@ -30,7 +30,7 @@ else()
   FetchContent_Declare(
     websocketpp
     GIT_REPOSITORY https://github.com/zaphoyd/websocketpp.git
-    GIT_TAG master
+    GIT_TAG 0.8.2
   )
   # 不要用 MakeAvailable：会执行 websocketpp 顶层 CMakeLists，多一层子工程且与头文件-only 用法无关。
   FetchContent_GetProperties(websocketpp)
@@ -41,8 +41,10 @@ else()
   message(STATUS "WebSocket++: FetchContent Populate (headers only) -> ${WEBSOCKETPP_ROOT}")
 endif()
 
-# 必须在 unistd.h 再次 #define access 之后仍生效：对头文件打补丁（-Uaccess 单独不够）。
-nebula_patch_websocketpp_headers("${WEBSOCKETPP_ROOT}")
+nebula_apply_websocketpp_patch(
+  "${WEBSOCKETPP_ROOT}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/patches/websocketpp_0.8.2_linux_posix.patch"
+)
 
 find_package(Threads REQUIRED)
 

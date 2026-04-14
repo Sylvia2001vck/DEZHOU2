@@ -1,0 +1,45 @@
+﻿diff --git a/websocketpp/logger/basic.hpp b/websocketpp/logger/basic.hpp
+index 8451413..05117d3 100644
+--- a/websocketpp/logger/basic.hpp
++++ b/websocketpp/logger/basic.hpp
+@@ -51,6 +51,22 @@
+ #include <iomanip>
+ #include <string>
+ 
++// Nebula (POSIX): unistd.h may #define access/error/basic/value/names
++#ifdef access
++#undef access
++#endif
++#ifdef error
++#undef error
++#endif
++#ifdef basic
++#undef basic
++#endif
++#ifdef value
++#undef value
++#endif
++#ifdef names
++#undef names
++#endif
+ namespace websocketpp {
+ namespace log {
+ 
+diff --git a/websocketpp/logger/levels.hpp b/websocketpp/logger/levels.hpp
+index cd7ccd6..fca9d0e 100644
+--- a/websocketpp/logger/levels.hpp
++++ b/websocketpp/logger/levels.hpp
+@@ -44,6 +44,13 @@ typedef uint32_t level;
+  * whereas `error` might be suitable for an error log file or cerr. 
+  */
+ struct channel_type_hint {
++// Nebula (POSIX): unistd.h may #define access/error; must precede member names
++#ifdef access
++#undef access
++#endif
++#ifdef error
++#undef error
++#endif
+     /// Type of a channel type hint value
+     typedef uint32_t value;
+     
