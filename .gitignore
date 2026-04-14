@@ -4,3 +4,6 @@ build/
 *.exe
 *.o
 bin/
+
+# Large local asset — not tracked (use CDN or manual copy on server)
+assets/ifcan.mp3
