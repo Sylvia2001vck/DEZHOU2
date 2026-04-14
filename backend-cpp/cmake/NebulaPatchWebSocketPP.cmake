@@ -13,6 +13,8 @@ function(nebula_patch_websocketpp_headers root)
     message(FATAL_ERROR "missing ${_script}")
   endif()
 
+  message(STATUS "WebSocket++: running Python patch (V3) on ${root}")
+
   execute_process(
     COMMAND "${NEBULA_PYTHON3}" "${_script}" "${root}"
     RESULT_VARIABLE _nebula_wspp_rc
@@ -25,4 +27,5 @@ function(nebula_patch_websocketpp_headers root)
   if(_nebula_wspp_err)
     message(STATUS "${_nebula_wspp_err}")
   endif()
+  message(STATUS "WebSocket++: Python patch (V3) finished successfully")
 endfunction()
