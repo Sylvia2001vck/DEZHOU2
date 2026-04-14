@@ -743,7 +743,8 @@
                 </div>
                 <button id="auth-login-btn" class="lobby-btn">Log In</button>
                 <button id="show-register-btn" class="lobby-btn" style="margin-top:10px;">Create New Account</button>
-                <button id="offline-debug-btn" class="lobby-btn" style="margin-top:10px;">Single Player Debug Mode</button>
+                <button id="offline-debug-btn" type="button" class="lobby-btn" style="margin-top:10px;"
+                    title="Enter offline / single-player mode (no server, no login)">Single Player (Offline)</button>
             </div>
 
             <div id="auth-register-view" style="display:none;">
@@ -761,7 +762,8 @@
                 </div>
                 <button id="auth-register-btn" class="lobby-btn">Register And Enter Lobby</button>
                 <button id="show-login-btn" class="lobby-btn" style="margin-top:10px;">Back To Login</button>
-                <button id="offline-debug-register-btn" class="lobby-btn" style="margin-top:10px;">Single Player Debug Mode</button>
+                <button id="offline-debug-register-btn" type="button" class="lobby-btn" style="margin-top:10px;"
+                    title="Enter offline / single-player mode (no server, no login)">Single Player (Offline)</button>
             </div>
 
             <div id="lobby-home-view" style="display:none;">
@@ -808,7 +810,8 @@
                     <button id="quick-match-btn" class="lobby-btn">Quick Match</button>
                     <button id="claim-daily-btn" class="lobby-btn" style="margin-top:10px;">Claim Daily Beans</button>
                     <button id="watch-ad-btn" class="lobby-btn" style="margin-top:10px;">Watch Ad Reward (Stub)</button>
-                    <button id="solo-debug-btn" class="lobby-btn" style="margin-top:10px;">Single Player Vs AI</button>
+                    <button id="solo-debug-btn" type="button" class="lobby-btn" style="margin-top:10px;"
+                        title="在离线模式下：与 AI 开局；联机模式下：先切到离线再开局">Single Player Vs AI</button>
                     <button id="cancel-match-btn" class="lobby-btn" style="display:none; margin-top:10px;">Cancel Matchmaking</button>
                     <div class="lobby-section-title">Daily Tasks</div>
                     <div id="home-task-list"></div>
@@ -1076,7 +1079,21 @@
         
         const BUILD_TAG = `build-${new Date().toISOString()}`;
         const urlParams = new URLSearchParams(location.search);
-        const FORCE_OFFLINE = urlParams.get('offline') === '1';
+        let preferOffline = false;
+        try {
+            preferOffline = localStorage.getItem('nebula_prefer_offline') === '1';
+        } catch (_) {}
+        const FORCE_OFFLINE = urlParams.get('offline') === '1' || preferOffline;
+        if (urlParams.get('offline') === '1') {
+            try { localStorage.setItem('nebula_prefer_offline', '1'); } catch (_) {}
+        }
+        if (FORCE_OFFLINE && urlParams.get('offline') !== '1') {
+            try {
+                const u = new URL(location.href);
+                u.searchParams.set('offline', '1');
+                history.replaceState(null, '', u.toString());
+            } catch (_) {}
+        }
         let IS_MULTIPLAYER = (!FORCE_OFFLINE && location.protocol !== 'file:');
         let socket = null;
         if (IS_MULTIPLAYER) {
@@ -2130,8 +2147,13 @@
 
         function navigateWithOfflineMode(enabled) {
             const nextUrl = new URL(window.location.href);
-            if (enabled) nextUrl.searchParams.set('offline', '1');
-            else nextUrl.searchParams.delete('offline');
+            if (enabled) {
+                try { localStorage.setItem('nebula_prefer_offline', '1'); } catch (_) {}
+                nextUrl.searchParams.set('offline', '1');
+            } else {
+                try { localStorage.removeItem('nebula_prefer_offline'); } catch (_) {}
+                nextUrl.searchParams.delete('offline');
+            }
             window.location.href = nextUrl.toString();
         }
 
@@ -2154,7 +2176,8 @@
             if (createBtn) createBtn.textContent = IS_MULTIPLAYER ? 'Create Private Room' : 'Open Local Table';
             if (joinBtn) joinBtn.style.display = IS_MULTIPLAYER ? 'block' : 'none';
             if (quickBtn) quickBtn.textContent = IS_MULTIPLAYER ? 'Quick Match' : 'Quick Solo Table';
-            if (soloBtn) soloBtn.style.display = IS_MULTIPLAYER ? 'block' : 'none';
+            // Always show: offline users need this to enter solo vs AI; online users use it to switch to ?offline=1.
+            if (soloBtn) soloBtn.style.display = 'block';
             if (logoutBtn) logoutBtn.style.display = IS_MULTIPLAYER ? 'block' : 'none';
             if (switchOnlineBtn) switchOnlineBtn.style.display = IS_MULTIPLAYER ? 'none' : 'block';
             if (!IS_MULTIPLAYER && cancelBtn) cancelBtn.style.display = 'none';
@@ -2518,7 +2541,7 @@
                     gamesPlayed: 0
                 });
                 setLobbyMode('home');
-                setLobbyFeedback('Offline debug mode: no login required. Open a local table or launch a solo table with AI.');
+                setLobbyFeedback('Offline debug: no login required. Use Open Local Table, Quick Solo, or Single Player Vs AI.');
                 await loadLobbyOverview();
                 return;
             }
@@ -6030,7 +6053,7 @@
             };
             document.getElementById('join-room-btn').onclick = async () => {
                 if (!IS_MULTIPLAYER) {
-                    setLobbyFeedback('Offline mode does not use room codes. Use Open Local Table or Single Player Vs AI.');
+                    setLobbyFeedback('Offline 模式不用房间码。请用 Open Local Table、Quick Solo Table 或 Single Player Vs AI。');
                     return;
                 }
                 try {
