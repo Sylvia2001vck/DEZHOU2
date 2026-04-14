@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.24)
+# Ubuntu 22.04 LTS ships CMake 3.22; avoid requiring 3.24+ unless necessary
+cmake_minimum_required(VERSION 3.22)
 project(nebula_poker_cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -30,7 +31,6 @@ if(NOT Protobuf_FOUND)
     protobuf
     GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
     GIT_TAG v28.3
-    OVERRIDE_FIND_PACKAGE
   )
   set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(protobuf_WITH_ZLIB OFF CACHE BOOL "" FORCE)
