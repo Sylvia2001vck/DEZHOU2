@@ -1,10 +1,7 @@
-#ifndef ASIO_STANDALONE
-#define ASIO_STANDALONE
-#endif
-
-// WebSocket++ 尽量靠前包含。POSIX access/error 宏冲突由 patches/websocketpp_*.patch 与编译选项 -Uaccess/-Uerror 处理。
-#include <websocketpp/config/asio_no_tls.hpp>
-#include <websocketpp/server.hpp>
+#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/websocket.hpp>
 
 #include <algorithm>
 #include <array>
@@ -31,8 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include <asio/steady_timer.hpp>
-
 #include <google/protobuf/message.h>
 
 #include "poker.pb.h"
@@ -46,10 +41,32 @@
 #include <hiredis/hiredis.h>
 #endif
 
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
+
 namespace {
 
-using websocketpp::connection_hdl;
-using WsServer = websocketpp::server<websocketpp::config::asio>;
+struct HttpRequestView {
+  std::string method;
+  std::string uri;
+  std::string clean_uri;
+  std::string body;
+  std::string cookie_header;
+};
+
+struct HttpReply {
+  unsigned status = 404;
+  std::string content_type = "text/plain; charset=utf-8";
+  std::optional<std::string> set_cookie;
+  std::string body;
+};
+
+struct WsSession;
+struct TcpHttpSession;
+
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::milliseconds;
 
@@ -417,14 +434,14 @@ struct Room {
 
   int turn_nonce = 0;
   int last_actor_seat_idx = -1;
-  std::unique_ptr<asio::steady_timer> ai_timer;
+  std::unique_ptr<net::steady_timer> ai_timer;
 
   std::map<std::string, VoiceParticipant> voice_participants;
   std::vector<MatchHandInfo> hand_history;
   std::vector<std::string> activity_log;
   int64_t event_seq = 0;
   std::deque<RoomEventEntry> event_log;
-  std::array<std::unique_ptr<asio::steady_timer>, kSeats> ai_takeover_timers;
+  std::array<std::unique_ptr<net::steady_timer>, kSeats> ai_takeover_timers;
   bool closing = false;
   std::set<std::string> expected_acks;
   std::set<std::string> match_acks;
@@ -899,28 +916,17 @@ class HiredisLeaderboardStore final : public LeaderboardStore {
 #endif
 
 class PokerServer {
+  friend struct TcpHttpSession;
+  friend struct WsSession;
+
  public:
   PokerServer()
       : rng_(std::random_device{}()),
         user_store_(create_user_store()),
         auth_store_(create_auth_store()),
-        leaderboard_store_(create_leaderboard_store()) {
-    server_.init_asio();
-    server_.clear_access_channels(websocketpp::log::alevel::all);
-    server_.set_reuse_addr(true);
+        leaderboard_store_(create_leaderboard_store()) {}
 
-    server_.set_open_handler([this](connection_hdl hdl) { on_open(hdl); });
-    server_.set_close_handler([this](connection_hdl hdl) { on_close(hdl); });
-    server_.set_message_handler([this](connection_hdl hdl, WsServer::message_ptr msg) { on_message(hdl, msg); });
-    server_.set_http_handler([this](connection_hdl hdl) { on_http(hdl); });
-  }
-
-  void run(uint16_t port) {
-    std::cout << "nebula-poker C++ listening on 0.0.0.0:" << port << "\n";
-    server_.listen(port);
-    server_.start_accept();
-    server_.run();
-  }
+  void run(uint16_t port);
 
  private:
   std::string make_envelope_bytes(const std::string& event_name, const google::protobuf::Message& message) {
@@ -931,9 +937,9 @@ class PokerServer {
   }
 
   void send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
-    auto it = socket_by_id_.find(socket_id);
-    if (it == socket_by_id_.end()) return;
-    server_.send(it->second, bytes, websocketpp::frame::opcode::binary);
+    auto it = ws_by_socket_id_.find(socket_id);
+    if (it == ws_by_socket_id_.end()) return;
+    it->second->queue_write(std::string(bytes));
   }
 
   template <typename T>
@@ -1118,8 +1124,8 @@ class PokerServer {
     Seat& seat = room.seats[seat_idx];
     if (seat.type != Seat::Type::Player) return;
     room.ai_takeover_timers[seat_idx] =
-        std::make_unique<asio::steady_timer>(server_.get_io_service(), std::chrono::milliseconds(kAiTakeoverDelayMs));
-    room.ai_takeover_timers[seat_idx]->async_wait([this, &room, seat_idx](const asio::error_code& ec) {
+        std::make_unique<net::steady_timer>(ioc_, std::chrono::milliseconds(kAiTakeoverDelayMs));
+    room.ai_takeover_timers[seat_idx]->async_wait([this, &room, seat_idx](const boost::system::error_code& ec) {
       if (ec) return;
       if (seat_idx < 0 || seat_idx >= kSeats) return;
       Seat& current_seat = room.seats[seat_idx];
@@ -1179,11 +1185,10 @@ class PokerServer {
     return out;
   }
 
-  void send_json(connection_hdl hdl, websocketpp::http::status_code::value status, const std::string& body) {
-    auto con = server_.get_con_from_hdl(hdl);
-    con->set_status(status);
-    con->replace_header("Content-Type", "application/json; charset=utf-8");
-    con->set_body(body);
+  static void send_json(HttpReply& reply, unsigned status, const std::string& body) {
+    reply.status = status;
+    reply.content_type = "application/json; charset=utf-8";
+    reply.body = body;
   }
 
   std::string user_profile_json(const UserProfileData& profile) {
@@ -1416,7 +1421,7 @@ class PokerServer {
     send_event(socket_id, "auth_state", auth);
   }
 
-  bool serve_static_file(connection_hdl hdl, const std::string& raw_uri) {
+  bool serve_static_file(HttpReply& reply, const std::string& raw_uri) {
     const std::string uri = raw_uri.substr(0, raw_uri.find('?'));
     std::string path;
     if (uri == "/" || uri == "/index.html") {
@@ -1460,10 +1465,9 @@ class PokerServer {
     if (!found) return false;
     const std::string body = read_file(resolved.string());
     if (body.empty()) return false;
-    auto con = server_.get_con_from_hdl(hdl);
-    con->set_status(websocketpp::http::status_code::ok);
-    con->replace_header("Content-Type", mime_for_path(path));
-    con->set_body(body);
+    reply.status = 200;
+    reply.content_type = mime_for_path(path);
+    reply.body = body;
     return true;
   }
 
@@ -1636,35 +1640,34 @@ class PokerServer {
     }
   }
 
-  void on_http(connection_hdl hdl) {
-    auto con = server_.get_con_from_hdl(hdl);
-    const std::string uri = con->get_request().get_uri();
-    const std::string clean_uri = uri.substr(0, uri.find('?'));
-    const std::string method = con->get_request().get_method();
-    const std::string body = con->get_request_body();
-    const std::string cookie_header = con->get_request_header("Cookie");
+  void handle_http_request(const HttpRequestView& req, HttpReply& reply) {
+    const std::string& uri = req.uri;
+    const std::string& clean_uri = req.clean_uri;
+    const std::string& method = req.method;
+    const std::string& body = req.body;
+    const std::string& cookie_header = req.cookie_header;
     const auto form = parse_form_body(body);
     const auto auth_session = find_http_session(cookie_header);
     if (uri == "/healthz") {
-      con->set_status(websocketpp::http::status_code::ok);
-      con->replace_header("Content-Type", "text/plain; charset=utf-8");
-      con->set_body("ok");
+      reply.status = 200;
+      reply.content_type = "text/plain; charset=utf-8";
+      reply.body = "ok";
       return;
     }
     if (uri == "/readyz") {
-      con->set_status(websocketpp::http::status_code::ok);
-      con->replace_header("Content-Type", "application/json; charset=utf-8");
-      con->set_body("{\"ok\":true}");
+      reply.status = 200;
+      reply.content_type = "application/json; charset=utf-8";
+      reply.body = "{\"ok\":true}";
       return;
     }
     if (uri.rfind("/api/leaderboard", 0) == 0) {
       std::string type = "coins";
       auto pos = uri.find("type=");
       if (pos != std::string::npos) type = uri.substr(pos + 5);
-      std::string body = leaderboard_store_->to_json(type, 20);
-      con->set_status(websocketpp::http::status_code::ok);
-      con->replace_header("Content-Type", "application/json; charset=utf-8");
-      con->set_body(body);
+      std::string lb_body = leaderboard_store_->to_json(type, 20);
+      reply.status = 200;
+      reply.content_type = "application/json; charset=utf-8";
+      reply.body = lb_body;
       return;
     }
     if (clean_uri == "/api/auth/register" && method == "POST") {
@@ -1674,12 +1677,12 @@ class PokerServer {
           form.count("displayName") ? form.at("displayName") : username);
       const std::string password = form.count("password") ? form.at("password") : "";
       if (!is_valid_username(username) || !is_valid_display_name(display_name) || password.size() < 6) {
-        send_json(hdl, websocketpp::http::status_code::bad_request,
+        send_json(reply, 400,
                   "{\"ok\":false,\"message\":\"Use a 3-24 char login username, a 1-48 char display name, and a 6+ char password.\"}");
         return;
       }
       if (auth_store_->find_by_username(username).has_value()) {
-        send_json(hdl, websocketpp::http::status_code::conflict, "{\"ok\":false,\"message\":\"Login username already exists.\"}");
+        send_json(reply, 409, "{\"ok\":false,\"message\":\"Login username already exists.\"}");
         return;
       }
       UserProfileData profile = user_store_->load_or_create(username, display_name);
@@ -1688,14 +1691,14 @@ class PokerServer {
       std::string error;
       const auto account = auth_store_->register_account(profile.user_id, username, hash_password_record(password, next_token(12)), error);
       if (!account.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::internal_server_error,
+        send_json(reply, 500,
                   "{\"ok\":false,\"message\":\"" + escape_json(error.empty() ? "Registration failed." : error) + "\"}");
         return;
       }
       auth_store_->update_last_login(profile.user_id, now_ms());
       const std::string session_id = create_session_cookie(profile.user_id, username);
-      con->replace_header("Set-Cookie", build_session_cookie_header(session_id));
-      send_json(hdl, websocketpp::http::status_code::ok,
+      reply.set_cookie = build_session_cookie_header(session_id);
+      send_json(reply, 200,
                 "{\"ok\":true,\"user\":" + user_profile_json(profile) + "}");
       return;
     }
@@ -1705,112 +1708,112 @@ class PokerServer {
       const std::string password = form.count("password") ? form.at("password") : "";
       const auto account = auth_store_->find_by_username(username);
       if (!account.has_value() || !verify_password_record(password, account->password_hash)) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
         return;
       }
       auth_store_->update_last_login(account->user_id, now_ms());
       const auto profile = get_profile_by_user_id(account->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::internal_server_error, "{\"ok\":false,\"message\":\"Profile load failed.\"}");
+        send_json(reply, 500, "{\"ok\":false,\"message\":\"Profile load failed.\"}");
         return;
       }
       const std::string session_id = create_session_cookie(account->user_id, username);
-      con->replace_header("Set-Cookie", build_session_cookie_header(session_id));
-      send_json(hdl, websocketpp::http::status_code::ok,
+      reply.set_cookie = build_session_cookie_header(session_id);
+      send_json(reply, 200,
                 "{\"ok\":true,\"user\":" + user_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/auth/logout" && method == "POST") {
       if (auth_session.has_value()) auth_sessions_.erase(auth_session->session_id);
-      con->replace_header("Set-Cookie", build_session_cookie_header("", true));
-      send_json(hdl, websocketpp::http::status_code::ok, "{\"ok\":true}");
+      reply.set_cookie = build_session_cookie_header("", true);
+      send_json(reply, 200, "{\"ok\":true}");
       return;
     }
     if (clean_uri == "/api/auth/me" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false}");
+        send_json(reply, 401, "{\"ok\":false}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false}");
+        send_json(reply, 401, "{\"ok\":false}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"user\":" + user_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/home/overview" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok, home_overview_json(*profile));
+      send_json(reply, 200, home_overview_json(*profile));
       return;
     }
     if (clean_uri == "/api/profile/me" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"profile\":" + user_profile_json(*profile) + ",\"favoriteMode\":\"friend-room\"}");
       return;
     }
     if (clean_uri == "/api/beans/profile" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"beanProfile\":" + bean_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/beans/claim-daily" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const int64_t day = current_day_bucket();
       if (daily_claim_day_[profile->user_id] == day) {
-        send_json(hdl, websocketpp::http::status_code::conflict, "{\"ok\":false,\"message\":\"Daily beans already claimed.\"}");
+        send_json(reply, 409, "{\"ok\":false,\"message\":\"Daily beans already claimed.\"}");
         return;
       }
       daily_claim_day_[profile->user_id] = day;
       profile->gold += 600;
       cache_profile(*profile);
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"rewardBeans\":600,\"beanProfile\":" + bean_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/beans/ad-reward" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const int64_t day = current_day_bucket();
@@ -1819,53 +1822,53 @@ class PokerServer {
         ad_reward_count_[profile->user_id] = 0;
       }
       if (ad_reward_count_[profile->user_id] >= 3) {
-        send_json(hdl, websocketpp::http::status_code::conflict, "{\"ok\":false,\"message\":\"Ad rewards capped for today.\"}");
+        send_json(reply, 409, "{\"ok\":false,\"message\":\"Ad rewards capped for today.\"}");
         return;
       }
       ad_reward_count_[profile->user_id] += 1;
       profile->gold += 400;
       cache_profile(*profile);
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"rewardBeans\":400,\"remaining\":" + std::to_string(3 - ad_reward_count_[profile->user_id]) +
                 ",\"beanProfile\":" + bean_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/inventory" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok, inventory_json(auth_session->user_id));
+      send_json(reply, 200, inventory_json(auth_session->user_id));
       return;
     }
     if (clean_uri == "/api/inventory/equip" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const std::string item_id = form.count("itemId") ? form.at("itemId") : "";
       auto& items = user_inventory(auth_session->user_id);
       if (std::find(items.begin(), items.end(), item_id) == items.end()) {
-        send_json(hdl, websocketpp::http::status_code::not_found, "{\"ok\":false,\"message\":\"Item not owned.\"}");
+        send_json(reply, 404, "{\"ok\":false,\"message\":\"Item not owned.\"}");
         return;
       }
       equipped_table_theme_[auth_session->user_id] = item_id;
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"equippedTable\":\"" + escape_json(item_id) + "\"}");
       return;
     }
     if (clean_uri == "/api/tournaments" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok, tournaments_json(auth_session->user_id));
+      send_json(reply, 200, tournaments_json(auth_session->user_id));
       return;
     }
     if (clean_uri.rfind("/api/tournaments/", 0) == 0 && clean_uri.size() > 24 &&
         clean_uri.substr(clean_uri.size() - 9) == "/register" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       ensure_tournaments_seeded();
@@ -1875,47 +1878,47 @@ class PokerServer {
         return item.id == tournament_id;
       });
       if (it == tournaments_.end()) {
-        send_json(hdl, websocketpp::http::status_code::not_found, "{\"ok\":false,\"message\":\"Tournament not found.\"}");
+        send_json(reply, 404, "{\"ok\":false,\"message\":\"Tournament not found.\"}");
         return;
       }
       if (static_cast<int>(it->registered_users.size()) >= it->max_players) {
-        send_json(hdl, websocketpp::http::status_code::conflict, "{\"ok\":false,\"message\":\"Tournament is full.\"}");
+        send_json(reply, 409, "{\"ok\":false,\"message\":\"Tournament is full.\"}");
         return;
       }
       it->registered_users.insert(auth_session->user_id);
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"registered\":true,\"tournamentId\":\"" + escape_json(it->id) + "\"}");
       return;
     }
     if (clean_uri == "/api/friend-rooms/create" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const int total_hands = form.count("totalHands") ? std::max(1, std::atoi(form.at("totalHands").c_str())) : 5;
       const int initial_chips = form.count("initialChips") ? std::max(1000, std::atoi(form.at("initialChips").c_str())) : 1000;
       Room& room = create_room_for_user(*profile, "private", total_hands, initial_chips, "friend");
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room.room_code) + "\",\"room\":" + room_summary_json(room) + "}");
       return;
     }
     if (clean_uri == "/api/friend-rooms/join" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const std::string room_code = to_upper_room_code(form.count("roomCode") ? form.at("roomCode") : "");
       Room* room = get_room(room_code);
       if (!room || room->room_type != "friend") {
-        send_json(hdl, websocketpp::http::status_code::not_found, "{\"ok\":false,\"message\":\"Friend room not found.\"}");
+        send_json(reply, 404, "{\"ok\":false,\"message\":\"Friend room not found.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room->room_code) + "\",\"room\":" + room_summary_json(*room) + "}");
       return;
     }
@@ -1925,7 +1928,7 @@ class PokerServer {
                                                      clean_uri.size() - std::string("/api/friend-rooms/").size() - std::string("/history").size());
       Room* room = get_room(to_upper_room_code(room_code));
       if (!room || room->room_type != "friend") {
-        send_json(hdl, websocketpp::http::status_code::not_found, "{\"ok\":false,\"message\":\"Friend room not found.\"}");
+        send_json(reply, 404, "{\"ok\":false,\"message\":\"Friend room not found.\"}");
         return;
       }
       std::ostringstream out;
@@ -1941,50 +1944,50 @@ class PokerServer {
         out << "]}";
       }
       out << "]}";
-      send_json(hdl, websocketpp::http::status_code::ok, out.str());
+      send_json(reply, 200, out.str());
       return;
     }
     if (clean_uri == "/api/rooms/create" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const int total_hands = form.count("totalHands") ? std::max(1, std::atoi(form.at("totalHands").c_str())) : 5;
       const int initial_chips = form.count("initialChips") ? std::max(1000, std::atoi(form.at("initialChips").c_str())) : 1000;
       const std::string visibility = form.count("visibility") ? form.at("visibility") : "private";
       Room& room = create_room_for_user(*profile, visibility, total_hands, initial_chips, "friend");
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room.room_code) + "\",\"room\":" + room_summary_json(room) + "}");
       return;
     }
     if (clean_uri == "/api/rooms/join" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const std::string room_code = to_upper_room_code(form.count("roomCode") ? form.at("roomCode") : "");
       Room* room = get_room(room_code);
       if (!room) {
-        send_json(hdl, websocketpp::http::status_code::not_found, "{\"ok\":false,\"message\":\"Room not found.\"}");
+        send_json(reply, 404, "{\"ok\":false,\"message\":\"Room not found.\"}");
         return;
       }
-      send_json(hdl, websocketpp::http::status_code::ok,
+      send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room->room_code) + "\",\"room\":" + room_summary_json(*room) + "}");
       return;
     }
     if (clean_uri == "/api/matchmaking/queue-bean" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const std::string tier = form.count("tier") ? form.at("tier") : bean_tier_for_balance(profile->gold);
@@ -2002,17 +2005,17 @@ class PokerServer {
         out << ",\"roomCode\":\"" << escape_json(pending_match_rooms_[auth_session->user_id]) << "\"";
       }
       out << "}";
-      send_json(hdl, websocketpp::http::status_code::ok, out.str());
+      send_json(reply, 200, out.str());
       return;
     }
     if (clean_uri == "/api/matchmaking/queue" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const auto profile = get_profile_by_user_id(auth_session->user_id);
       if (!profile.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Session expired.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
         return;
       }
       const std::string tier = bean_tier_for_balance(profile->gold);
@@ -2030,22 +2033,22 @@ class PokerServer {
         out << ",\"roomCode\":\"" << escape_json(pending_match_rooms_[auth_session->user_id]) << "\"";
       }
       out << "}";
-      send_json(hdl, websocketpp::http::status_code::ok, out.str());
+      send_json(reply, 200, out.str());
       return;
     }
     if (clean_uri == "/api/matchmaking/cancel" && method == "POST") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       matchmaking_queue_.erase(std::remove(matchmaking_queue_.begin(), matchmaking_queue_.end(), auth_session->user_id), matchmaking_queue_.end());
       remove_from_bean_queues(auth_session->user_id);
-      send_json(hdl, websocketpp::http::status_code::ok, "{\"ok\":true,\"state\":\"idle\"}");
+      send_json(reply, 200, "{\"ok\":true,\"state\":\"idle\"}");
       return;
     }
     if (clean_uri == "/api/matchmaking/status" && method == "GET") {
       if (!auth_session.has_value()) {
-        send_json(hdl, websocketpp::http::status_code::unauthorized, "{\"ok\":false,\"message\":\"Login required.\"}");
+        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
         return;
       }
       const bool queued = std::find(matchmaking_queue_.begin(), matchmaking_queue_.end(), auth_session->user_id) != matchmaking_queue_.end();
@@ -2065,50 +2068,22 @@ class PokerServer {
       if (bean_entry) out << ",\"tier\":\"" << escape_json(bean_tier_for_balance(bean_entry->bean_balance)) << "\"";
       if (matched != pending_match_rooms_.end()) out << ",\"roomCode\":\"" << escape_json(matched->second) << "\"";
       out << "}";
-      send_json(hdl, websocketpp::http::status_code::ok, out.str());
+      send_json(reply, 200, out.str());
       return;
     }
-    if (serve_static_file(hdl, uri)) return;
+    if (serve_static_file(reply, uri)) return;
 
-    con->set_status(websocketpp::http::status_code::not_found);
-    con->replace_header("Content-Type", "text/plain; charset=utf-8");
-    con->set_body("Not Found");
+    reply.status = 404;
+    reply.content_type = "text/plain; charset=utf-8";
+    reply.body = "Not Found";
   }
 
-  void on_open(connection_hdl hdl) {
-    Session session;
-    session.socket_id = next_socket_id();
-    bind_http_session_to_socket(session, server_.get_con_from_hdl(hdl)->get_request_header("Cookie"));
-    sessions_[hdl] = session;
-    socket_by_id_[session.socket_id] = hdl;
-    send_connect(hdl, session.socket_id);
-    send_auth_state(session.socket_id, session);
-  }
-
-  void send_connect(connection_hdl hdl, const std::string& socket_id) {
-    nebula::poker::TextMessage msg;
-    msg.set_msg(socket_id);
-    nebula::poker::Envelope env;
-    env.set_event_name("connect");
-    env.set_payload(msg.SerializeAsString());
-    server_.send(hdl, env.SerializeAsString(), websocketpp::frame::opcode::binary);
-  }
-
-  void on_close(connection_hdl hdl) {
-    auto it = sessions_.find(hdl);
-    if (it == sessions_.end()) return;
-    handle_disconnect(it->second);
-    socket_by_id_.erase(it->second.socket_id);
-    sessions_.erase(it);
-  }
-
-  void on_message(connection_hdl hdl, WsServer::message_ptr msg) {
-    if (msg->get_opcode() != websocketpp::frame::opcode::binary) return;
-    auto sit = sessions_.find(hdl);
+  void on_ws_message(const std::string& socket_id, const std::string& payload) {
+    auto sit = sessions_.find(socket_id);
     if (sit == sessions_.end()) return;
 
     nebula::poker::Envelope env;
-    if (!env.ParseFromString(msg->get_payload())) return;
+    if (!env.ParseFromString(payload)) return;
 
     const std::string& event_name = env.event_name();
     Session& session = sit->second;
@@ -2210,7 +2185,7 @@ class PokerServer {
   }
 
   bool is_online(const std::string& socket_id) const {
-    return !socket_id.empty() && socket_by_id_.find(socket_id) != socket_by_id_.end();
+    return !socket_id.empty() && ws_by_socket_id_.find(socket_id) != ws_by_socket_id_.end();
   }
 
   bool is_seat_eligible(Room& room, int seat_idx) {
@@ -2754,9 +2729,9 @@ class PokerServer {
     broadcast_game(room);
     const Seat& seat = room.seats[room.active_seat_idx];
     if (seat.type == Seat::Type::AI || (seat.type == Seat::Type::Player && seat.ai_managed && !is_online(seat.socket_id))) {
-      room.ai_timer = std::make_unique<asio::steady_timer>(server_.get_io_service(), std::chrono::milliseconds(700));
+      room.ai_timer = std::make_unique<net::steady_timer>(ioc_, std::chrono::milliseconds(700));
       int ai_seat_idx = room.active_seat_idx;
-      room.ai_timer->async_wait([this, &room, ai_seat_idx](const asio::error_code& ec) {
+      room.ai_timer->async_wait([this, &room, ai_seat_idx](const boost::system::error_code& ec) {
         if (ec) return;
         if (room.active_seat_idx != ai_seat_idx) return;
         const Seat& active_seat = room.seats[ai_seat_idx];
@@ -3670,9 +3645,14 @@ class PokerServer {
 #endif
   }
 
-  WsServer server_;
-  std::map<connection_hdl, Session, std::owner_less<connection_hdl>> sessions_;
-  std::unordered_map<std::string, connection_hdl> socket_by_id_;
+  net::io_context ioc_;
+  std::optional<tcp::acceptor> acceptor_;
+  std::unordered_map<std::string, Session> sessions_;
+  std::unordered_map<std::string, std::shared_ptr<WsSession>> ws_by_socket_id_;
+
+  void do_accept();
+  void register_ws_session(std::shared_ptr<WsSession> sess);
+  void unregister_ws_session(const std::string& socket_id);
   std::unordered_map<std::string, Room> rooms_;
   std::unordered_map<std::string, std::mutex> room_mutexes_;
   std::unordered_map<std::string, UserProfileData> cached_users_;
@@ -3694,6 +3674,176 @@ class PokerServer {
   std::unique_ptr<AuthStore> auth_store_;
   std::unique_ptr<LeaderboardStore> leaderboard_store_;
 };
+
+struct WsSession : std::enable_shared_from_this<WsSession> {
+  PokerServer* server_;
+  websocket::stream<tcp::socket> ws_;
+  http::request<http::string_body> req_;
+  beast::flat_buffer buffer_;
+  std::string socket_id_;
+  std::deque<std::string> out_queue_;
+  bool writing_{false};
+
+  WsSession(PokerServer* s, tcp::socket&& sock, http::request<http::string_body>&& r)
+      : server_(s), ws_(std::move(sock)), req_(std::move(r)) {}
+
+  void start() {
+    auto self = shared_from_this();
+    ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+    ws_.max_read_message_size(16 * 1024 * 1024);
+    ws_.async_accept(req_, [self](beast::error_code ec) {
+      if (ec) return;
+      self->server_->register_ws_session(self);
+      self->read_loop();
+    });
+  }
+
+  void queue_write(std::string s) {
+    out_queue_.push_back(std::move(s));
+    if (!writing_) pump_write();
+  }
+
+  void pump_write() {
+    if (out_queue_.empty()) {
+      writing_ = false;
+      return;
+    }
+    writing_ = true;
+    auto self = shared_from_this();
+    ws_.binary(true);
+    ws_.async_write(net::buffer(out_queue_.front()), [self](beast::error_code ec, std::size_t) {
+      if (ec) {
+        self->server_->unregister_ws_session(self->socket_id_);
+        return;
+      }
+      self->out_queue_.pop_front();
+      self->pump_write();
+    });
+  }
+
+  void read_loop() {
+    auto self = shared_from_this();
+    ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t n) {
+      if (ec) {
+        self->server_->unregister_ws_session(self->socket_id_);
+        return;
+      }
+      if (self->ws_.got_text()) {
+        self->buffer_.consume(self->buffer_.size());
+        self->read_loop();
+        return;
+      }
+      std::string payload = beast::buffers_to_string(self->buffer_.data());
+      self->buffer_.consume(self->buffer_.size());
+      self->server_->on_ws_message(self->socket_id_, payload);
+      self->read_loop();
+    });
+  }
+};
+
+struct TcpHttpSession : std::enable_shared_from_this<TcpHttpSession> {
+  PokerServer* server_;
+  tcp::socket socket_;
+  beast::flat_buffer buffer_;
+  http::request<http::string_body> req_;
+
+  TcpHttpSession(PokerServer* s, tcp::socket&& sock) : server_(s), socket_(std::move(sock)) {}
+
+  void start() {
+    auto self = shared_from_this();
+    http::async_read(socket_, buffer_, req_, [self](beast::error_code ec, std::size_t) {
+      if (ec) return;
+      if (websocket::is_upgrade(self->req_)) {
+        auto ws = std::make_shared<WsSession>(self->server_, std::move(self->socket_), std::move(self->req_));
+        ws->start();
+        return;
+      }
+      HttpRequestView v;
+      v.method = std::string(self->req_.method_string());
+      v.uri = std::string(self->req_.target());
+      const std::size_t q = v.uri.find('?');
+      v.clean_uri = q == std::string::npos ? v.uri : v.uri.substr(0, q);
+      v.body = self->req_.body();
+      v.cookie_header = self->req_.count(http::field::cookie) ? std::string(self->req_[http::field::cookie]) : "";
+      HttpReply rep;
+      self->server_->handle_http_request(v, rep);
+      http::response<http::string_body> res{static_cast<http::status>(rep.status), self->req_.version()};
+      res.set(http::field::content_type, rep.content_type);
+      if (rep.set_cookie) res.set(http::field::set_cookie, *rep.set_cookie);
+      res.body() = rep.body;
+      res.prepare_payload();
+      http::async_write(self->socket_, res, [self](beast::error_code ec, std::size_t) {
+        if (ec) return;
+        if (self->socket_.is_open()) {
+          beast::error_code se;
+          self->socket_.shutdown(tcp::socket::shutdown_send, se);
+        }
+      });
+    });
+  }
+};
+
+void PokerServer::run(uint16_t port) {
+  tcp::endpoint ep{tcp::v4(), port};
+  beast::error_code ec;
+  acceptor_.emplace(ioc_);
+  acceptor_->open(ep.protocol(), ec);
+  if (ec) {
+    std::cerr << "open: " << ec.message() << "\n";
+    return;
+  }
+  acceptor_->set_option(net::socket_base::reuse_address(true));
+  acceptor_->bind(ep, ec);
+  if (ec) {
+    std::cerr << "bind failed: " << ec.message() << "\n";
+    return;
+  }
+  acceptor_->listen(net::socket_base::max_listen_connections, ec);
+  if (ec) {
+    std::cerr << "listen failed: " << ec.message() << "\n";
+    return;
+  }
+  std::cout << "nebula-poker C++ listening on 0.0.0.0:" << port << "\n";
+  do_accept();
+  ioc_.run();
+}
+
+void PokerServer::do_accept() {
+  auto sock = std::make_shared<tcp::socket>(ioc_);
+  acceptor_->async_accept(*sock, [this, sock](beast::error_code ec) {
+    if (!ec) {
+      std::make_shared<TcpHttpSession>(this, std::move(*sock))->start();
+    }
+    do_accept();
+  });
+}
+
+void PokerServer::register_ws_session(std::shared_ptr<WsSession> sess) {
+  const std::string cookie =
+      sess->req_.count(http::field::cookie) ? std::string(sess->req_[http::field::cookie]) : "";
+  Session session;
+  session.socket_id = next_socket_id();
+  bind_http_session_to_socket(session, cookie);
+  sessions_[session.socket_id] = session;
+  sess->socket_id_ = session.socket_id;
+  ws_by_socket_id_[session.socket_id] = sess;
+  nebula::poker::TextMessage msg;
+  msg.set_msg(session.socket_id);
+  nebula::poker::Envelope env;
+  env.set_event_name("connect");
+  env.set_payload(msg.SerializeAsString());
+  sess->queue_write(env.SerializeAsString());
+  send_auth_state(session.socket_id, sessions_[session.socket_id]);
+}
+
+void PokerServer::unregister_ws_session(const std::string& socket_id) {
+  if (socket_id.empty()) return;
+  ws_by_socket_id_.erase(socket_id);
+  auto it = sessions_.find(socket_id);
+  if (it == sessions_.end()) return;
+  handle_disconnect(it->second);
+  sessions_.erase(it);
+}
 
 }  // namespace
 

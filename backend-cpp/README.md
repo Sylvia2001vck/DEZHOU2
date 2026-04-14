@@ -4,12 +4,20 @@ This directory contains a C++ replacement for the original `server.js`.
 
 ## Stack
 
-- `websocketpp + asio` for browser WebSocket connections
+- `Boost.Beast` (WebSocket + HTTP) on `Boost.Asio` for browser connections
 - `Protocol Buffers` for all client/server event payloads
 - `MySQL` for user profile persistence when connector headers/libs are available
 - `Redis` sorted sets for leaderboard updates when `hiredis` is available
 
 ## Build
+
+Install Boost (Beast/Asio) and Protobuf, e.g. on Ubuntu:
+
+```bash
+sudo apt install libboost-system-dev libboost-thread-dev protobuf-compiler libprotobuf-dev
+```
+
+Then:
 
 ```bash
 cmake -S backend-cpp -B build

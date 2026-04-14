@@ -6,50 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyWebSocketPPPatch.cmake")
-include(FetchContent)
+find_package(Boost 1.71 REQUIRED COMPONENTS system thread)
+find_package(Threads REQUIRED)
 
 option(NEBULA_ENABLE_MYSQL "Enable MySQL-backed user persistence" ON)
 option(NEBULA_ENABLE_REDIS "Enable Redis-backed leaderboards" ON)
 
-FetchContent_Declare(
-  asio
-  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-  GIT_TAG asio-1-30-2
-)
-
-FetchContent_MakeAvailable(asio)
-
-# WebSocket++：POSIX 宏（access/error/…）会破坏头文件解析；固定 0.8.2 + patches/*.patch（git apply），与 CMake 3.22 兼容。
-# 离线：将 upstream 0.8.2 树放到 extern/websocketpp（与补丁一致）。
-set(_WSPP_LOCAL "${CMAKE_CURRENT_SOURCE_DIR}/extern/websocketpp")
-if(EXISTS "${_WSPP_LOCAL}/websocketpp/server.hpp")
-  set(WEBSOCKETPP_ROOT "${_WSPP_LOCAL}")
-  message(STATUS "WebSocket++: using local ${_WSPP_LOCAL}")
-else()
-  FetchContent_Declare(
-    websocketpp
-    GIT_REPOSITORY https://github.com/zaphoyd/websocketpp.git
-    GIT_TAG 0.8.2
-  )
-  # 不要用 MakeAvailable：会执行 websocketpp 顶层 CMakeLists，多一层子工程且与头文件-only 用法无关。
-  FetchContent_GetProperties(websocketpp)
-  if(NOT websocketpp_POPULATED)
-    FetchContent_Populate(websocketpp)
-  endif()
-  set(WEBSOCKETPP_ROOT "${websocketpp_SOURCE_DIR}")
-  message(STATUS "WebSocket++: FetchContent Populate (headers only) -> ${WEBSOCKETPP_ROOT}")
-endif()
-
-nebula_apply_websocketpp_patch(
-  "${WEBSOCKETPP_ROOT}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/patches/websocketpp_0.8.2_linux_posix.patch"
-)
-
-find_package(Threads REQUIRED)
-
 # 使用系统 Protobuf（apt: protobuf-compiler libprotobuf-dev）。
-# 从源码 Fetch Protobuf 后再 find_package(Protobuf MODULE) 往往找不到，且依赖 CMake 3.24+ 的 OVERRIDE_FIND_PACKAGE。
 find_package(Protobuf REQUIRED)
 if(NOT Protobuf_PROTOC_EXECUTABLE)
   message(FATAL_ERROR "protoc not found. Install: sudo apt install protobuf-compiler libprotobuf-dev")
@@ -83,18 +46,17 @@ target_include_directories(
   nebula-poker-server
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
-    # protobuf_generate 输出与 .proto 相对路径一致：build/proto/poker.pb.h
     ${CMAKE_CURRENT_BINARY_DIR}/proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${asio_SOURCE_DIR}/asio/include
-    ${WEBSOCKETPP_ROOT}
 )
 
-target_compile_definitions(
+target_link_libraries(
   nebula-poker-server
   PRIVATE
-    ASIO_STANDALONE
-    _WEBSOCKETPP_CPP11_STL_
+    Boost::system
+    Boost::thread
+    protobuf::libprotobuf
+    Threads::Threads
 )
 
 if(NEBULA_HAVE_MYSQL)
@@ -109,23 +71,12 @@ if(NEBULA_HAVE_HIREDIS)
   target_compile_definitions(nebula-poker-server PRIVATE NEBULA_HAVE_HIREDIS=1)
 endif()
 
-target_link_libraries(
-  nebula-poker-server
-  PRIVATE
-    protobuf::libprotobuf
-    Threads::Threads
-)
-
 if(MSVC)
   target_compile_options(nebula-poker-server PRIVATE /W4 /permissive-)
 else()
-  # BEFORE 必须紧跟在 target 名之后；若写成 PRIVATE BEFORE …，会把字面量 BEFORE 传给 c++。
-  # -Uaccess / -Uerror：避免 unistd.h 等把 access / error 定义成宏，破坏 channel_type_hint::access|error。
   target_compile_options(
     nebula-poker-server
-    BEFORE PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Uaccess>
-    $<$<COMPILE_LANGUAGE:CXX>:-Uerror>
+    PRIVATE
     -Wall
     -Wextra
     -Wpedantic
