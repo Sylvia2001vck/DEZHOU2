@@ -60,6 +60,8 @@ target_include_directories(
   nebula-poker-server
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
+    # protobuf_generate 输出与 .proto 相对路径一致：build/proto/poker.pb.h
+    ${CMAKE_CURRENT_BINARY_DIR}/proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${asio_SOURCE_DIR}/asio/include
     ${websocketpp_SOURCE_DIR}

@@ -1428,13 +1428,35 @@ class PokerServer {
       path = uri.substr(1);
     }
     if (path.empty()) return false;
-    std::filesystem::path candidate = std::filesystem::current_path() / path;
-    if (!std::filesystem::exists(candidate)) {
-      candidate = std::filesystem::current_path().parent_path() / path;
+    // Paths are relative to repo root (e.g. DEZHOU2/index.html). If the binary is started from
+    // backend-cpp/build, cwd may be too deep — walk up parents (and optional NEBULA_REPO_ROOT).
+    std::filesystem::path resolved;
+    bool found = false;
+    const std::string repo_root = get_env("NEBULA_REPO_ROOT", "");
+    if (!repo_root.empty()) {
+      std::error_code ec;
+      const auto candidate = std::filesystem::path(repo_root) / path;
+      const auto canon = std::filesystem::weakly_canonical(candidate, ec);
+      if (!ec && std::filesystem::exists(canon)) {
+        resolved = canon;
+        found = true;
+      }
     }
-    std::error_code ec;
-    const std::filesystem::path resolved = std::filesystem::weakly_canonical(candidate, ec);
-    if (ec || !std::filesystem::exists(resolved)) return false;
+    if (!found) {
+      for (std::filesystem::path base = std::filesystem::current_path();;) {
+        std::error_code ec;
+        const auto candidate = base / path;
+        const auto canon = std::filesystem::weakly_canonical(candidate, ec);
+        if (!ec && std::filesystem::exists(canon)) {
+          resolved = canon;
+          found = true;
+          break;
+        }
+        if (base == base.parent_path()) break;
+        base = base.parent_path();
+      }
+    }
+    if (!found) return false;
     const std::string body = read_file(resolved.string());
     if (body.empty()) return false;
     auto con = server_.get_con_from_hdl(hdl);
