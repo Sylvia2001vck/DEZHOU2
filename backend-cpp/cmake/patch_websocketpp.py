@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 POSIX unistd.h #defines `access` (and sometimes collides with `error` / `value`).
-That breaks websocketpp/logger/levels.hpp first:
+That breaks websocketpp/logger/levels.hpp:
 
   struct channel_type_hint {
     typedef uint32_t value;
-    static value const access = 1;   // <- token `access` is macro-expanded
+    static value const access = 1;
     static value const error = 2;
   };
 
-Patch must run *before* that struct is parsed: insert an undef block right after
-the include guard in levels.hpp, and keep secondary patches before namespace in
-other headers for headers that pull unistd again later.
+core.hpp includes <websocketpp/logger/stub.hpp> before <.../basic.hpp>; stub.hpp
+uses channel_type_hint::value in constructors, so we also patch:
+  - config/core.hpp: undef right after the `// Loggers` line (before stub/basic includes)
+  - logger/stub.hpp: undef before namespace (after its #includes)
+  - logger/levels.hpp: undef immediately before `struct channel_type_hint`
 
 Requires: Python 3.6+.
 """
@@ -20,10 +22,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
-MARKER = "NEBULA_POSIX_MACRO_UNDO_V4"
+MARKER = "NEBULA_POSIX_MACRO_UNDO_V5"
 
-# Unconditional #undef: #ifdef(access) is false when it's a function-like macro name
-# but the macro still breaks ::access in source; we must always undef these tokens.
 SNIPPET = """// {m}: POSIX macros break channel_type_hint::access/error/value and template name `basic`
 #undef access
 #undef error
@@ -33,8 +33,24 @@ SNIPPET = """// {m}: POSIX macros break channel_type_hint::access/error/value an
 
 """.format(m=MARKER)
 
-# Previous patch snippets to strip before re-applying
+# Older patch snippets (strip before re-applying)
 _STRIP_BLOCKS = (
+    # V4
+    """// NEBULA_POSIX_MACRO_UNDO_V4: POSIX macros break channel_type_hint::access/error/value and template name `basic`
+#undef access
+#undef error
+#undef value
+#undef basic
+#undef names
+
+""",
+    """// NEBULA_POSIX_MACRO_UNDO_V4: POSIX macros break channel_type_hint::access/error/value and template name `basic`
+#undef access
+#undef error
+#undef value
+#undef basic
+#undef names
+""",
     # V3
     """// NEBULA_POSIX_MACRO_UNDO_V3: POSIX headers may #define access/error; breaks channel_type_hint::access etc.
 #ifdef access
@@ -78,7 +94,6 @@ def _strip_old(text: str) -> str:
 
 
 def _insert_before_line_starting_with(text: str, line_prefix: str) -> str:
-    """Insert SNIPPET immediately before the first line whose stripped content starts with line_prefix."""
     lines = text.splitlines(keepends=True)
     insert_at = None
     for i, line in enumerate(lines):
@@ -87,6 +102,25 @@ def _insert_before_line_starting_with(text: str, line_prefix: str) -> str:
             break
     if insert_at is None:
         raise RuntimeError(f"no line starting with {line_prefix!r}")
+    out = lines[:insert_at]
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    out.append("\n")
+    out.append(SNIPPET)
+    out.extend(lines[insert_at:])
+    return "".join(out)
+
+
+def _insert_after_line_containing(text: str, line_substr: str) -> str:
+    """Insert SNIPPET after the first line that contains line_substr (e.g. '// Loggers')."""
+    lines = text.splitlines(keepends=True)
+    insert_at = None
+    for i, line in enumerate(lines):
+        if line_substr in line:
+            insert_at = i + 1
+            break
+    if insert_at is None:
+        raise RuntimeError(f"no line containing {line_substr!r}")
     out = lines[:insert_at]
     if out and not out[-1].endswith("\n"):
         out[-1] += "\n"
@@ -123,9 +157,9 @@ def _patch_file(path: pathlib.Path, mode: str) -> bool:
 
     text = _strip_old(raw)
 
-    if mode == "before_struct_channel_type_hint":
-        # Must be after #includes in this file (they may pull unistd.h) and before the struct that
-        # declares `static value const access` / `error` (POSIX macros break those lines).
+    if mode == "after_loggers_in_core":
+        text = _insert_after_line_containing(text, "// Loggers")
+    elif mode == "before_struct_channel_type_hint":
         text = _insert_before_line_starting_with(text, "struct channel_type_hint")
     elif mode == "before_namespace":
         text = _insert_before_first_namespace_websocketpp(text)
@@ -146,8 +180,11 @@ def main() -> int:
         print(f"ERROR: not a directory: {root}", file=sys.stderr)
         return 1
 
+    # Order matters for human readability only; each file is independent.
     jobs = (
+        ("websocketpp/config/core.hpp", "after_loggers_in_core"),
         ("websocketpp/logger/levels.hpp", "before_struct_channel_type_hint"),
+        ("websocketpp/logger/stub.hpp", "before_namespace"),
         ("websocketpp/logger/basic.hpp", "before_namespace"),
         ("websocketpp/endpoint.hpp", "before_namespace"),
         ("websocketpp/roles/server_endpoint.hpp", "before_namespace"),
