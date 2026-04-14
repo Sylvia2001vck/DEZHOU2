@@ -31,9 +31,13 @@ else()
     GIT_REPOSITORY https://github.com/zaphoyd/websocketpp.git
     GIT_TAG master
   )
-  FetchContent_MakeAvailable(websocketpp)
+  # 不要用 MakeAvailable：会执行 websocketpp 顶层 CMakeLists，多一层子工程且与头文件-only 用法无关。
+  FetchContent_GetProperties(websocketpp)
+  if(NOT websocketpp_POPULATED)
+    FetchContent_Populate(websocketpp)
+  endif()
   set(WEBSOCKETPP_ROOT "${websocketpp_SOURCE_DIR}")
-  message(STATUS "WebSocket++: FetchContent from GitHub master -> ${WEBSOCKETPP_ROOT}")
+  message(STATUS "WebSocket++: FetchContent Populate (headers only) -> ${WEBSOCKETPP_ROOT}")
 endif()
 
 find_package(Threads REQUIRED)
@@ -109,6 +113,15 @@ target_link_libraries(
 if(MSVC)
   target_compile_options(nebula-poker-server PRIVATE /W4 /permissive-)
 else()
-  # POSIX headers expose `access` as a macro; WebSocket++ uses channel_type_hint::access (enum).
-  target_compile_options(nebula-poker-server PRIVATE -Wall -Wextra -Wpedantic -Uaccess)
+  # BEFORE：确保 -Uaccess 早于任何会 #define access 的系统头（unistd.h）。
+  target_compile_options(
+    nebula-poker-server
+    PRIVATE
+    BEFORE
+    $<$<COMPILE_LANGUAGE:CXX>:-Uaccess>
+    $<$<COMPILE_LANGUAGE:CXX>:-Uerror>
+    -Wall
+    -Wextra
+    -Wpedantic
+  )
 endif()

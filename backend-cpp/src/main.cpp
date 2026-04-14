@@ -2,6 +2,17 @@
 #define ASIO_STANDALONE
 #endif
 
+// WebSocket++ 必须尽量靠前：任何先包含的系统头都可能通过 unistd.h 定义 access 宏，
+// 破坏 websocketpp::log::channel_type_hint::access / error 等枚举成员名。
+#undef access
+#undef error
+#include <websocketpp/config/asio_no_tls.hpp>
+#undef access
+#undef error
+#include <websocketpp/server.hpp>
+#undef access
+#undef error
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -28,15 +39,6 @@
 #include <vector>
 
 #include <asio/steady_timer.hpp>
-// POSIX <unistd.h> often #defines `access` — breaks websocketpp::log::channel_type_hint::access
-// Nested includes may re-introduce the macro between our headers; #undef before each WSPP include.
-#undef access
-#include <websocketpp/config/asio_no_tls.hpp>
-#undef access
-#include <websocketpp/server.hpp>
-#undef access
-
-// WebSocket++ must come before Protobuf (some protobuf deps pollute macros).
 
 #include <google/protobuf/message.h>
 
