@@ -24,9 +24,12 @@
 #include <vector>
 
 #include <asio/steady_timer.hpp>
-#include <google/protobuf/message.h>
+// WebSocket++ must come before Protobuf: some protobuf transitive headers define macros
+// that break websocketpp/logger/basic.hpp (constructors parse as invalid syntax on GCC).
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
+
+#include <google/protobuf/message.h>
 
 #include "poker.pb.h"
 #include "sha256.hpp"
@@ -815,13 +818,8 @@ class MemoryLeaderboardStore final : public LeaderboardStore {
   }
 
   std::string to_json(const std::string& type, int limit) override {
-    struct Row {
-      std::string username;
-      int64_t gold;
-      double win_rate;
-      int64_t weekly;
-    };
     std::vector<Row> rows;
+    rows.reserve(entries_.size());
     for (const auto& [_, entry] : entries_) rows.push_back(entry);
     if (type == "winrate") {
       std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.win_rate > b.win_rate; });
@@ -921,7 +919,6 @@ class PokerServer {
   }
 
  private:
-  template <typename T>
   std::string make_envelope_bytes(const std::string& event_name, const google::protobuf::Message& message) {
     nebula::poker::Envelope env;
     env.set_event_name(event_name);
