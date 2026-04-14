@@ -1,0 +1,23 @@
+config:
+  target: "{{ $processEnvironment.LOAD_SERVER_URL || 'http://127.0.0.1:3000' }}"
+  phases:
+    - duration: 20
+      arrivalRate: 10
+  socketio:
+    transports: ["websocket"]
+scenarios:
+  - name: "two rooms isolated"
+    engine: socketio
+    flow:
+      - emit:
+          channel: "join_room"
+          data:
+            roomId: "{{ $randomString() }}"
+            name: "load-user-{{ $uuid }}"
+            clientId: "{{ $uuid }}"
+      - think: 1
+      - emit:
+          channel: "take_seat"
+          data:
+            seatIdx: 0
+      - think: 1

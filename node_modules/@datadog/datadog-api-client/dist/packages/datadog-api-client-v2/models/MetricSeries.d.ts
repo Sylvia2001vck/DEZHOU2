@@ -1,0 +1,73 @@
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+import { MetricIntakeType } from "./MetricIntakeType";
+import { MetricMetadata } from "./MetricMetadata";
+import { MetricPoint } from "./MetricPoint";
+import { MetricResource } from "./MetricResource";
+import { AttributeTypeMap } from "../../datadog-api-client-common/util";
+/**
+ * A metric to submit to Datadog.
+ * See [Datadog metrics](https://docs.datadoghq.com/developers/metrics/#custom-metrics-properties).
+ */
+export declare class MetricSeries {
+    /**
+     * If the type of the metric is rate or count, define the corresponding interval in seconds.
+     */
+    "interval"?: number;
+    /**
+     * Metadata for the metric.
+     */
+    "metadata"?: MetricMetadata;
+    /**
+     * The name of the timeseries.
+     */
+    "metric": string;
+    /**
+     * Points relating to a metric. All points must be objects with timestamp and a scalar value (cannot be a string). Timestamps should be in POSIX time in seconds, and cannot be more than ten minutes in the future or more than one hour in the past.
+     */
+    "points": Array<MetricPoint>;
+    /**
+     * A list of resources to associate with this metric.
+     */
+    "resources"?: Array<MetricResource>;
+    /**
+     * The source type name.
+     */
+    "sourceTypeName"?: string;
+    /**
+     * A list of tags associated with the metric.
+     */
+    "tags"?: Array<string>;
+    /**
+     * The type of metric. The available types are `0` (unspecified), `1` (count), `2` (rate), and `3` (gauge).
+     */
+    "type"?: MetricIntakeType;
+    /**
+     * The unit of point value.
+     */
+    "unit"?: string;
+    /**
+     * A container for additional, undeclared properties.
+     * This is a holder for any undeclared properties as specified with
+     * the 'additionalProperties' keyword in the OAS document.
+     */
+    "additionalProperties"?: {
+        [key: string]: any;
+    };
+    /**
+     * @ignore
+     */
+    "_unparsed"?: boolean;
+    /**
+     * @ignore
+     */
+    static readonly attributeTypeMap: AttributeTypeMap;
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap(): AttributeTypeMap;
+    constructor();
+}

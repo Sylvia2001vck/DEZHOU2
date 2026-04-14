@@ -1,0 +1,43 @@
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+import { SuppressionVersions } from "./SuppressionVersions";
+import { AttributeTypeMap } from "../../datadog-api-client-common/util";
+/**
+ * Response object containing the version history of a suppression.
+ */
+export declare class SuppressionVersionHistory {
+    /**
+     * The number of suppression versions.
+     */
+    "count"?: number;
+    /**
+     * The version history of a suppression.
+     */
+    "data"?: {
+        [key: string]: SuppressionVersions;
+    };
+    /**
+     * A container for additional, undeclared properties.
+     * This is a holder for any undeclared properties as specified with
+     * the 'additionalProperties' keyword in the OAS document.
+     */
+    "additionalProperties"?: {
+        [key: string]: any;
+    };
+    /**
+     * @ignore
+     */
+    "_unparsed"?: boolean;
+    /**
+     * @ignore
+     */
+    static readonly attributeTypeMap: AttributeTypeMap;
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap(): AttributeTypeMap;
+    constructor();
+}

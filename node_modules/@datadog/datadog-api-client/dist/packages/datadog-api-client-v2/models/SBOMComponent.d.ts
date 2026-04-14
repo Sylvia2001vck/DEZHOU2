@@ -1,0 +1,68 @@
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+import { SBOMComponentLicense } from "./SBOMComponentLicense";
+import { SBOMComponentProperty } from "./SBOMComponentProperty";
+import { SBOMComponentSupplier } from "./SBOMComponentSupplier";
+import { SBOMComponentType } from "./SBOMComponentType";
+import { AttributeTypeMap } from "../../datadog-api-client-common/util";
+/**
+ * Software or hardware component.
+ */
+export declare class SBOMComponent {
+    /**
+     * An optional identifier that can be used to reference the component elsewhere in the BOM.
+     */
+    "bomRef"?: string;
+    /**
+     * The software licenses of the SBOM component.
+     */
+    "licenses"?: Array<SBOMComponentLicense>;
+    /**
+     * The name of the component. This will often be a shortened, single name of the component.
+     */
+    "name": string;
+    /**
+     * The custom properties of the component of the SBOM.
+     */
+    "properties"?: Array<SBOMComponentProperty>;
+    /**
+     * Specifies the package-url (purl). The purl, if specified, MUST be valid and conform to the [specification](https://github.com/package-url/purl-spec).
+     */
+    "purl"?: string;
+    /**
+     * The supplier of the component.
+     */
+    "supplier": SBOMComponentSupplier;
+    /**
+     * The SBOM component type
+     */
+    "type": SBOMComponentType;
+    /**
+     * The component version.
+     */
+    "version": string;
+    /**
+     * A container for additional, undeclared properties.
+     * This is a holder for any undeclared properties as specified with
+     * the 'additionalProperties' keyword in the OAS document.
+     */
+    "additionalProperties"?: {
+        [key: string]: any;
+    };
+    /**
+     * @ignore
+     */
+    "_unparsed"?: boolean;
+    /**
+     * @ignore
+     */
+    static readonly attributeTypeMap: AttributeTypeMap;
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap(): AttributeTypeMap;
+    constructor();
+}

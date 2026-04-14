@@ -1,0 +1,52 @@
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+import { MetricCustomAggregation } from "./MetricCustomAggregation";
+import { AttributeTypeMap } from "../../datadog-api-client-common/util";
+/**
+ * Object containing the definition of a metric tag configuration to be updated.
+ */
+export declare class MetricTagConfigurationUpdateAttributes {
+    /**
+     * Deprecated. You no longer need to configure specific time and space aggregations for Metrics Without Limits.
+     */
+    "aggregations"?: Array<MetricCustomAggregation>;
+    /**
+     * When set to true, the configuration will exclude the configured tags and include any other submitted tags.
+     * When set to false, the configuration will include the configured tags and exclude any other submitted tags.
+     * Defaults to false. Requires `tags` property.
+     */
+    "excludeTagsMode"?: boolean;
+    /**
+     * Toggle to include/exclude percentiles for a distribution metric.
+     * Defaults to false. Can only be applied to metrics that have a `metric_type` of `distribution`.
+     */
+    "includePercentiles"?: boolean;
+    /**
+     * A list of tag keys that will be queryable for your metric.
+     */
+    "tags"?: Array<string>;
+    /**
+     * A container for additional, undeclared properties.
+     * This is a holder for any undeclared properties as specified with
+     * the 'additionalProperties' keyword in the OAS document.
+     */
+    "additionalProperties"?: {
+        [key: string]: any;
+    };
+    /**
+     * @ignore
+     */
+    "_unparsed"?: boolean;
+    /**
+     * @ignore
+     */
+    static readonly attributeTypeMap: AttributeTypeMap;
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap(): AttributeTypeMap;
+    constructor();
+}

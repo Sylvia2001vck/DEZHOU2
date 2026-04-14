@@ -1,0 +1,316 @@
+syntax = "proto3";
+
+package nebula.poker;
+
+message Envelope {
+  string event_name = 1;
+  bytes payload = 2;
+}
+
+message Empty {}
+
+message JoinRoomRequest {
+  string roomId = 1;
+  string name = 2;
+  string clientId = 3;
+  string reconnectToken = 4;
+  string sessionId = 5;
+}
+
+message SeatRequest {
+  int32 seatIdx = 1;
+  string reconnectToken = 2;
+  string sessionId = 3;
+}
+
+message StartGameRequest {
+  int32 totalHands = 1;
+  int32 initialChips = 2;
+}
+
+message ActionRequest {
+  string type = 1;
+  int32 raiseBy = 2;
+}
+
+message AmountRequest {
+  int32 amount = 1;
+}
+
+message DecorRequest {
+  string decor = 1;
+}
+
+message RebuyApproveRequest {
+  int32 seatIdx = 1;
+  int32 amount = 2;
+}
+
+message VoiceSignalMessage {
+  string to = 1;
+  string from = 2;
+  bytes data = 3;
+}
+
+message ErrorMessage {
+  string msg = 1;
+}
+
+message TextMessage {
+  string msg = 1;
+}
+
+message RoomClosed {
+  string roomId = 1;
+  string reason = 2;
+}
+
+message UserProfile {
+  int64 userId = 1;
+  string externalId = 2;
+  string username = 3;
+  string avatar = 4;
+  int64 gold = 5;
+  int32 gamesPlayed = 6;
+  int32 gamesWon = 7;
+}
+
+message AuthState {
+  bool authenticated = 1;
+  UserProfile profile = 2;
+}
+
+message YouState {
+  string roomId = 1;
+  int32 seatIdx = 2;
+  bool isHost = 3;
+}
+
+message Seat {
+  string type = 1;
+  int32 seatIdx = 2;
+  string name = 3;
+  string decor = 4;
+  string socketId = 5;
+  string clientId = 6;
+  bool aiManaged = 7;
+  int64 disconnectedAt = 8;
+}
+
+message RoomSettings {
+  int32 totalHands = 1;
+  int32 initialChips = 2;
+  int32 smallBlind = 3;
+  int32 bigBlind = 4;
+}
+
+message RoomState {
+  string roomId = 1;
+  string hostSocketId = 2;
+  int32 hostSeatIdx = 3;
+  bool isHost = 4;
+  bool started = 5;
+  repeated Seat seats = 6;
+  RoomSettings settings = 7;
+  int64 ownerUserId = 8;
+  string roomCode = 9;
+  string visibility = 10;
+  string status = 11;
+  int32 maxPlayers = 12;
+}
+
+message Card {
+  string s = 1;
+  string r = 2;
+  int32 v = 3;
+}
+
+message PlayerState {
+  int32 seatIdx = 1;
+  string name = 2;
+  string type = 3;
+  int32 chips = 4;
+  int32 currentBet = 5;
+  bool isFolded = 6;
+  bool isBankrupt = 7;
+  int32 totalBuyIn = 8;
+}
+
+message GameState {
+  string roomId = 1;
+  bool started = 2;
+  RoomSettings settings = 3;
+  int32 handNum = 4;
+  int32 dealerSeatIdx = 5;
+  int32 sbSeatIdx = 6;
+  int32 bbSeatIdx = 7;
+  int32 activeSeatIdx = 8;
+  int32 pot = 9;
+  string round = 10;
+  repeated Card communityCards = 11;
+  int32 currentMaxBet = 12;
+  int32 minRaise = 13;
+  repeated PlayerState players = 14;
+}
+
+message PrivateHand {
+  int32 seatIdx = 1;
+  repeated Card hand = 2;
+}
+
+message ActivitySync {
+  repeated string items = 1;
+}
+
+message PlayerAction {
+  int32 seatIdx = 1;
+  string text = 2;
+}
+
+message TurnMessage {
+  int32 activeSeatIdx = 1;
+  int32 turnNonce = 2;
+}
+
+message Winner {
+  int32 seatIdx = 1;
+  string name = 2;
+}
+
+message ShowdownHand {
+  int32 seatIdx = 1;
+  string name = 2;
+  repeated Card hand = 3;
+}
+
+message HandOver {
+  int32 handNum = 1;
+  int32 totalHands = 2;
+  repeated Winner winners = 3;
+  string desc = 4;
+  repeated ShowdownHand showdownHands = 5;
+}
+
+message Standing {
+  int32 seatIdx = 1;
+  string type = 2;
+  string name = 3;
+  int32 chips = 4;
+  int32 buyIn = 5;
+  int32 net = 6;
+}
+
+message MatchHand {
+  int32 handNum = 1;
+  repeated Winner winners = 2;
+  string desc = 3;
+}
+
+message MatchOver {
+  string roomId = 1;
+  int32 totalHands = 2;
+  int32 scheduledHands = 3;
+  int32 playedHands = 4;
+  repeated Standing standings = 5;
+  repeated MatchHand hands = 6;
+}
+
+message VoicePeer {
+  string socketId = 1;
+  int32 seatIdx = 2;
+  string name = 3;
+}
+
+message VoicePeers {
+  repeated VoicePeer peers = 1;
+}
+
+message VoicePeerJoined {
+  VoicePeer peer = 1;
+}
+
+message VoicePeerLeft {
+  string socketId = 1;
+}
+
+message RebuyRequested {
+  int32 seatIdx = 1;
+  string name = 2;
+  int32 amount = 3;
+}
+
+message RebuyDenied {
+  string msg = 1;
+}
+
+message SeatTaken {
+  int32 seatIdx = 1;
+}
+
+message SeatSession {
+  string roomId = 1;
+  string reconnectToken = 2;
+  string sessionId = 3;
+  int64 lastSeenSeq = 4;
+}
+
+message RoomSummary {
+  string roomCode = 1;
+  string status = 2;
+  string visibility = 3;
+  int32 playerCount = 4;
+  int32 maxPlayers = 5;
+  int64 ownerUserId = 6;
+}
+
+message MatchmakingStatus {
+  string state = 1;
+  string roomCode = 2;
+  int32 queuedPlayers = 3;
+  int32 threshold = 4;
+}
+
+message MatchFound {
+  string roomCode = 1;
+  int32 queuedPlayers = 2;
+}
+
+message CreateRoomRequest {
+  string visibility = 1;
+  int32 totalHands = 2;
+  int32 initialChips = 3;
+}
+
+message CreateRoomResponse {
+  bool ok = 1;
+  string roomCode = 2;
+  RoomSummary room = 3;
+  string message = 4;
+}
+
+message JoinRoomCodeRequest {
+  string roomCode = 1;
+}
+
+message JoinRoomCodeResponse {
+  bool ok = 1;
+  RoomSummary room = 2;
+  string message = 3;
+}
+
+message Kicked {
+  int32 seatIdx = 1;
+  string msg = 2;
+}
+
+message LeaderboardEntry {
+  string username = 1;
+  int64 gold = 2;
+  double winRate = 3;
+  int64 weeklyScore = 4;
+}
+
+message LeaderboardResponse {
+  string type = 1;
+  repeated LeaderboardEntry entries = 2;
+}

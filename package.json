@@ -1,0 +1,26 @@
+{
+  "name": "nebula-poker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "load:autocannon": "autocannon -c 30 -d 20 http://127.0.0.1:3000/healthz",
+    "load:artillery:rooms": "artillery run scripts/load/multi-room-artillery.yml",
+    "load:socketio": "node scripts/load/socketio-bet-storm.mjs",
+    "test:reconnect": "node scripts/load/reconnect-takeover-test.mjs",
+    "cpp:load:rooms": "node scripts/load/cpp-proto-room-storm.mjs",
+    "cpp:test:reconnect": "node scripts/load/cpp-proto-reconnect-test.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "artillery": "^2.0.30",
+    "async-mutex": "^0.5.0",
+    "autocannon": "^8.0.0",
+    "socket.io-client": "^4.8.3"
+  }
+}

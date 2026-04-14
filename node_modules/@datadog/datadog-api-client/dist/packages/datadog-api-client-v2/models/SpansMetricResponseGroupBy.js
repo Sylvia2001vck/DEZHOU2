@@ -1,0 +1,39 @@
+"use strict";
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.SpansMetricResponseGroupBy = void 0;
+/**
+ * A group by rule.
+ */
+class SpansMetricResponseGroupBy {
+    constructor() { }
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap() {
+        return SpansMetricResponseGroupBy.attributeTypeMap;
+    }
+}
+exports.SpansMetricResponseGroupBy = SpansMetricResponseGroupBy;
+/**
+ * @ignore
+ */
+SpansMetricResponseGroupBy.attributeTypeMap = {
+    path: {
+        baseName: "path",
+        type: "string",
+    },
+    tagName: {
+        baseName: "tag_name",
+        type: "string",
+    },
+    additionalProperties: {
+        baseName: "additionalProperties",
+        type: "{ [key: string]: any; }",
+    },
+};
+//# sourceMappingURL=SpansMetricResponseGroupBy.js.map

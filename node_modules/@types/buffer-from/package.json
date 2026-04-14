@@ -1,0 +1,27 @@
+{
+    "name": "@types/buffer-from",
+    "version": "1.1.3",
+    "description": "TypeScript definitions for buffer-from",
+    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/buffer-from",
+    "license": "MIT",
+    "contributors": [
+        {
+            "name": "Nat Burns",
+            "githubUsername": "burnnat",
+            "url": "https://github.com/burnnat"
+        }
+    ],
+    "main": "",
+    "types": "index.d.ts",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
+        "directory": "types/buffer-from"
+    },
+    "scripts": {},
+    "dependencies": {
+        "@types/node": "*"
+    },
+    "typesPublisherContentHash": "9120b76adcc727867d288178a65f13179190d2252fbc035fb368d9658f07eef5",
+    "typeScriptVersion": "4.5"
+}

@@ -1,0 +1,43 @@
+"use strict";
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DowntimeScheduleCurrentDowntimeResponse = void 0;
+/**
+ * The most recent actual start and end dates for a recurring downtime. For a canceled downtime,
+ * this is the previously occurring downtime. For active downtimes, this is the ongoing downtime, and for scheduled
+ * downtimes it is the upcoming downtime.
+ */
+class DowntimeScheduleCurrentDowntimeResponse {
+    constructor() { }
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap() {
+        return DowntimeScheduleCurrentDowntimeResponse.attributeTypeMap;
+    }
+}
+exports.DowntimeScheduleCurrentDowntimeResponse = DowntimeScheduleCurrentDowntimeResponse;
+/**
+ * @ignore
+ */
+DowntimeScheduleCurrentDowntimeResponse.attributeTypeMap = {
+    end: {
+        baseName: "end",
+        type: "Date",
+        format: "date-time",
+    },
+    start: {
+        baseName: "start",
+        type: "Date",
+        format: "date-time",
+    },
+    additionalProperties: {
+        baseName: "additionalProperties",
+        type: "{ [key: string]: any; }",
+    },
+};
+//# sourceMappingURL=DowntimeScheduleCurrentDowntimeResponse.js.map

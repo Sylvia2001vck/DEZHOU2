@@ -1,0 +1,72 @@
+/**
+ * Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+ * This product includes software developed at Datadog (https://www.datadoghq.com/).
+ * Copyright 2020-Present Datadog, Inc.
+ */
+import { AttributeTypeMap } from "../../datadog-api-client-common/util";
+/**
+ * Details of a rule.
+ */
+export declare class RuleAttributes {
+    /**
+     * The scorecard name to which this rule must belong.
+     */
+    "category"?: string;
+    /**
+     * Creation time of the rule outcome.
+     */
+    "createdAt"?: Date;
+    /**
+     * Defines if the rule is a custom rule.
+     */
+    "custom"?: boolean;
+    /**
+     * Explanation of the rule.
+     */
+    "description"?: string;
+    /**
+     * If enabled, the rule is calculated as part of the score.
+     */
+    "enabled"?: boolean;
+    /**
+     * The maturity level of the rule (1, 2, or 3).
+     */
+    "level"?: number;
+    /**
+     * Time of the last rule outcome modification.
+     */
+    "modifiedAt"?: Date;
+    /**
+     * Name of the rule.
+     */
+    "name"?: string;
+    /**
+     * Owner of the rule.
+     */
+    "owner"?: string;
+    /**
+     * The scorecard name to which this rule must belong.
+     */
+    "scorecardName"?: string;
+    /**
+     * A container for additional, undeclared properties.
+     * This is a holder for any undeclared properties as specified with
+     * the 'additionalProperties' keyword in the OAS document.
+     */
+    "additionalProperties"?: {
+        [key: string]: any;
+    };
+    /**
+     * @ignore
+     */
+    "_unparsed"?: boolean;
+    /**
+     * @ignore
+     */
+    static readonly attributeTypeMap: AttributeTypeMap;
+    /**
+     * @ignore
+     */
+    static getAttributeTypeMap(): AttributeTypeMap;
+    constructor();
+}
