@@ -25,17 +25,11 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(asio websocketpp)
 
-find_package(Protobuf QUIET)
-if(NOT Protobuf_FOUND)
-  FetchContent_Declare(
-    protobuf
-    GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
-    GIT_TAG v28.3
-  )
-  set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(protobuf_WITH_ZLIB OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(protobuf)
-  find_package(Protobuf REQUIRED)
+# 使用系统 Protobuf（apt: protobuf-compiler libprotobuf-dev）。
+# 从源码 Fetch Protobuf 后再 find_package(Protobuf MODULE) 往往找不到，且依赖 CMake 3.24+ 的 OVERRIDE_FIND_PACKAGE。
+find_package(Protobuf REQUIRED)
+if(NOT Protobuf_PROTOC_EXECUTABLE)
+  message(FATAL_ERROR "protoc not found. Install: sudo apt install protobuf-compiler libprotobuf-dev")
 endif()
 
 find_path(MYSQL_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql mariadb)
