@@ -563,6 +563,25 @@ class MemoryUserStore final : public UserStore {
 };
 
 #ifdef NEBULA_HAVE_MYSQL
+// mysql_real_escape_string requires a live connection; do not call it on mysql_init() only (UB → crash).
+std::string mysql_string_literal_escape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() * 2);
+  for (unsigned char c : in) {
+    switch (c) {
+      case '\0': out += "\\0"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\\': out += "\\\\"; break;
+      case '\'': out += "\\'"; break;
+      case '"': out += "\\\""; break;
+      case 26: out += "\\Z"; break;
+      default: out += static_cast<char>(c); break;
+    }
+  }
+  return out;
+}
+
 class MySqlUserStore final : public UserStore {
  public:
   MySqlUserStore() {
@@ -660,15 +679,7 @@ class MySqlUserStore final : public UserStore {
     mysql_query(conn, ddl);
   }
 
-  std::string escape_sql(const std::string& in) {
-    std::string out;
-    out.resize(in.size() * 2 + 1);
-    MYSQL* tmp = mysql_init(nullptr);
-    unsigned long n = mysql_real_escape_string(tmp, out.data(), in.c_str(), static_cast<unsigned long>(in.size()));
-    mysql_close(tmp);
-    out.resize(n);
-    return out;
-  }
+  std::string escape_sql(const std::string& in) { return mysql_string_literal_escape(in); }
 
   std::string host_;
   std::string user_;
@@ -796,15 +807,7 @@ class MySqlAuthStore final : public AuthStore {
     mysql_query(conn, ddl);
   }
 
-  std::string escape_sql(const std::string& in) {
-    std::string out;
-    out.resize(in.size() * 2 + 1);
-    MYSQL* tmp = mysql_init(nullptr);
-    unsigned long n = mysql_real_escape_string(tmp, out.data(), in.c_str(), static_cast<unsigned long>(in.size()));
-    mysql_close(tmp);
-    out.resize(n);
-    return out;
-  }
+  std::string escape_sql(const std::string& in) { return mysql_string_literal_escape(in); }
 
   std::string host_;
   std::string user_;
@@ -3896,7 +3899,10 @@ void PokerServer::do_accept() {
     if (!ec) {
       std::make_shared<TcpHttpSession>(this, std::move(*sock))->start();
     }
-    do_accept();
+    // Never call do_accept() directly here: on some systems async_accept can invoke
+    // this handler synchronously; chaining do_accept()->async_accept()->handler->do_accept()
+    // recurses on one stack and can overflow → SIGSEGV. Post breaks the recursion.
+    net::post(ioc_, [this]() { do_accept(); });
   });
 }
 
