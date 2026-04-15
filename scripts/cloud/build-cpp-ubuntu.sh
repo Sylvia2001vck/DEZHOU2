@@ -20,9 +20,11 @@ sudo apt-get install -y \
   default-libmysqlclient-dev \
   libhiredis-dev
 
-echo "[2/3] CMake configure + build Release..."
+# Small云主机不要用满核编译，否则 g++/cc1plus 会吃光 CPU/内存，SSH 也会卡死。默认 -j2，可用 NEBULA_BUILD_JOBS 覆盖。
+: "${NEBULA_BUILD_JOBS:=2}"
+echo "[2/3] CMake configure + build Release (parallel jobs=${NEBULA_BUILD_JOBS})..."
 cmake -S backend-cpp -B build-cpp -DCMAKE_BUILD_TYPE=Release
-cmake --build build-cpp -j"$(nproc)"
+cmake --build build-cpp -j"${NEBULA_BUILD_JOBS}"
 
 BIN="$ROOT/build-cpp/nebula-poker-server"
 if [[ ! -x "$BIN" ]]; then

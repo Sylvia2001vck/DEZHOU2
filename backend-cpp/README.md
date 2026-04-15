@@ -133,7 +133,11 @@ chmod +x scripts/cloud/build-cpp-ubuntu.sh
 bash scripts/cloud/build-cpp-ubuntu.sh
 ```
 
+The script compiles with **`NEBULA_BUILD_JOBS` defaulting to `2`** so small VMs are not saturated (Protobuf `.pb.cc` is heavy). Override only on larger instances, e.g. `NEBULA_BUILD_JOBS=4 bash scripts/cloud/build-cpp-ubuntu.sh`.
+
 Binary: `build-cpp/nebula-poker-server`. Set `NEBULA_REPO_ROOT` to the repo path (or run with `WorkingDirectory` = repo root). Optional systemd unit: `scripts/cloud/nebula-poker-cpp.service` (edit paths/user). Open **TCP 3000** (or your `PORT`) in the cloud security group; put Nginx/Caddy in front for HTTPS/WSS in production.
+
+If the machine became unresponsive during a build, SSH in (or reboot from the cloud console), then `pkill -f g++; pkill -f make` or similar, and rebuild with limited jobs as above.
 
 Recommended first production shape for Hong Kong friend playtests:
 
