@@ -1,0 +1,26 @@
+# Copy to /etc/systemd/system/nebula-poker-cpp.service and adjust paths + user.
+#   sudo cp scripts/cloud/nebula-poker-cpp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nebula-poker-cpp
+
+[Unit]
+Description=Nebula Poker C++ server (Boost.Beast)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/DEZHOU
+Environment=NEBULA_REPO_ROOT=/home/ubuntu/DEZHOU
+Environment=PORT=3000
+# Optional DB (omit or comment if not used yet):
+# Environment=MYSQL_HOST=127.0.0.1
+# Environment=MYSQL_USER=nebula
+# Environment=MYSQL_PASSWORD=
+# Environment=MYSQL_DATABASE=nebula_poker
+ExecStart=/home/ubuntu/DEZHOU/build-cpp/nebula-poker-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

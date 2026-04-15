@@ -126,6 +126,15 @@ Simpler fixed-step lerp (more lag if FPS drops): `mesh.position.lerp(targetPosit
 
 ## Cloud Deployment
 
+**Ubuntu (e.g. Tencent CVM):** from repo root on the server after `git pull`:
+
+```bash
+chmod +x scripts/cloud/build-cpp-ubuntu.sh
+bash scripts/cloud/build-cpp-ubuntu.sh
+```
+
+Binary: `build-cpp/nebula-poker-server`. Set `NEBULA_REPO_ROOT` to the repo path (or run with `WorkingDirectory` = repo root). Optional systemd unit: `scripts/cloud/nebula-poker-cpp.service` (edit paths/user). Open **TCP 3000** (or your `PORT`) in the cloud security group; put Nginx/Caddy in front for HTTPS/WSS in production.
+
 Recommended first production shape for Hong Kong friend playtests:
 
 1. Run a single `nebula-poker-server` instance in one HK region VM/container.
