@@ -936,11 +936,8 @@ class PokerServer {
     return env.SerializeAsString();
   }
 
-  void send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
-    auto it = ws_by_socket_id_.find(socket_id);
-    if (it == ws_by_socket_id_.end()) return;
-    it->second->queue_write(std::string(bytes));
-  }
+  // Defined after struct WsSession (needs complete type for queue_write).
+  void send_envelope_bytes(const std::string& socket_id, const std::string& bytes);
 
   template <typename T>
   void send_event(const std::string& socket_id, const std::string& event_name, const T& message) {
@@ -3741,7 +3738,8 @@ struct WsSession : std::enable_shared_from_this<WsSession> {
     auto self = shared_from_this();
     buffer_.reserve(65536);
     ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
-    ws_.max_read_message_size(16 * 1024 * 1024);
+    // Boost.Beast 1.74+: member is read_message_max (not max_read_message_size).
+    ws_.read_message_max(16ULL * 1024 * 1024);
     ws_.async_accept(req_, [self](beast::error_code ec) {
       if (ec) return;  // handshake failed — no session registered yet
       self->server_->register_ws_session(self);
@@ -3818,6 +3816,12 @@ struct WsSession : std::enable_shared_from_this<WsSession> {
     });
   }
 };
+
+void PokerServer::send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
+  auto it = ws_by_socket_id_.find(socket_id);
+  if (it == ws_by_socket_id_.end()) return;
+  it->second->queue_write(std::string(bytes));
+}
 
 struct TcpHttpSession : std::enable_shared_from_this<TcpHttpSession> {
   PokerServer* server_;

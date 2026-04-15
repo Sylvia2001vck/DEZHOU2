@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Build Nebula C++ (Boost.Beast) backend on Ubuntu 22.04/24.04.
 # Run from repository root: bash scripts/cloud/build-cpp-ubuntu.sh
+#
+# Low-RAM VM: optional swap → scripts/cloud/add-swap-2g-ubuntu.sh
+# SSH-safe background: scripts/cloud/build-cpp-ubuntu-nohup.sh  (see backend-cpp/README.md)
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -20,8 +23,9 @@ sudo apt-get install -y \
   default-libmysqlclient-dev \
   libhiredis-dev
 
-# Small云主机不要用满核编译，否则 g++/cc1plus 会吃光 CPU/内存，SSH 也会卡死。默认 -j2，可用 NEBULA_BUILD_JOBS 覆盖。
-: "${NEBULA_BUILD_JOBS:=2}"
+# 2 核小实例编译 poker.pb.cc / main.cpp 极易打满 CPU+内存，SSH/Cursor 会假死。默认 -j1（等价 make -j1），最稳。
+# 核多再上：NEBULA_BUILD_JOBS=2 bash scripts/cloud/build-cpp-ubuntu.sh
+: "${NEBULA_BUILD_JOBS:=1}"
 echo "[2/3] CMake configure + build Release (parallel jobs=${NEBULA_BUILD_JOBS})..."
 cmake -S backend-cpp -B build-cpp -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cpp -j"${NEBULA_BUILD_JOBS}"

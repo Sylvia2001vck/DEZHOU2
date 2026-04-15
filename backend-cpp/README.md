@@ -126,14 +126,23 @@ Simpler fixed-step lerp (more lag if FPS drops): `mesh.position.lerp(targetPosit
 
 ## Cloud Deployment
 
-**Ubuntu (e.g. Tencent CVM):** from repo root on the server after `git pull`:
+**Ubuntu (e.g. Tencent CVM, 2 GB / 4 GB RAM):** use this checklist to avoid OOM and SSH drops during the Protobuf/C++ build.
+
+| Step | Action |
+|------|--------|
+| 1 | `git pull` so `NEBULA_BUILD_JOBS=1` (default in `scripts/cloud/build-cpp-ubuntu.sh`) is in effect. |
+| 2 | `free -h` — if available memory is tight for large compile units, add swap once: `chmod +x scripts/cloud/add-swap-2g-ubuntu.sh && bash scripts/cloud/add-swap-2g-ubuntu.sh` |
+| 3 | Prefer **background** build so a flaky SSH client does not stop compilation: `bash scripts/cloud/build-cpp-ubuntu-nohup.sh` then `tail -f build-cpp.log` (or run `nohup bash scripts/cloud/build-cpp-ubuntu.sh >build-cpp.log 2>&1 &` yourself). |
+| 4 | While compiling, avoid hammering the same disk with heavy `git`/`vim` work on 2-core instances. |
+
+**Foreground build** (after step 1–2 if needed):
 
 ```bash
 chmod +x scripts/cloud/build-cpp-ubuntu.sh
 bash scripts/cloud/build-cpp-ubuntu.sh
 ```
 
-The script compiles with **`NEBULA_BUILD_JOBS` defaulting to `2`** so small VMs are not saturated (Protobuf `.pb.cc` is heavy). Override only on larger instances, e.g. `NEBULA_BUILD_JOBS=4 bash scripts/cloud/build-cpp-ubuntu.sh`.
+The script compiles with **`NEBULA_BUILD_JOBS` defaulting to `1`** (`cmake --build … -j1`) so Protobuf/C++ builds do not saturate CPU/RAM on small VMs. On a larger box use e.g. `NEBULA_BUILD_JOBS=2` or `4`.
 
 Binary: `build-cpp/nebula-poker-server`. Set `NEBULA_REPO_ROOT` to the repo path (or run with `WorkingDirectory` = repo root). Optional systemd unit: `scripts/cloud/nebula-poker-cpp.service` (edit paths/user). Open **TCP 3000** (or your `PORT`) in the cloud security group; put Nginx/Caddy in front for HTTPS/WSS in production.
 
