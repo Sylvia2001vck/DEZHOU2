@@ -54,7 +54,221 @@ app.use((req, _res, next) => {
 });
 
 app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "index.html")));
+// Same path as C++ server: GET /proto/poker.proto → backend-cpp/proto/poker.proto
+app.use(
+  "/proto",
+  express.static(path.join(__dirname, "backend-cpp", "proto"), {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".proto")) {
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      }
+    }
+  })
+);
 app.use(express.static(__dirname));
+app.use(express.urlencoded({ extended: true }));
+
+/** Memory lobby auth + stubs so `npm start` works with the same REST paths as the C++ server. */
+const lobbySessions = new Map();
+const lobbyAccounts = new Map();
+const lobbyProfiles = new Map();
+let lobbyNextUserId = 1;
+
+function lobbyRandomSessionId() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function lobbyHashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 32, "sha256").toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function lobbyVerifyPassword(password, record) {
+  try {
+    const [salt, hash] = String(record).split(":");
+    if (!salt || !hash) return false;
+    const h = crypto.pbkdf2Sync(password, salt, 100000, 32, "sha256").toString("hex");
+    const a = Buffer.from(hash, "hex");
+    const b = Buffer.from(h, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function lobbyParseCookies(req) {
+  const out = {};
+  const h = req.headers.cookie;
+  if (!h) return out;
+  for (const part of h.split(";")) {
+    const i = part.indexOf("=");
+    if (i === -1) continue;
+    const k = part.slice(0, i).trim();
+    const v = decodeURIComponent(part.slice(i + 1).trim());
+    out[k] = v;
+  }
+  return out;
+}
+
+function lobbyGetSession(req) {
+  const sid = lobbyParseCookies(req).nebula_session;
+  if (!sid) return null;
+  return lobbySessions.get(sid) || null;
+}
+
+app.post("/api/auth/register", (req, res) => {
+  const loginUsername = String(req.body.loginUsername || "").trim();
+  const displayName = String(req.body.displayName || loginUsername).trim();
+  const password = String(req.body.password || "");
+  if (!/^[a-zA-Z0-9_-]{3,24}$/.test(loginUsername) || displayName.length < 1 || displayName.length > 48 || password.length < 6) {
+    return res.status(400).json({
+      ok: false,
+      message: "Use a 3-24 char login username, a 1-48 char display name, and a 6+ char password."
+    });
+  }
+  if (lobbyAccounts.has(loginUsername)) {
+    return res.status(409).json({ ok: false, message: "Login username already exists." });
+  }
+  const userId = lobbyNextUserId++;
+  lobbyAccounts.set(loginUsername, { userId, passwordRecord: lobbyHashPassword(password) });
+  const profile = {
+    userId,
+    username: displayName,
+    displayName,
+    loginUsername,
+    externalId: loginUsername,
+    avatar: "",
+    gold: 10000,
+    gamesPlayed: 0,
+    gamesWon: 0
+  };
+  lobbyProfiles.set(userId, profile);
+  const sessionId = lobbyRandomSessionId();
+  lobbySessions.set(sessionId, { userId, loginUsername });
+  res.setHeader("Set-Cookie", `nebula_session=${sessionId}; Path=/; HttpOnly; SameSite=Lax`);
+  res.json({ ok: true, user: profile });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const loginUsername = String(req.body.loginUsername || "").trim();
+  const password = String(req.body.password || "");
+  const acc = lobbyAccounts.get(loginUsername);
+  if (!acc || !lobbyVerifyPassword(password, acc.passwordRecord)) {
+    return res.status(401).json({ ok: false, message: "Invalid username or password." });
+  }
+  const profile = lobbyProfiles.get(acc.userId);
+  if (!profile) return res.status(500).json({ ok: false, message: "Profile load failed." });
+  const sessionId = lobbyRandomSessionId();
+  lobbySessions.set(sessionId, { userId: acc.userId, loginUsername });
+  res.setHeader("Set-Cookie", `nebula_session=${sessionId}; Path=/; HttpOnly; SameSite=Lax`);
+  res.json({ ok: true, user: profile });
+});
+
+app.get("/api/auth/me", (req, res) => {
+  const s = lobbyGetSession(req);
+  if (!s) return res.status(401).json({ ok: false });
+  const profile = lobbyProfiles.get(s.userId);
+  if (!profile) return res.status(401).json({ ok: false });
+  res.json({ ok: true, user: profile });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const sid = lobbyParseCookies(req).nebula_session;
+  if (sid) lobbySessions.delete(sid);
+  res.setHeader("Set-Cookie", "nebula_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+  res.json({ ok: true });
+});
+
+app.get("/api/home/overview", (req, res) => {
+  const s = lobbyGetSession(req);
+  if (!s) return res.status(401).json({ ok: false, message: "Login required." });
+  const profile = lobbyProfiles.get(s.userId);
+  if (!profile) return res.status(401).json({ ok: false, message: "Session expired." });
+  res.json({
+    ok: true,
+    profile,
+    beanProfile: { beanBalance: profile.gold, mmrScore: 1000, tier: "novice", dailyClaimAvailable: false },
+    dailyTasks: [],
+    tournaments: [],
+    inventoryPreview: { equippedTable: "--", items: [] }
+  });
+});
+
+app.get("/api/leaderboard", (req, res) => {
+  res.json({ type: "coins", entries: [] });
+});
+
+/** In-memory friend rooms (C++ parity for lobby create/join HTTP). Game sync still uses Socket.io / proto per your setup. */
+const lobbyFriendRooms = new Map();
+
+function lobbyGenerateFriendRoomCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return code;
+}
+
+function lobbyFriendRoomSummary(room) {
+  return {
+    roomCode: room.roomCode,
+    status: room.status,
+    roomType: room.roomType,
+    visibility: room.visibility,
+    playerCount: room.playerCount,
+    maxPlayers: room.maxPlayers,
+    ownerUserId: room.ownerUserId
+  };
+}
+
+app.post("/api/friend-rooms/create", (req, res) => {
+  const s = lobbyGetSession(req);
+  if (!s) return res.status(401).json({ ok: false, message: "Login required." });
+  const profile = lobbyProfiles.get(s.userId);
+  if (!profile) return res.status(401).json({ ok: false, message: "Session expired." });
+  const totalHands = Math.max(1, parseInt(String(req.body.totalHands ?? "5"), 10) || 5);
+  const initialChips = Math.max(1000, parseInt(String(req.body.initialChips ?? "1000"), 10) || 1000);
+  let code = lobbyGenerateFriendRoomCode();
+  while (lobbyFriendRooms.has(code)) code = lobbyGenerateFriendRoomCode();
+  const room = {
+    roomCode: code,
+    status: "waiting",
+    roomType: "friend",
+    visibility: "private",
+    playerCount: 0,
+    maxPlayers: 10,
+    ownerUserId: profile.userId,
+    totalHands,
+    initialChips
+  };
+  lobbyFriendRooms.set(code, room);
+  res.json({ ok: true, roomCode: code, room: lobbyFriendRoomSummary(room) });
+});
+
+app.post("/api/friend-rooms/join", (req, res) => {
+  const s = lobbyGetSession(req);
+  if (!s) return res.status(401).json({ ok: false, message: "Login required." });
+  const profile = lobbyProfiles.get(s.userId);
+  if (!profile) return res.status(401).json({ ok: false, message: "Session expired." });
+  const roomCode = String(req.body.roomCode || "")
+    .trim()
+    .toUpperCase();
+  const room = lobbyFriendRooms.get(roomCode);
+  if (!room || room.roomType !== "friend") {
+    return res.status(404).json({ ok: false, message: "Friend room not found." });
+  }
+  res.json({ ok: true, roomCode: room.roomCode, room: lobbyFriendRoomSummary(room) });
+});
+
+app.get("/api/friend-rooms/:roomCode/history", (req, res) => {
+  const roomCode = String(req.params.roomCode || "")
+    .trim()
+    .toUpperCase();
+  const room = lobbyFriendRooms.get(roomCode);
+  if (!room) return res.status(404).json({ ok: false, message: "Friend room not found." });
+  res.json({ ok: true, roomCode: room.roomCode, hands: [] });
+});
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();

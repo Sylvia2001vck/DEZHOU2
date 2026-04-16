@@ -9,6 +9,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Boost 1.71 REQUIRED COMPONENTS system thread)
 find_package(Threads REQUIRED)
 
+include(FetchContent)
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3
+  GIT_SHALLOW TRUE
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+set(JSON_Install OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 option(NEBULA_ENABLE_MYSQL "Enable MySQL-backed user persistence" ON)
 option(NEBULA_ENABLE_REDIS "Enable Redis-backed leaderboards" ON)
 
@@ -57,6 +68,7 @@ target_link_libraries(
     Boost::thread
     protobuf::libprotobuf
     Threads::Threads
+    nlohmann_json::nlohmann_json
 )
 
 if(NEBULA_HAVE_MYSQL)

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <google/protobuf/message.h>
+#include <nlohmann/json.hpp>
 
 #include "poker.pb.h"
 #include "sha256.hpp"
@@ -76,6 +77,7 @@ constexpr int64_t kGameplaySessionTtlMs = 1000LL * 60LL * 5LL;
 constexpr int64_t kAiTakeoverDelayMs = 1000LL * 60LL;
 constexpr int kMatchmakingThreshold = 3;
 constexpr std::size_t kRoomEventLogLimit = 600;
+constexpr int kSnapshotFlushMs = 75;
 constexpr const char* kSessionCookieName = "nebula_session";
 
 int64_t now_ms() {
@@ -446,6 +448,378 @@ struct Room {
   std::set<std::string> expected_acks;
   std::set<std::string> match_acks;
 };
+
+// --- Room JSON snapshots (parity with Node server.js .runtime/rooms/<roomId>.json) ---
+
+bool nebula_room_snapshots_enabled() {
+  // Default off: WSL + drvfs (/mnt/d/...) snapshot restore has caused SIGSEGV for some users;
+  // set NEBULA_ENABLE_ROOM_SNAPSHOT=1 when you want cold recovery from .runtime/rooms/*.json.
+  const std::string v = get_env("NEBULA_ENABLE_ROOM_SNAPSHOT", "0");
+  return v != "0" && v != "false" && v != "FALSE";
+}
+
+std::filesystem::path nebula_snapshot_dir_path() {
+  const std::string custom = get_env("NEBULA_SNAPSHOT_DIR");
+  if (!custom.empty()) return std::filesystem::path(custom);
+  const std::string root = get_env("NEBULA_REPO_ROOT");
+  if (!root.empty()) return std::filesystem::path(root) / ".runtime" / "rooms";
+  return std::filesystem::path(".runtime") / "rooms";
+}
+
+std::filesystem::path nebula_snapshot_room_file(const std::string& room_id) { return nebula_snapshot_dir_path() / (room_id + ".json"); }
+
+std::string base64_encode(const std::string& in) {
+  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve((in.size() + 2) / 3 * 4);
+  unsigned val = 0;
+  int valb = -6;
+  for (unsigned char c : in) {
+    val = (val << 8) + c;
+    valb += 8;
+    while (valb >= 0) {
+      out.push_back(table[(val >> valb) & 63]);
+      valb -= 6;
+    }
+  }
+  if (valb > -6) out.push_back(table[((val << 8) >> (valb + 8)) & 63]);
+  while (out.size() % 4) out.push_back('=');
+  return out;
+}
+
+std::string base64_decode(const std::string& in) {
+  static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  std::vector<int> T(256, -1);
+  for (int i = 0; i < 64; ++i) T[static_cast<unsigned char>(chars[static_cast<std::size_t>(i)])] = i;
+  int val = 0;
+  int valb = -8;
+  for (unsigned char c : in) {
+    if (c == '=') break;
+    if (T[c] == -1) continue;
+    val = (val << 6) + T[c];
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return out;
+}
+
+void write_atomic_json_file(const std::filesystem::path& path, const std::string& content) {
+  std::filesystem::create_directories(path.parent_path());
+  const std::string tmp = path.string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary);
+    out << content;
+  }
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::cerr << "[snapshot] atomic write failed: " << ec.message() << "\n";
+    std::filesystem::remove(tmp, ec);
+  }
+}
+
+nlohmann::json card_to_json(const Card& c) { return nlohmann::json{{"s", c.s}, {"r", c.r}, {"v", c.v}}; }
+
+void card_from_json(const nlohmann::json& j, Card& c) {
+  c = Card{};
+  if (!j.is_object()) return;
+  c.s = j.value("s", std::string());
+  c.r = j.value("r", std::string());
+  c.v = j.value("v", 0);
+}
+
+nlohmann::json player_to_json(const PlayerState& p) {
+  nlohmann::json j;
+  j["seatIdx"] = p.seat_idx;
+  j["chips"] = p.chips;
+  j["currentBet"] = p.current_bet;
+  j["isFolded"] = p.is_folded;
+  j["isBankrupt"] = p.is_bankrupt;
+  j["totalBuyIn"] = p.total_buy_in;
+  j["pendingRebuy"] = p.pending_rebuy;
+  j["sitOutUntilHand"] = p.sit_out_until_hand;
+  j["hand"] = nlohmann::json::array();
+  for (const auto& c : p.hand) j["hand"].push_back(card_to_json(c));
+  return j;
+}
+
+void player_from_json(const nlohmann::json& j, PlayerState& p) {
+  p = PlayerState{};
+  p.seat_idx = j.value("seatIdx", -1);
+  p.chips = j.value("chips", 1000);
+  p.current_bet = j.value("currentBet", 0);
+  p.is_folded = j.value("isFolded", false);
+  p.is_bankrupt = j.value("isBankrupt", false);
+  p.total_buy_in = j.value("totalBuyIn", 1000);
+  if (j.contains("totalCommitted") && j["totalCommitted"].is_number_integer()) p.total_buy_in = j["totalCommitted"].get<int>();
+  p.pending_rebuy = j.value("pendingRebuy", 0);
+  p.sit_out_until_hand = j.value("sitOutUntilHand", 0);
+  p.hand.clear();
+  if (j.contains("hand") && j["hand"].is_array()) {
+    for (const auto& cj : j["hand"]) {
+      Card c;
+      card_from_json(cj, c);
+      p.hand.push_back(c);
+    }
+  }
+}
+
+nlohmann::json seat_to_json(const Seat& s) {
+  if (s.type == Seat::Type::Empty) return nullptr;
+  if (s.type == Seat::Type::AI) return nlohmann::json{{"type", "ai"}, {"name", s.name}};
+  nlohmann::json o = {{"type", "player"},
+                       {"socketId", nullptr},
+                       {"name", s.name},
+                       {"decor", s.decor},
+                       {"aiManaged", s.ai_managed}};
+  if (!s.client_id.empty()) o["clientId"] = s.client_id;
+  else o["clientId"] = nullptr;
+  if (!s.gameplay_session_id.empty()) o["sessionId"] = s.gameplay_session_id;
+  else o["sessionId"] = nullptr;
+  if (!s.reconnect_token.empty()) o["reconnectToken"] = s.reconnect_token;
+  else o["reconnectToken"] = nullptr;
+  if (s.disconnected_at != 0) o["disconnectedAt"] = s.disconnected_at;
+  else o["disconnectedAt"] = nullptr;
+  if (s.ai_takeover_at != 0) o["aiTakeoverAt"] = s.ai_takeover_at;
+  else o["aiTakeoverAt"] = nullptr;
+  if (s.user_id != 0) o["userId"] = s.user_id;
+  return o;
+}
+
+void seat_from_json(const nlohmann::json& j, Seat& s) {
+  s = Seat{};
+  if (j.is_null() || !j.is_object()) return;
+  const std::string type = j.value("type", "");
+  if (type == "ai") {
+    s.type = Seat::Type::AI;
+    s.name = j.value("name", std::string("AI"));
+    return;
+  }
+  if (type == "player") {
+    s.type = Seat::Type::Player;
+    s.socket_id.clear();
+    s.name = j.value("name", std::string("Player"));
+    if (j.contains("clientId") && !j["clientId"].is_null()) s.client_id = j["clientId"].get<std::string>();
+    if (j.contains("sessionId") && !j["sessionId"].is_null()) s.gameplay_session_id = j["sessionId"].get<std::string>();
+    if (s.gameplay_session_id.empty() && j.contains("gameplaySessionId") && !j["gameplaySessionId"].is_null())
+      s.gameplay_session_id = j["gameplaySessionId"].get<std::string>();
+    if (j.contains("reconnectToken") && !j["reconnectToken"].is_null()) s.reconnect_token = j["reconnectToken"].get<std::string>();
+    if (j.contains("disconnectedAt") && j["disconnectedAt"].is_number_integer()) s.disconnected_at = j["disconnectedAt"].get<int64_t>();
+    s.decor = j.value("decor", std::string("none"));
+    s.ai_managed = j.value("aiManaged", false);
+    if (j.contains("aiTakeoverAt") && j["aiTakeoverAt"].is_number_integer()) s.ai_takeover_at = j["aiTakeoverAt"].get<int64_t>();
+    if (j.contains("userId") && j["userId"].is_number_integer()) s.user_id = j["userId"].get<int64_t>();
+  }
+}
+
+nlohmann::json match_hand_to_json(const MatchHandInfo& h) {
+  nlohmann::json jh = {{"handNum", h.hand_num}, {"desc", h.desc}};
+  nlohmann::json wins = nlohmann::json::array();
+  for (const auto& w : h.winners) wins.push_back({{"seatIdx", w.seat_idx}, {"name", w.name}});
+  jh["winners"] = wins;
+  return jh;
+}
+
+void match_hand_from_json(const nlohmann::json& j, MatchHandInfo& h) {
+  h = MatchHandInfo{};
+  h.hand_num = j.value("handNum", 0);
+  h.desc = j.value("desc", std::string(""));
+  if (j.contains("winners") && j["winners"].is_array()) {
+    for (const auto& wj : j["winners"]) {
+      WinnerInfo w;
+      w.seat_idx = wj.value("seatIdx", -1);
+      w.name = wj.value("name", std::string(""));
+      h.winners.push_back(std::move(w));
+    }
+  }
+}
+
+nlohmann::json room_to_json(const Room& room) {
+  nlohmann::json j;
+  j["schemaVersion"] = 2;
+  j["snapshotFormat"] = "nebula-cpp-1";
+  j["roomId"] = room.room_id;
+  j["roomCode"] = room.room_code;
+  j["roomType"] = room.room_type;
+  j["ownerUserId"] = room.owner_user_id;
+  j["visibility"] = room.visibility;
+  j["status"] = room.status;
+  j["maxPlayers"] = room.max_players;
+  j["createdAt"] = room.created_at;
+  j["lastActiveAt"] = room.last_active_at;
+  if (room.empty_since.has_value()) j["emptySince"] = *room.empty_since;
+  else j["emptySince"] = nullptr;
+  j["hostSocketId"] = nullptr;
+  j["host_socket_id"] = nullptr;
+  j["seats"] = nlohmann::json::array();
+  for (int i = 0; i < kSeats; ++i) j["seats"].push_back(seat_to_json(room.seats[static_cast<std::size_t>(i)]));
+  j["started"] = room.started;
+  j["totalHands"] = room.total_hands;
+  j["initialChips"] = room.initial_chips;
+  j["smallBlind"] = room.small_blind;
+  j["bigBlind"] = room.big_blind;
+  j["handNum"] = room.hand_num;
+  j["dealerSeatIdx"] = room.dealer_seat_idx;
+  j["sbSeatIdx"] = room.sb_seat_idx >= 0 ? nlohmann::json(room.sb_seat_idx) : nullptr;
+  j["bbSeatIdx"] = room.bb_seat_idx >= 0 ? nlohmann::json(room.bb_seat_idx) : nullptr;
+  j["pot"] = room.pot;
+  j["round"] = room.round;
+  j["communityCards"] = nlohmann::json::array();
+  for (const auto& c : room.community_cards) j["communityCards"].push_back(card_to_json(c));
+  j["deck"] = nlohmann::json::array();
+  for (const auto& c : room.deck) j["deck"].push_back(card_to_json(c));
+  j["currentMaxBet"] = room.current_max_bet;
+  j["minRaise"] = room.min_raise;
+  j["activeSeatIdx"] = room.active_seat_idx >= 0 ? nlohmann::json(room.active_seat_idx) : nullptr;
+  j["pendingActionSeats"] = nlohmann::json::array();
+  for (int ps : room.pending_action_seats) j["pendingActionSeats"].push_back(ps);
+  j["players"] = nlohmann::json::array();
+  for (const auto& [idx, p] : room.players) {
+    nlohmann::json row = nlohmann::json::array();
+    row.push_back(idx);
+    row.push_back(player_to_json(p));
+    j["players"].push_back(row);
+  }
+  j["turnNonce"] = room.turn_nonce;
+  j["lastActorSeatIdx"] = room.last_actor_seat_idx >= 0 ? nlohmann::json(room.last_actor_seat_idx) : nullptr;
+  j["handHistory"] = nlohmann::json::array();
+  for (const auto& h : room.hand_history) j["handHistory"].push_back(match_hand_to_json(h));
+  j["activityLog"] = nlohmann::json::array();
+  for (const auto& line : room.activity_log) j["activityLog"].push_back(line);
+  j["eventSeq"] = room.event_seq;
+  j["eventLog"] = nlohmann::json::array();
+  for (const auto& e : room.event_log) {
+    nlohmann::json je = {{"seq", e.seq}, {"seatIdx", e.seat_idx}, {"createdAt", e.created_at}};
+    je["envelopeB64"] = base64_encode(e.envelope_bytes);
+    j["eventLog"].push_back(je);
+  }
+  j["closing"] = room.closing;
+  j["voiceParticipants"] = nlohmann::json::array();
+  for (const auto& [sid, vp] : room.voice_participants) {
+    j["voiceParticipants"].push_back({{"socketId", sid}, {"seatIdx", vp.seat_idx}, {"name", vp.name}});
+  }
+  return j;
+}
+
+void room_from_json(const nlohmann::json& j, Room& out) {
+  out = Room{};
+  std::string rid = j.value("roomId", std::string());
+  if (rid.empty()) rid = j.value("room_id", std::string());
+  out.room_id = rid;
+  out.room_code = j.value("roomCode", rid);
+  if (out.room_code.empty()) out.room_code = rid;
+  out.room_type = j.value("roomType", std::string("friend"));
+  if (out.room_type.empty()) out.room_type = "friend";
+  out.owner_user_id = j.value("ownerUserId", static_cast<int64_t>(0));
+  out.visibility = j.value("visibility", std::string("private"));
+  out.status = j.value("status", std::string("waiting"));
+  out.max_players = j.value("maxPlayers", kSeats);
+  out.created_at = j.value("createdAt", now_ms());
+  out.last_active_at = j.value("lastActiveAt", now_ms());
+  if (j.contains("emptySince") && j["emptySince"].is_number_integer()) out.empty_since = j["emptySince"].get<int64_t>();
+  else out.empty_since = now_ms();
+  out.socket_ids.clear();
+  out.host_socket_id.clear();
+  out.seats.assign(static_cast<std::size_t>(kSeats), Seat{});
+  if (j.contains("seats") && j["seats"].is_array()) {
+    int i = 0;
+    for (const auto& el : j["seats"]) {
+      if (i >= kSeats) break;
+      seat_from_json(el, out.seats[static_cast<std::size_t>(i)]);
+      ++i;
+    }
+  }
+  out.started = j.value("started", false);
+  out.total_hands = std::clamp(j.value("totalHands", 5), 1, 50);
+  out.initial_chips = std::max(1000, j.value("initialChips", 1000));
+  out.small_blind = std::max(1, j.value("smallBlind", 50));
+  out.big_blind = std::max(out.small_blind, j.value("bigBlind", 100));
+  out.hand_num = std::max(0, j.value("handNum", 0));
+  out.dealer_seat_idx = j.value("dealerSeatIdx", 0);
+  if (j.contains("sbSeatIdx") && j["sbSeatIdx"].is_number_integer()) out.sb_seat_idx = j["sbSeatIdx"].get<int>();
+  else out.sb_seat_idx = -1;
+  if (j.contains("bbSeatIdx") && j["bbSeatIdx"].is_number_integer()) out.bb_seat_idx = j["bbSeatIdx"].get<int>();
+  else out.bb_seat_idx = -1;
+  out.pot = std::max(0, j.value("pot", 0));
+  out.round = j.value("round", std::string("WAITING"));
+  out.community_cards.clear();
+  if (j.contains("communityCards") && j["communityCards"].is_array()) {
+    for (const auto& cj : j["communityCards"]) {
+      Card c;
+      card_from_json(cj, c);
+      out.community_cards.push_back(c);
+    }
+  }
+  out.deck.clear();
+  if (j.contains("deck") && j["deck"].is_array()) {
+    for (const auto& cj : j["deck"]) {
+      Card c;
+      card_from_json(cj, c);
+      out.deck.push_back(c);
+    }
+  }
+  out.current_max_bet = std::max(0, j.value("currentMaxBet", 0));
+  out.min_raise = std::max(1, j.value("minRaise", out.big_blind));
+  if (j.contains("activeSeatIdx") && j["activeSeatIdx"].is_number_integer()) out.active_seat_idx = j["activeSeatIdx"].get<int>();
+  else out.active_seat_idx = -1;
+  out.pending_action_seats.clear();
+  if (j.contains("pendingActionSeats") && j["pendingActionSeats"].is_array()) {
+    for (const auto& x : j["pendingActionSeats"]) {
+      if (x.is_number_integer()) out.pending_action_seats.insert(x.get<int>());
+    }
+  }
+  out.players.clear();
+  if (j.contains("players") && j["players"].is_array()) {
+    for (const auto& item : j["players"]) {
+      if (!item.is_array() || item.size() < 2) continue;
+      const int seat_idx = item[0].get<int>();
+      PlayerState p{};
+      player_from_json(item[1], p);
+      p.seat_idx = seat_idx;
+      out.players[seat_idx] = std::move(p);
+    }
+  }
+  out.turn_nonce = std::max(0, j.value("turnNonce", 0));
+  if (j.contains("lastActorSeatIdx") && j["lastActorSeatIdx"].is_number_integer()) out.last_actor_seat_idx = j["lastActorSeatIdx"].get<int>();
+  else out.last_actor_seat_idx = -1;
+  out.hand_history.clear();
+  if (j.contains("handHistory") && j["handHistory"].is_array()) {
+    for (const auto& el : j["handHistory"]) {
+      MatchHandInfo h;
+      match_hand_from_json(el, h);
+      out.hand_history.push_back(std::move(h));
+    }
+  }
+  out.activity_log.clear();
+  if (j.contains("activityLog") && j["activityLog"].is_array()) {
+    for (const auto& el : j["activityLog"]) {
+      if (el.is_string()) out.activity_log.push_back(el.get<std::string>());
+    }
+  }
+  out.event_seq = j.value("eventSeq", static_cast<int64_t>(0));
+  out.event_log.clear();
+  if (j.contains("eventLog") && j["eventLog"].is_array()) {
+    for (const auto& el : j["eventLog"]) {
+      if (!el.is_object()) continue;
+      RoomEventEntry e;
+      e.seq = el.value("seq", static_cast<int64_t>(0));
+      e.seat_idx = el.value("seatIdx", -1);
+      e.created_at = el.value("createdAt", static_cast<int64_t>(0));
+      if (el.contains("envelopeB64") && el["envelopeB64"].is_string()) e.envelope_bytes = base64_decode(el["envelopeB64"].get<std::string>());
+      if (!e.envelope_bytes.empty()) out.event_log.push_back(std::move(e));
+    }
+  }
+  while (out.event_log.size() > kRoomEventLogLimit) out.event_log.pop_front();
+  out.closing = j.value("closing", false);
+  out.voice_participants.clear();
+  out.expected_acks.clear();
+  out.match_acks.clear();
+}
 
 struct HandEval {
   int rank = 0;
@@ -1013,6 +1387,7 @@ class PokerServer {
       send_envelope_bytes(socket_id, bytes);
       mark_last_seen_for_socket(socket_id, seq);
     }
+    touch_room_snapshot(room);
   }
 
   void emit_seat_event(Room& room, int seat_idx, const std::string& event_name, const google::protobuf::Message& message) {
@@ -1031,6 +1406,7 @@ class PokerServer {
       gameplay.ai_managed = seat.ai_managed;
       gameplay.ai_takeover_at = seat.ai_takeover_at;
     }
+    touch_room_snapshot(room);
   }
 
   void replay_missed_events(Session& session, Room& room) {
@@ -1154,6 +1530,7 @@ class PokerServer {
       send_event(socket_id, "room_state", state);
       mark_last_seen_for_socket(socket_id, room.event_seq);
     }
+    touch_room_snapshot(room);
   }
 
   void broadcast_game(Room& room) {
@@ -1507,6 +1884,7 @@ class PokerServer {
     room.small_blind = 50;
     room.big_blind = 100;
     room.last_active_at = now_ms();
+    touch_room_snapshot(room);
     return room;
   }
 
@@ -1646,20 +2024,21 @@ class PokerServer {
     const std::string& method = req.method;
     const std::string& body = req.body;
     const std::string& cookie_header = req.cookie_header;
-    const auto form = parse_form_body(body);
-    const auto auth_session = find_http_session(cookie_header);
-    if (uri == "/healthz") {
+    // Cheap probes first (no form/cookie parsing) so liveness checks stay stable.
+    if (clean_uri == "/healthz") {
       reply.status = 200;
       reply.content_type = "text/plain; charset=utf-8";
       reply.body = "ok";
       return;
     }
-    if (uri == "/readyz") {
+    if (clean_uri == "/readyz") {
       reply.status = 200;
       reply.content_type = "application/json; charset=utf-8";
       reply.body = "{\"ok\":true}";
       return;
     }
+    const auto form = parse_form_body(body);
+    const auto auth_session = find_http_session(cookie_header);
     if (uri.rfind("/api/leaderboard", 0) == 0) {
       std::string type = "coins";
       auto pos = uri.find("type=");
@@ -3028,6 +3407,7 @@ class PokerServer {
     msg.set_roomid(room.room_id);
     msg.set_reason("match_over");
     emit_room_event(room, "room_closed", msg);
+    obliterate_room_snapshot(room.room_id);
     rooms_.erase(room.room_id);
     room_mutexes_.erase(room.room_id);
   }
@@ -3602,6 +3982,7 @@ class PokerServer {
       room->expected_acks.erase(session.socket_id);
       room->match_acks.erase(session.socket_id);
       if (room->expected_acks.empty()) {
+        obliterate_room_snapshot(room->room_id);
         rooms_.erase(room->room_id);
         room_mutexes_.erase(room->room_id);
         return;
@@ -3652,6 +4033,7 @@ class PokerServer {
     bool no_seats = true;
     for (const auto& seat : room->seats) if (seat.type != Seat::Type::Empty) no_seats = false;
     if (no_seats) {
+      obliterate_room_snapshot(room->room_id);
       rooms_.erase(room->room_id);
       room_mutexes_.erase(room->room_id);
       return;
@@ -3698,6 +4080,12 @@ class PokerServer {
   std::optional<tcp::acceptor> acceptor_;
   std::unordered_map<std::string, Session> sessions_;
   std::unordered_map<std::string, std::shared_ptr<WsSession>> ws_by_socket_id_;
+  std::unordered_map<std::string, std::unique_ptr<net::steady_timer>> snapshot_timers_;
+
+  void touch_room_snapshot(Room& room);
+  void flush_room_snapshot_to_disk(const std::string& room_id);
+  void obliterate_room_snapshot(const std::string& room_id);
+  void restore_room_snapshots_from_disk();
 
   void do_accept();
   void register_ws_session(std::shared_ptr<WsSession> sess);
@@ -3851,8 +4239,21 @@ struct TcpHttpSession : std::enable_shared_from_this<TcpHttpSession> {
       v.body = self->req_.body();
       v.cookie_header = self->req_.count(http::field::cookie) ? std::string(self->req_[http::field::cookie]) : "";
       HttpReply rep;
-      self->server_->handle_http_request(v, rep);
+      try {
+        self->server_->handle_http_request(v, rep);
+      } catch (const std::exception& e) {
+        std::cerr << "[http] handle_http_request: " << e.what() << "\n";
+        rep.status = 500;
+        rep.content_type = "text/plain; charset=utf-8";
+        rep.body = "Internal Server Error";
+      } catch (...) {
+        std::cerr << "[http] handle_http_request: unknown exception\n";
+        rep.status = 500;
+        rep.content_type = "text/plain; charset=utf-8";
+        rep.body = "Internal Server Error";
+      }
       http::response<http::string_body> res{static_cast<http::status>(rep.status), self->req_.version()};
+      res.set(http::field::connection, "close");
       res.set(http::field::content_type, rep.content_type);
       if (rep.set_cookie) res.set(http::field::set_cookie, *rep.set_cookie);
       res.body() = rep.body;
@@ -3889,7 +4290,29 @@ void PokerServer::run(uint16_t port) {
     return;
   }
   std::cout << "nebula-poker C++ listening on 0.0.0.0:" << port << "\n";
+  std::cout.flush();
+  {
+    std::error_code ec;
+    const std::filesystem::path cw = std::filesystem::current_path(ec);
+    std::cerr << "[boot] cwd=" << (ec ? std::string("(error)") : cw.string())
+              << " room_snapshot=" << (nebula_room_snapshots_enabled() ? "on" : "off") << "\n";
+    std::cerr << "[boot] If you see SIGSEGV right after this, try running the binary from Linux ext4 "
+                 "(e.g. copy build-cpp to ~/nebula-build), not from /mnt/d/ — drvfs can crash native code.\n";
+    std::cerr.flush();
+  }
   do_accept();
+  // Only schedule restore when enabled; avoids posting a no-op lambda and keeps startup minimal.
+  if (nebula_room_snapshots_enabled()) {
+    net::post(ioc_, [this]() {
+      try {
+        restore_room_snapshots_from_disk();
+      } catch (const std::exception& e) {
+        std::cerr << "[snapshot] restore: " << e.what() << "\n";
+      } catch (...) {
+        std::cerr << "[snapshot] restore: unknown exception\n";
+      }
+    });
+  }
   ioc_.run();
 }
 
@@ -3938,6 +4361,96 @@ void PokerServer::close_ws_protocol_error(const std::string& socket_id) {
   auto it = ws_by_socket_id_.find(socket_id);
   if (it == ws_by_socket_id_.end()) return;
   it->second->async_close_and_disconnect(websocket::close_code::protocol_error);
+}
+
+void PokerServer::touch_room_snapshot(Room& room) {
+  if (!nebula_room_snapshots_enabled()) return;
+  room.last_active_at = now_ms();
+  const std::string rid = room.room_id;
+  std::unique_ptr<net::steady_timer>& t = snapshot_timers_[rid];
+  if (!t) t = std::make_unique<net::steady_timer>(ioc_);
+  t->cancel();
+  t->expires_after(std::chrono::milliseconds(kSnapshotFlushMs));
+  t->async_wait([this, rid](const boost::system::error_code& ec) {
+    if (ec == net::error::operation_aborted) return;
+    flush_room_snapshot_to_disk(rid);
+  });
+}
+
+void PokerServer::flush_room_snapshot_to_disk(const std::string& room_id) {
+  if (!nebula_room_snapshots_enabled()) return;
+  nlohmann::json j;
+  {
+    std::lock_guard<std::mutex> lock(room_mutex(room_id));
+    auto it = rooms_.find(room_id);
+    if (it == rooms_.end()) return;
+    j = room_to_json(it->second);
+  }
+  try {
+    write_atomic_json_file(nebula_snapshot_room_file(room_id), j.dump(2));
+  } catch (const std::exception& e) {
+    std::cerr << "[snapshot] flush failed: " << e.what() << "\n";
+  }
+}
+
+void PokerServer::obliterate_room_snapshot(const std::string& room_id) {
+  auto it = snapshot_timers_.find(room_id);
+  if (it != snapshot_timers_.end() && it->second) {
+    it->second->cancel();
+    snapshot_timers_.erase(it);
+  }
+  std::error_code ec;
+  std::filesystem::remove(nebula_snapshot_room_file(room_id), ec);
+}
+
+void PokerServer::restore_room_snapshots_from_disk() {
+  if (!nebula_room_snapshots_enabled()) return;
+  constexpr std::uintmax_t kMaxSnapshotBytes = 32ULL * 1024ULL * 1024ULL;
+  try {
+    const auto dir = nebula_snapshot_dir_path();
+    std::filesystem::create_directories(dir);
+    try {
+      for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        std::error_code fe;
+        if (!entry.is_regular_file(fe) || fe) continue;
+        const std::filesystem::path& p = entry.path();
+        if (p.extension() != ".json") continue;
+        const auto sz = entry.file_size(fe);
+        if (fe || sz > kMaxSnapshotBytes) continue;
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs) continue;
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        const std::string raw = ss.str();
+        if (raw.empty()) continue;
+        try {
+          nlohmann::json j = nlohmann::json::parse(raw, nullptr, false);
+          if (j.is_discarded() || !j.is_object()) continue;
+          Room room;
+          room_from_json(j, room);
+          if (room.room_id.empty()) continue;
+          room.socket_ids.clear();
+          room.host_socket_id.clear();
+          room.voice_participants.clear();
+          room.expected_acks.clear();
+          room.match_acks.clear();
+          room.empty_since = now_ms();
+          if (room.room_code.empty()) room.room_code = room.room_id;
+          const std::string rid = room.room_id;
+          if (rooms_.count(rid)) continue;
+          rooms_.emplace(rid, std::move(room));
+          room_mutexes_.try_emplace(rid);
+          std::cout << "[snapshot] restored room " << rid << "\n";
+        } catch (const std::exception& e) {
+          std::cerr << "[snapshot] skip " << p.string() << ": " << e.what() << "\n";
+        }
+      }
+    } catch (const std::filesystem::filesystem_error& e) {
+      std::cerr << "[snapshot] restore fs: " << e.what() << "\n";
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "[snapshot] restore: " << e.what() << "\n";
+  }
 }
 
 }  // namespace

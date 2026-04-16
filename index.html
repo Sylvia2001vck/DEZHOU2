@@ -62,7 +62,18 @@
             /* Use normal stacking so it looks metallic even on browsers that ignore blend modes */
             background-blend-mode: normal;
         }
-        #container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        /* Full-screen WebGL can win hit-testing over fixed overlays in some browsers/GPUs; keep
+           canvas inert while lobby or seat UI is visible, then enable only for the actual table. */
+        #container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            pointer-events: none;
+        }
+        #container.canvas-pointer-events { pointer-events: auto; }
         
         /* Lobby UI */
         #lobby-overlay {
@@ -1079,21 +1090,10 @@
         
         const BUILD_TAG = `build-${new Date().toISOString()}`;
         const urlParams = new URLSearchParams(location.search);
-        let preferOffline = false;
         try {
-            preferOffline = localStorage.getItem('nebula_prefer_offline') === '1';
+            localStorage.removeItem('nebula_prefer_offline');
         } catch (_) {}
-        const FORCE_OFFLINE = urlParams.get('offline') === '1' || preferOffline;
-        if (urlParams.get('offline') === '1') {
-            try { localStorage.setItem('nebula_prefer_offline', '1'); } catch (_) {}
-        }
-        if (FORCE_OFFLINE && urlParams.get('offline') !== '1') {
-            try {
-                const u = new URL(location.href);
-                u.searchParams.set('offline', '1');
-                history.replaceState(null, '', u.toString());
-            } catch (_) {}
-        }
+        const FORCE_OFFLINE = urlParams.get('offline') === '1';
         let IS_MULTIPLAYER = (!FORCE_OFFLINE && location.protocol !== 'file:');
         let socket = null;
         if (IS_MULTIPLAYER) {
@@ -1104,8 +1104,15 @@
                 console.warn('[bootstrap] multiplayer init failed; fallback to offline mode', e);
                 IS_MULTIPLAYER = false;
                 socket = null;
+                const detail = (e && e.message) ? e.message : String(e);
                 setTimeout(() => {
-                    try { alert('Multiplayer backend not reachable. Switched to offline debug mode.'); } catch (_) {}
+                    try {
+                        alert(
+                            'Multiplayer init failed (see console). Switched to offline debug mode.\n\n' +
+                            'Common causes: server not running, or /proto/poker.proto not served (open it in a new tab).\n\n' +
+                            detail
+                        );
+                    } catch (_) {}
                 }, 0);
             }
         }
@@ -2114,6 +2121,31 @@
             } catch(_) {}
         });
 
+        function syncCanvasPointerEvents() {
+            const lobby = document.getElementById('lobby-overlay');
+            const seat = document.getElementById('seat-overlay');
+            const container = document.getElementById('container');
+            if (!container) return;
+            const lobbyVisible = lobby && window.getComputedStyle(lobby).display !== 'none';
+            const seatVisible = seat && window.getComputedStyle(seat).display !== 'none';
+            const enableCanvas = !lobbyVisible && !seatVisible;
+            container.classList.toggle('canvas-pointer-events', enableCanvas);
+        }
+
+        function installCanvasPointerGuards() {
+            syncCanvasPointerEvents();
+            try {
+                const obs = new MutationObserver(() => syncCanvasPointerEvents());
+                const lobby = document.getElementById('lobby-overlay');
+                const seat = document.getElementById('seat-overlay');
+                if (lobby) obs.observe(lobby, { attributes: true, attributeFilter: ['style'] });
+                if (seat) obs.observe(seat, { attributes: true, attributeFilter: ['style'] });
+            } catch (_) {}
+            try {
+                window.__syncCanvasPointerEvents = syncCanvasPointerEvents;
+            } catch (_) {}
+        }
+
         function setLobbyFeedback(message, isError = false) {
             const el = document.getElementById('auth-feedback');
             if (!el) return;
@@ -2147,13 +2179,8 @@
 
         function navigateWithOfflineMode(enabled) {
             const nextUrl = new URL(window.location.href);
-            if (enabled) {
-                try { localStorage.setItem('nebula_prefer_offline', '1'); } catch (_) {}
-                nextUrl.searchParams.set('offline', '1');
-            } else {
-                try { localStorage.removeItem('nebula_prefer_offline'); } catch (_) {}
-                nextUrl.searchParams.delete('offline');
-            }
+            if (enabled) nextUrl.searchParams.set('offline', '1');
+            else nextUrl.searchParams.delete('offline');
             window.location.href = nextUrl.toString();
         }
 
@@ -2561,10 +2588,19 @@
         }
 
         function init() {
-            setupBase();
-            setupLights();
-            setupAtmosphere();
-            createTable();
+            // 3D 初始化失败时仍必须绑定大厅按钮；否则 WebGL/驱动异常会导致登录/注册全无响应
+            try {
+                setupBase();
+                setupLights();
+                setupAtmosphere();
+                createTable();
+            } catch (e) {
+                console.error('[init] 3D bootstrap failed (lobby UI will still work):', e);
+                try {
+                    const fb = document.getElementById('auth-feedback');
+                    if (fb) fb.textContent = '3D table failed to load; lobby buttons still work. Check console.';
+                } catch (_) {}
+            }
             // 不再直接调用 createPlayers，由选座流程控制
             setupEvents();
             try { applyLanguageToUI(); } catch (_) {}
@@ -2587,8 +2623,13 @@
                     try { nextStep(); } catch(e) { console.error('[WATCHDOG nextStep error]', e); }
                 }
             }, 500);
-            animate();
+            if (renderer && scene && camera) {
+                animate();
+            } else {
+                console.warn('[init] Skipping render loop (3D not initialized).');
+            }
             try { wireMultiplayer(); } catch (_) {}
+            try { installCanvasPointerGuards(); } catch (_) {}
             bootstrapAuthLobby();
         }
 
@@ -5525,7 +5566,12 @@
         }
 
         function setupEvents() {
-            window.onresize = () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); };
+            window.onresize = () => {
+                if (!camera || !renderer) return;
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            };
             try {
                 const prev = window.onresize;
                 window.onresize = () => {
@@ -5934,92 +5980,110 @@
             document.querySelectorAll('.bean-tier-btn').forEach((btn) => {
                 btn.onclick = () => setSelectedBeanTier(btn.dataset.tier);
             });
-            document.getElementById('claim-daily-btn').onclick = async () => {
-                if (!IS_MULTIPLAYER) {
-                    setLobbyFeedback('Offline mode does not consume real rewards.');
-                    return;
-                }
-                try {
-                    await apiPost('/api/beans/claim-daily');
-                    setLobbyFeedback('Daily beans claimed.');
-                    await loadLobbyOverview();
-                } catch (e) {
-                    setLobbyFeedback(e?.message || 'Daily reward failed.', true);
-                }
-            };
-            document.getElementById('watch-ad-btn').onclick = async () => {
-                if (!IS_MULTIPLAYER) {
-                    setLobbyFeedback('Offline mode uses local debug rewards only.');
-                    return;
-                }
-                try {
-                    await apiPost('/api/beans/ad-reward');
-                    setLobbyFeedback('Ad reward granted.');
-                    await loadLobbyOverview();
-                } catch (e) {
-                    setLobbyFeedback(e?.message || 'Ad reward failed.', true);
-                }
-            };
-            document.getElementById('show-register-btn').onclick = () => {
-                setLobbyMode('register');
-                setLobbyFeedback('Create a new account.');
-            };
-            document.getElementById('show-login-btn').onclick = () => {
-                setLobbyMode('login');
-                setLobbyFeedback('Log in to create rooms or quick match.');
-            };
-            document.getElementById('offline-debug-btn').onclick = () => {
-                navigateWithOfflineMode(true);
-            };
-            document.getElementById('offline-debug-register-btn').onclick = () => {
-                navigateWithOfflineMode(true);
-            };
-            document.getElementById('auth-login-btn').onclick = async () => {
-                try {
-                    const loginUsername = document.getElementById('auth-login-username').value.trim();
-                    const password = document.getElementById('auth-login-password').value;
-                    const data = await apiPost('/api/auth/login', { loginUsername, password });
-                    updateLobbyAccountCard(data.user);
-                    setLobbyMode('home');
-                    setLobbyFeedback('Login successful.');
-                    location.reload();
-                } catch (e) {
-                    setLobbyFeedback(e?.message || 'Login failed.', true);
-                }
-            };
-            document.getElementById('auth-register-btn').onclick = async () => {
-                try {
-                    const loginUsername = document.getElementById('auth-register-username').value.trim();
-                    const displayName = document.getElementById('auth-register-display-name').value.trim();
-                    const password = document.getElementById('auth-register-password').value;
-                    const data = await apiPost('/api/auth/register', { loginUsername, displayName, password });
-                    updateLobbyAccountCard(data.user);
-                    setLobbyMode('home');
-                    setLobbyFeedback('Registration successful.');
-                    location.reload();
-                } catch (e) {
-                    setLobbyFeedback(e?.message || 'Registration failed.', true);
-                }
-            };
-            document.getElementById('logout-btn').onclick = async () => {
-                if (!IS_MULTIPLAYER) {
-                    navigateWithOfflineMode(false);
-                    return;
-                }
-                try {
-                    stopMatchmakingPolling();
-                    await apiPost('/api/auth/logout');
-                    updateLobbyAccountCard(null);
+            const claimDailyBtn = document.getElementById('claim-daily-btn');
+            if (claimDailyBtn) {
+                claimDailyBtn.onclick = async () => {
+                    if (!IS_MULTIPLAYER) {
+                        setLobbyFeedback('Offline mode does not consume real rewards.');
+                        return;
+                    }
+                    try {
+                        await apiPost('/api/beans/claim-daily');
+                        setLobbyFeedback('Daily beans claimed.');
+                        await loadLobbyOverview();
+                    } catch (e) {
+                        setLobbyFeedback(e?.message || 'Daily reward failed.', true);
+                    }
+                };
+            }
+            const watchAdBtn = document.getElementById('watch-ad-btn');
+            if (watchAdBtn) {
+                watchAdBtn.onclick = async () => {
+                    if (!IS_MULTIPLAYER) {
+                        setLobbyFeedback('Offline mode uses local debug rewards only.');
+                        return;
+                    }
+                    try {
+                        await apiPost('/api/beans/ad-reward');
+                        setLobbyFeedback('Ad reward granted.');
+                        await loadLobbyOverview();
+                    } catch (e) {
+                        setLobbyFeedback(e?.message || 'Ad reward failed.', true);
+                    }
+                };
+            }
+            const showRegisterBtn = document.getElementById('show-register-btn');
+            if (showRegisterBtn) {
+                showRegisterBtn.onclick = () => {
+                    setLobbyMode('register');
+                    setLobbyFeedback('Create a new account.');
+                };
+            }
+            const showLoginBtn = document.getElementById('show-login-btn');
+            if (showLoginBtn) {
+                showLoginBtn.onclick = () => {
                     setLobbyMode('login');
-                    setLobbyFeedback('Signed out.');
-                    location.reload();
-                } catch (e) {
-                    setLobbyFeedback(e?.message || 'Logout failed.', true);
-                }
-            };
-            document.getElementById('switch-online-btn').onclick = () => {
-                navigateWithOfflineMode(false);
-            };
+                    setLobbyFeedback('Log in to create rooms or quick match.');
+                };
+            }
+            const offlineDebugBtn = document.getElementById('offline-debug-btn');
+            if (offlineDebugBtn) offlineDebugBtn.onclick = () => navigateWithOfflineMode(true);
+            const offlineDebugRegBtn = document.getElementById('offline-debug-register-btn');
+            if (offlineDebugRegBtn) offlineDebugRegBtn.onclick = () => navigateWithOfflineMode(true);
+            const authLoginBtn = document.getElementById('auth-login-btn');
+            if (authLoginBtn) {
+                authLoginBtn.onclick = async () => {
+                    try {
+                        const loginUsername = document.getElementById('auth-login-username').value.trim();
+                        const password = document.getElementById('auth-login-password').value;
+                        const data = await apiPost('/api/auth/login', { loginUsername, password });
+                        updateLobbyAccountCard(data.user);
+                        setLobbyMode('home');
+                        setLobbyFeedback('Login successful.');
+                        location.reload();
+                    } catch (e) {
+                        setLobbyFeedback(e?.message || 'Login failed.', true);
+                    }
+                };
+            }
+            const authRegisterBtn = document.getElementById('auth-register-btn');
+            if (authRegisterBtn) {
+                authRegisterBtn.onclick = async () => {
+                    try {
+                        const loginUsername = document.getElementById('auth-register-username').value.trim();
+                        const displayName = document.getElementById('auth-register-display-name').value.trim();
+                        const password = document.getElementById('auth-register-password').value;
+                        const data = await apiPost('/api/auth/register', { loginUsername, displayName, password });
+                        updateLobbyAccountCard(data.user);
+                        setLobbyMode('home');
+                        setLobbyFeedback('Registration successful.');
+                        location.reload();
+                    } catch (e) {
+                        setLobbyFeedback(e?.message || 'Registration failed.', true);
+                    }
+                };
+            }
+            const logoutBtnEl = document.getElementById('logout-btn');
+            if (logoutBtnEl) {
+                logoutBtnEl.onclick = async () => {
+                    if (!IS_MULTIPLAYER) {
+                        navigateWithOfflineMode(false);
+                        return;
+                    }
+                    try {
+                        stopMatchmakingPolling();
+                        await apiPost('/api/auth/logout');
+                        updateLobbyAccountCard(null);
+                        setLobbyMode('login');
+                        setLobbyFeedback('Signed out.');
+                        location.reload();
+                    } catch (e) {
+                        setLobbyFeedback(e?.message || 'Logout failed.', true);
+                    }
+                };
+            }
+            const switchOnlineBtn = document.getElementById('switch-online-btn');
+            if (switchOnlineBtn) switchOnlineBtn.onclick = () => navigateWithOfflineMode(false);
             document.getElementById('create-room-btn').onclick = async () => {
                 if (!IS_MULTIPLAYER) {
                     const initChips = parseInt(document.getElementById('init-chips-input').value, 10);
@@ -6475,9 +6539,10 @@
 
         function animate() {
             requestAnimationFrame(animate);
+            if (!renderer || !scene || !camera) return;
             const dt = nextSmoothDt();
             for (const s of smoothSyncRegistry) s.update(dt);
-            controls.update();
+            if (controls) controls.update();
             if(starField) {
                 starField.rotation.y += 0.0005;
                 starField.rotation.x += 0.0002;
