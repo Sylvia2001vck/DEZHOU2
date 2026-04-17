@@ -14,7 +14,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/DEZHOU2
 Environment=NEBULA_REPO_ROOT=/home/ubuntu/DEZHOU2
-Environment=PORT=3000
+Environment=PORT=8080
 Environment=NEBULA_ROOM_WORKER_HOST=127.0.0.1
 Environment=NEBULA_ROOM_WORKER_PORT=3101
 ExecStart=/usr/bin/java -jar /home/ubuntu/DEZHOU2/backend-java/target/nebula-gateway.jar

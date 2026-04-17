@@ -9,7 +9,7 @@
 #   sudo systemctl enable --now nebula-poker-cpp
 #   sudo systemctl enable --now nebula-gateway-java
 #
-# Security group: open TCP 22 (SSH) and PORT (default 3000) or 80/443 behind Nginx.
+# Security group: open TCP 22 (SSH) and PORT (nebula-gateway-java.service defaults to 8080) or 80/443 behind Nginx.
 # Do NOT expose NEBULA_ROOM_WORKER_PORT (3101) — C++ listens on 127.0.0.1 only.
 
 set -euo pipefail
@@ -50,6 +50,6 @@ ls -la "$CPP_BIN" "$JAR"
 echo ""
 echo "Manual run (same machine):"
 echo "  terminal A:  NEBULA_REPO_ROOT=\"$ROOT\" $CPP_BIN"
-echo "  terminal B:  NEBULA_REPO_ROOT=\"$ROOT\" PORT=3000 java -jar \"$JAR\""
+echo "  terminal B:  NEBULA_REPO_ROOT=\"$ROOT\" PORT=8080 java -jar \"$JAR\""
 echo ""
 echo "Or use systemd units under scripts/cloud/ (edit User + paths to match this server)."
