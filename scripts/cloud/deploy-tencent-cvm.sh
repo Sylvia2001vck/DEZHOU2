@@ -16,6 +16,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+if ! command -v javac >/dev/null 2>&1; then
+  echo "ERROR: javac not found. Maven needs a full JDK (not JRE-only)." >&2
+  echo "  sudo apt install -y openjdk-21-jdk" >&2
+  echo "  export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64" >&2
+  echo "  export PATH=\"\$JAVA_HOME/bin:\$PATH\"" >&2
+  exit 1
+fi
+echo "[0/3] javac: $(javac -version 2>&1)"
+
 : "${NEBULA_BUILD_JOBS:=$(nproc)}"
 
 echo "[1/3] C++ Release build..."
