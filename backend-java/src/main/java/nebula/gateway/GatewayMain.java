@@ -3,6 +3,7 @@ package nebula.gateway;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.Handler;
+import io.javalin.http.staticfiles.Location;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -56,6 +57,8 @@ public final class GatewayMain {
               config.staticFiles.add(staticFiles -> {
                 staticFiles.hostedPath = "/";
                 staticFiles.directory = staticRoot;
+                // Default is CLASSPATH — absolute paths must use EXTERNAL or Jetty reports "directory does not exist".
+                staticFiles.location = Location.EXTERNAL;
               });
             });
 
