@@ -1,7 +1,4 @@
 #include <boost/asio.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/websocket.hpp>
 
 #include <algorithm>
 #include <array>
@@ -25,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,9 +40,6 @@
 #include <hiredis/hiredis.h>
 #endif
 
-namespace beast = boost::beast;
-namespace http = beast::http;
-namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
@@ -65,8 +60,7 @@ struct HttpReply {
   std::string body;
 };
 
-struct WsSession;
-struct TcpHttpSession;
+struct GatewaySession;
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::milliseconds;
@@ -1293,8 +1287,7 @@ class HiredisLeaderboardStore final : public LeaderboardStore {
 #endif
 
 class PokerServer {
-  friend struct TcpHttpSession;
-  friend struct WsSession;
+  friend struct GatewaySession;
 
  public:
   PokerServer()
@@ -1313,7 +1306,7 @@ class PokerServer {
     return env.SerializeAsString();
   }
 
-  // Defined after struct WsSession (needs complete type for queue_write).
+  // Defined after struct GatewaySession (needs complete type for queue_up).
   void send_envelope_bytes(const std::string& socket_id, const std::string& bytes);
 
   template <typename T>
@@ -2572,10 +2565,6 @@ class PokerServer {
     return true;
   }
 
-  std::string next_socket_id() {
-    return "ws-" + std::to_string(++socket_counter_);
-  }
-
   Room* get_room(const std::string& room_id) {
     auto it = rooms_.find(room_id);
     return it == rooms_.end() ? nullptr : &it->second;
@@ -2610,7 +2599,7 @@ class PokerServer {
   }
 
   bool is_online(const std::string& socket_id) const {
-    return !socket_id.empty() && ws_by_socket_id_.find(socket_id) != ws_by_socket_id_.end();
+    return !socket_id.empty() && active_gateway_clients_.count(socket_id) > 0;
   }
 
   bool is_seat_eligible(Room& room, int seat_idx) {
@@ -4079,7 +4068,9 @@ class PokerServer {
   net::io_context ioc_;
   std::optional<tcp::acceptor> acceptor_;
   std::unordered_map<std::string, Session> sessions_;
-  std::unordered_map<std::string, std::shared_ptr<WsSession>> ws_by_socket_id_;
+  std::shared_ptr<GatewaySession> gateway_session_;
+  std::unordered_set<std::string> active_gateway_clients_;
+  std::unordered_set<std::string> gateway_tracked_socket_ids_;
   std::unordered_map<std::string, std::unique_ptr<net::steady_timer>> snapshot_timers_;
 
   void touch_room_snapshot(Room& room);
@@ -4088,8 +4079,10 @@ class PokerServer {
   void restore_room_snapshots_from_disk();
 
   void do_accept();
-  void register_ws_session(std::shared_ptr<WsSession> sess);
-  void unregister_ws_session(const std::string& socket_id);
+  void attach_gateway(const std::shared_ptr<GatewaySession>& sess);
+  void detach_gateway(const std::shared_ptr<GatewaySession>& sess);
+  void remove_session(const std::string& socket_id);
+  void on_gateway_down(GatewaySession& gw, const nebula::poker::GatewayDown& msg);
   void close_ws_protocol_error(const std::string& socket_id);
   std::unordered_map<std::string, Room> rooms_;
   std::unordered_map<std::string, std::mutex> room_mutexes_;
@@ -4107,171 +4100,221 @@ class PokerServer {
   std::unordered_map<int64_t, std::string> equipped_table_theme_;
   std::vector<TournamentInfo> tournaments_;
   std::mt19937 rng_;
-  int64_t socket_counter_ = 0;
   std::unique_ptr<UserStore> user_store_;
   std::unique_ptr<AuthStore> auth_store_;
   std::unique_ptr<LeaderboardStore> leaderboard_store_;
 };
 
-struct WsSession : std::enable_shared_from_this<WsSession> {
-  PokerServer* server_;
-  websocket::stream<tcp::socket> ws_;
-  http::request<http::string_body> req_;
-  beast::flat_buffer buffer_;
-  std::string socket_id_;
+struct GatewaySession : std::enable_shared_from_this<GatewaySession> {
+  PokerServer* server_{nullptr};
+  tcp::socket socket_;
   std::deque<std::string> out_queue_;
   bool writing_{false};
+  std::array<char, 4> hdr_{};
+  std::vector<char> body_;
+  std::uint32_t expect_len_{0};
 
-  WsSession(PokerServer* s, tcp::socket&& sock, http::request<http::string_body>&& r)
-      : server_(s), ws_(std::move(sock)), req_(std::move(r)) {}
+  static constexpr std::uint32_t kMaxFrame = 32U * 1024U * 1024U;
 
-  void start() {
-    auto self = shared_from_this();
-    buffer_.reserve(65536);
-    ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
-    // Boost.Beast 1.74+: member is read_message_max (not max_read_message_size).
-    ws_.read_message_max(16ULL * 1024 * 1024);
-    ws_.async_accept(req_, [self](beast::error_code ec) {
-      if (ec) return;  // handshake failed — no session registered yet
-      self->server_->register_ws_session(self);
-      self->read_loop();
-    });
-  }
+  GatewaySession(PokerServer* s, tcp::socket&& sock) : server_(s), socket_(std::move(sock)) {}
 
-  /// Close the WebSocket with an RFC6455 close code, then remove session from server maps (idempotent).
-  void async_close_and_disconnect(websocket::close_code code) {
-    auto self = shared_from_this();
-    ws_.async_close(code, [self](beast::error_code ec) {
-      (void)ec;
-      self->server_->unregister_ws_session(self->socket_id_);
-    });
-  }
+  void start();
+  void begin_read_frame();
 
-  void queue_write(std::string s) {
-    out_queue_.push_back(std::move(s));
-    if (!writing_) pump_write();
+  void queue_up(const nebula::poker::GatewayUp& up) {
+    const std::string payload = up.SerializeAsString();
+    if (payload.size() > kMaxFrame) return;
+    std::string framed;
+    framed.reserve(4 + payload.size());
+    const auto n = static_cast<std::uint32_t>(payload.size());
+    framed.push_back(static_cast<char>((n >> 24) & 0xff));
+    framed.push_back(static_cast<char>((n >> 16) & 0xff));
+    framed.push_back(static_cast<char>((n >> 8) & 0xff));
+    framed.push_back(static_cast<char>(n & 0xff));
+    framed.append(payload);
+    out_queue_.push_back(std::move(framed));
+    pump_write();
   }
 
   void pump_write() {
-    if (out_queue_.empty()) {
-      writing_ = false;
-      return;
-    }
+    if (writing_ || out_queue_.empty()) return;
     writing_ = true;
     auto self = shared_from_this();
-    ws_.binary(true);
-    ws_.async_write(net::buffer(out_queue_.front()), [self](beast::error_code ec, std::size_t) {
-      if (ec) {
-        self->server_->unregister_ws_session(self->socket_id_);
-        return;
-      }
-      self->out_queue_.pop_front();
-      self->pump_write();
-    });
-  }
-
-  void read_loop() {
-    auto self = shared_from_this();
-    ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t n) {
-      // Any error (incl. websocket::error::closed) ends the connection — drop maps to avoid zombies.
-      if (ec) {
-        self->server_->unregister_ws_session(self->socket_id_);
-        return;
-      }
-      (void)n;
-      if (self->ws_.got_text()) {
-        self->buffer_.consume(self->buffer_.size());
-        self->read_loop();
-        return;
-      }
-      const std::size_t total = self->buffer_.size();
-      if (total == 0) {
-        self->read_loop();
-        return;
-      }
-      const auto bufs = self->buffer_.data();
-      const auto first = beast::buffers_front(bufs);
-      bool keep_reading = false;
-      if (first.size() >= total) {
-        // Hot path: one contiguous readable segment — ParseFromArray without std::string copy.
-        keep_reading = self->server_->on_ws_message(
-            self->socket_id_, static_cast<const char*>(first.data()), total);
-      } else {
-        // Rare: readable bytes span multiple const_buffer chunks — single concat then parse.
-        std::string tmp = beast::buffers_to_string(bufs);
-        keep_reading = self->server_->on_ws_message(self->socket_id_, tmp.data(), tmp.size());
-      }
-      self->buffer_.consume(total);
-      if (!keep_reading) return;
-      self->read_loop();
-    });
+    net::async_write(socket_, net::buffer(out_queue_.front()),
+                     [this, self](const boost::system::error_code& ec, std::size_t) {
+                       writing_ = false;
+                       if (ec) {
+                         server_->detach_gateway(self);
+                         return;
+                       }
+                       out_queue_.pop_front();
+                       pump_write();
+                     });
   }
 };
 
-void PokerServer::send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
-  auto it = ws_by_socket_id_.find(socket_id);
-  if (it == ws_by_socket_id_.end()) return;
-  it->second->queue_write(std::string(bytes));
+void GatewaySession::start() {
+  server_->attach_gateway(shared_from_this());
+  begin_read_frame();
 }
 
-struct TcpHttpSession : std::enable_shared_from_this<TcpHttpSession> {
-  PokerServer* server_;
-  tcp::socket socket_;
-  beast::flat_buffer buffer_;
-  http::request<http::string_body> req_;
+void GatewaySession::begin_read_frame() {
+  auto self = shared_from_this();
+  net::async_read(socket_, net::buffer(hdr_.data(), hdr_.size()),
+                  [this, self](const boost::system::error_code& ec, std::size_t) {
+                    if (ec) {
+                      server_->detach_gateway(self);
+                      return;
+                    }
+                    expect_len_ = (static_cast<std::uint32_t>(static_cast<unsigned char>(hdr_[0])) << 24) |
+                                  (static_cast<std::uint32_t>(static_cast<unsigned char>(hdr_[1])) << 16) |
+                                  (static_cast<std::uint32_t>(static_cast<unsigned char>(hdr_[2])) << 8) |
+                                  static_cast<std::uint32_t>(static_cast<unsigned char>(hdr_[3]));
+                    if (expect_len_ == 0 || expect_len_ > kMaxFrame) {
+                      server_->detach_gateway(self);
+                      return;
+                    }
+                    body_.resize(expect_len_);
+                    net::async_read(socket_, net::buffer(body_.data(), body_.size()),
+                                    [this, self](const boost::system::error_code& ec2, std::size_t) {
+                                      if (ec2) {
+                                        server_->detach_gateway(self);
+                                        return;
+                                      }
+                                      nebula::poker::GatewayDown down;
+                                      if (!down.ParseFromArray(body_.data(), static_cast<int>(body_.size()))) {
+                                        server_->detach_gateway(self);
+                                        return;
+                                      }
+                                      server_->on_gateway_down(*self, down);
+                                      begin_read_frame();
+                                    });
+                  });
+}
 
-  TcpHttpSession(PokerServer* s, tcp::socket&& sock) : server_(s), socket_(std::move(sock)) {}
+void PokerServer::send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
+  if (!gateway_session_) return;
+  nebula::poker::GatewayUp up;
+  auto* out = up.mutable_to_client_envelope();
+  out->set_socket_id(socket_id);
+  out->set_envelope(bytes);
+  gateway_session_->queue_up(up);
+}
 
-  void start() {
-    auto self = shared_from_this();
-    http::async_read(socket_, buffer_, req_, [self](beast::error_code ec, std::size_t) {
-      if (ec) return;
-      if (websocket::is_upgrade(self->req_)) {
-        auto ws = std::make_shared<WsSession>(self->server_, std::move(self->socket_), std::move(self->req_));
-        ws->start();
-        return;
-      }
+void PokerServer::attach_gateway(const std::shared_ptr<GatewaySession>& sess) {
+  gateway_session_ = sess;
+}
+
+void PokerServer::detach_gateway(const std::shared_ptr<GatewaySession>& sess) {
+  if (!gateway_session_ || gateway_session_ != sess) return;
+  gateway_session_.reset();
+  const std::vector<std::string> ids(gateway_tracked_socket_ids_.begin(), gateway_tracked_socket_ids_.end());
+  gateway_tracked_socket_ids_.clear();
+  active_gateway_clients_.clear();
+  for (const auto& sid : ids) {
+    auto it = sessions_.find(sid);
+    if (it == sessions_.end()) continue;
+    handle_disconnect(it->second);
+    sessions_.erase(it);
+  }
+}
+
+void PokerServer::remove_session(const std::string& socket_id) {
+  if (socket_id.empty()) return;
+  active_gateway_clients_.erase(socket_id);
+  gateway_tracked_socket_ids_.erase(socket_id);
+  auto it = sessions_.find(socket_id);
+  if (it == sessions_.end()) return;
+  handle_disconnect(it->second);
+  sessions_.erase(it);
+}
+
+void PokerServer::on_gateway_down(GatewaySession& /*gw*/, const nebula::poker::GatewayDown& msg) {
+  switch (msg.payload_case()) {
+    case nebula::poker::GatewayDown::kClientRegister: {
+      const auto& r = msg.client_register();
+      const std::string& socket_id = r.socket_id();
+      if (socket_id.empty()) return;
+      if (sessions_.count(socket_id) > 0) remove_session(socket_id);
+      Session session;
+      session.socket_id = socket_id;
+      bind_http_session_to_socket(session, r.cookie_header());
+      sessions_[socket_id] = std::move(session);
+      active_gateway_clients_.insert(socket_id);
+      gateway_tracked_socket_ids_.insert(socket_id);
+      nebula::poker::TextMessage tmsg;
+      tmsg.set_msg(socket_id);
+      send_event(socket_id, "connect", tmsg);
+      send_auth_state(socket_id, sessions_[socket_id]);
+      return;
+    }
+    case nebula::poker::GatewayDown::kClientUnregister: {
+      remove_session(msg.client_unregister().socket_id());
+      return;
+    }
+    case nebula::poker::GatewayDown::kClientEnvelope: {
+      const auto& e = msg.client_envelope();
+      const std::string& sid = e.socket_id();
+      const std::string& env = e.envelope();
+      (void)on_ws_message(sid, env.data(), env.size());
+      return;
+    }
+    case nebula::poker::GatewayDown::kApiRequest: {
+      if (!gateway_session_) return;
+      const auto& a = msg.api_request();
       HttpRequestView v;
-      v.method = std::string(self->req_.method_string());
-      v.uri = std::string(self->req_.target());
+      v.method = a.method();
+      v.uri = a.uri();
       const std::size_t q = v.uri.find('?');
       v.clean_uri = q == std::string::npos ? v.uri : v.uri.substr(0, q);
-      v.body = self->req_.body();
-      v.cookie_header = self->req_.count(http::field::cookie) ? std::string(self->req_[http::field::cookie]) : "";
+      v.body = std::string(a.body());
+      v.cookie_header = a.cookie_header();
       HttpReply rep;
       try {
-        self->server_->handle_http_request(v, rep);
+        handle_http_request(v, rep);
       } catch (const std::exception& e) {
-        std::cerr << "[http] handle_http_request: " << e.what() << "\n";
+        std::cerr << "[api] handle_http_request: " << e.what() << "\n";
         rep.status = 500;
         rep.content_type = "text/plain; charset=utf-8";
         rep.body = "Internal Server Error";
       } catch (...) {
-        std::cerr << "[http] handle_http_request: unknown exception\n";
+        std::cerr << "[api] handle_http_request: unknown exception\n";
         rep.status = 500;
         rep.content_type = "text/plain; charset=utf-8";
         rep.body = "Internal Server Error";
       }
-      http::response<http::string_body> res{static_cast<http::status>(rep.status), self->req_.version()};
-      res.set(http::field::connection, "close");
-      res.set(http::field::content_type, rep.content_type);
-      if (rep.set_cookie) res.set(http::field::set_cookie, *rep.set_cookie);
-      res.body() = rep.body;
-      res.prepare_payload();
-      http::async_write(self->socket_, res, [self](beast::error_code ec, std::size_t) {
-        if (ec) return;
-        if (self->socket_.is_open()) {
-          beast::error_code se;
-          self->socket_.shutdown(tcp::socket::shutdown_send, se);
-        }
-      });
-    });
+      nebula::poker::GatewayUp up;
+      auto* ar = up.mutable_api_response();
+      ar->set_request_id(a.request_id());
+      ar->set_status(static_cast<std::int32_t>(rep.status));
+      ar->set_content_type(rep.content_type);
+      ar->set_body(rep.body.data(), static_cast<int>(rep.body.size()));
+      if (rep.set_cookie) ar->set_set_cookie_header(*rep.set_cookie);
+      gateway_session_->queue_up(up);
+      return;
+    }
+    case nebula::poker::GatewayDown::kPing: {
+      if (!gateway_session_) return;
+      nebula::poker::GatewayUp up;
+      up.mutable_pong()->set_nonce(msg.ping().nonce());
+      gateway_session_->queue_up(up);
+      return;
+    }
+    default:
+      return;
   }
-};
+}
 
 void PokerServer::run(uint16_t port) {
-  tcp::endpoint ep{tcp::v4(), port};
-  beast::error_code ec;
+  const std::string bind = get_env("NEBULA_ROOM_WORKER_BIND", "127.0.0.1");
+  boost::system::error_code addr_ec;
+  const auto addr = net::ip::make_address(bind, addr_ec);
+  if (addr_ec) {
+    std::cerr << "invalid NEBULA_ROOM_WORKER_BIND: " << bind << " (" << addr_ec.message() << ")\n";
+    return;
+  }
+  tcp::endpoint ep{addr, port};
+  boost::system::error_code ec;
   acceptor_.emplace(ioc_);
   acceptor_->open(ep.protocol(), ec);
   if (ec) {
@@ -4289,19 +4332,18 @@ void PokerServer::run(uint16_t port) {
     std::cerr << "listen failed: " << ec.message() << "\n";
     return;
   }
-  std::cout << "nebula-poker C++ listening on 0.0.0.0:" << port << "\n";
+  std::cout << "nebula-poker C++ room worker listening on " << bind << ":" << port << " (Java gateway connects here)\n";
   std::cout.flush();
   {
-    std::error_code ec;
-    const std::filesystem::path cw = std::filesystem::current_path(ec);
-    std::cerr << "[boot] cwd=" << (ec ? std::string("(error)") : cw.string())
+    std::error_code fsec;
+    const std::filesystem::path cw = std::filesystem::current_path(fsec);
+    std::cerr << "[boot] cwd=" << (fsec ? std::string("(error)") : cw.string())
               << " room_snapshot=" << (nebula_room_snapshots_enabled() ? "on" : "off") << "\n";
     std::cerr << "[boot] If you see SIGSEGV right after this, try running the binary from Linux ext4 "
                  "(e.g. copy build-cpp to ~/nebula-build), not from /mnt/d/ — drvfs can crash native code.\n";
     std::cerr.flush();
   }
   do_accept();
-  // Only schedule restore when enabled; avoids posting a no-op lambda and keeps startup minimal.
   if (nebula_room_snapshots_enabled()) {
     net::post(ioc_, [this]() {
       try {
@@ -4318,49 +4360,29 @@ void PokerServer::run(uint16_t port) {
 
 void PokerServer::do_accept() {
   auto sock = std::make_shared<tcp::socket>(ioc_);
-  acceptor_->async_accept(*sock, [this, sock](beast::error_code ec) {
+  acceptor_->async_accept(*sock, [this, sock](const boost::system::error_code& ec) {
     if (!ec) {
-      std::make_shared<TcpHttpSession>(this, std::move(*sock))->start();
+      if (gateway_session_) {
+        boost::system::error_code sec;
+        sock->close(sec);
+        std::cerr << "[gateway] rejected extra inbound connection (only one Java gateway allowed)\n";
+      } else {
+        std::make_shared<GatewaySession>(this, std::move(*sock))->start();
+      }
     }
-    // Never call do_accept() directly here: on some systems async_accept can invoke
-    // this handler synchronously; chaining do_accept()->async_accept()->handler->do_accept()
-    // recurses on one stack and can overflow → SIGSEGV. Post breaks the recursion.
     net::post(ioc_, [this]() { do_accept(); });
   });
 }
 
-void PokerServer::register_ws_session(std::shared_ptr<WsSession> sess) {
-  const std::string cookie =
-      sess->req_.count(http::field::cookie) ? std::string(sess->req_[http::field::cookie]) : "";
-  Session session;
-  session.socket_id = next_socket_id();
-  bind_http_session_to_socket(session, cookie);
-  sessions_[session.socket_id] = session;
-  sess->socket_id_ = session.socket_id;
-  ws_by_socket_id_[session.socket_id] = sess;
-  nebula::poker::TextMessage msg;
-  msg.set_msg(session.socket_id);
-  nebula::poker::Envelope env;
-  env.set_event_name("connect");
-  env.set_payload(msg.SerializeAsString());
-  sess->queue_write(env.SerializeAsString());
-  send_auth_state(session.socket_id, sessions_[session.socket_id]);
-}
-
-// Idempotent: safe if also called from read/write after async_close (duplicate teardown).
-void PokerServer::unregister_ws_session(const std::string& socket_id) {
-  if (socket_id.empty()) return;
-  ws_by_socket_id_.erase(socket_id);
-  auto it = sessions_.find(socket_id);
-  if (it == sessions_.end()) return;
-  handle_disconnect(it->second);
-  sessions_.erase(it);
-}
-
 void PokerServer::close_ws_protocol_error(const std::string& socket_id) {
-  auto it = ws_by_socket_id_.find(socket_id);
-  if (it == ws_by_socket_id_.end()) return;
-  it->second->async_close_and_disconnect(websocket::close_code::protocol_error);
+  if (gateway_session_) {
+    nebula::poker::GatewayUp up;
+    auto* c = up.mutable_to_client_close();
+    c->set_socket_id(socket_id);
+    c->set_close_code(1002);
+    gateway_session_->queue_up(up);
+  }
+  remove_session(socket_id);
 }
 
 void PokerServer::touch_room_snapshot(Room& room) {
@@ -4457,7 +4479,7 @@ void PokerServer::restore_room_snapshots_from_disk() {
 
 int main() {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
-  const uint16_t port = static_cast<uint16_t>(get_env_int("PORT", 3000));
+  const uint16_t port = static_cast<uint16_t>(get_env_int("NEBULA_ROOM_WORKER_PORT", 3101));
   PokerServer server;
   server.run(port);
   google::protobuf::ShutdownProtobufLibrary();

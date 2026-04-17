@@ -4,7 +4,7 @@
 #   sudo systemctl enable --now nebula-poker-cpp
 
 [Unit]
-Description=Nebula Poker C++ server (Boost.Beast)
+Description=Nebula Poker C++ room worker (loopback gateway for Java)
 After=network.target
 
 [Service]
@@ -12,7 +12,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/DEZHOU
 Environment=NEBULA_REPO_ROOT=/home/ubuntu/DEZHOU
-Environment=PORT=3000
+Environment=NEBULA_ROOM_WORKER_PORT=3101
+Environment=NEBULA_ROOM_WORKER_BIND=127.0.0.1
 # Optional DB (omit or comment if not used yet):
 # Environment=MYSQL_HOST=127.0.0.1
 # Environment=MYSQL_USER=nebula

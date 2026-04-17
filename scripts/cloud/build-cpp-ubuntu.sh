@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Nebula C++ (Boost.Beast) backend on Ubuntu 22.04/24.04.
+# Build Nebula C++ room worker (Boost.Asio gateway + game logic) on Ubuntu 22.04/24.04.
 # Run from repository root: bash scripts/cloud/build-cpp-ubuntu.sh
 #
 # Low-RAM VM: optional swap → scripts/cloud/add-swap-2g-ubuntu.sh

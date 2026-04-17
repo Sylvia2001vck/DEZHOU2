@@ -314,3 +314,72 @@ message LeaderboardResponse {
   string type = 1;
   repeated LeaderboardEntry entries = 2;
 }
+
+// --- Java gateway <-> C++ room worker (length-prefixed on TCP, no WebSocket in C++) ---
+
+message GatewayClientRegister {
+  string socket_id = 1;
+  string cookie_header = 2;
+}
+
+message GatewayClientUnregister {
+  string socket_id = 1;
+}
+
+message GatewayClientEnvelope {
+  string socket_id = 1;
+  bytes envelope = 2;
+}
+
+message GatewayApiRequest {
+  uint64 request_id = 1;
+  string method = 2;
+  string uri = 3;
+  bytes body = 4;
+  string cookie_header = 5;
+}
+
+message GatewayPing {
+  int64 nonce = 1;
+}
+
+message GatewayDown {
+  oneof payload {
+    GatewayClientRegister client_register = 1;
+    GatewayClientUnregister client_unregister = 2;
+    GatewayClientEnvelope client_envelope = 3;
+    GatewayApiRequest api_request = 4;
+    GatewayPing ping = 5;
+  }
+}
+
+message GatewayToClientEnvelope {
+  string socket_id = 1;
+  bytes envelope = 2;
+}
+
+message GatewayToClientClose {
+  string socket_id = 1;
+  int32 close_code = 2;
+}
+
+message GatewayApiResponse {
+  uint64 request_id = 1;
+  int32 status = 2;
+  string content_type = 3;
+  bytes body = 4;
+  string set_cookie_header = 5;
+}
+
+message GatewayPong {
+  int64 nonce = 1;
+}
+
+message GatewayUp {
+  oneof payload {
+    GatewayToClientEnvelope to_client_envelope = 1;
+    GatewayToClientClose to_client_close = 2;
+    GatewayApiResponse api_response = 3;
+    GatewayPong pong = 4;
+  }
+}

@@ -1,6 +1,6 @@
 # Nebula Poker — C++ Backend
 
-Single-process game server for **Nebula Poker**: HTTP + WebSocket, protobuf-framed events, optional MySQL users and Redis leaderboards. It replaces the original Node `server.js` while keeping the same HTTP routes and client-facing behavior where documented below.
+**C++ room worker** for **Nebula Poker**: game logic, protobuf `Envelope` events, optional MySQL users and Redis leaderboards. **HTTP and WebSocket are not implemented in C++** — run the **Java gateway** (`backend-java`) on the public port; it forwards REST and `/ws` binary frames to this process over a localhost TCP link (`GatewayDown` / `GatewayUp` in `proto/poker.proto`).
 
 ---
 
@@ -10,7 +10,7 @@ Single-process game server for **Nebula Poker**: HTTP + WebSocket, protobuf-fram
 |------|------|
 | 语言 / 标准 | **C++20** |
 | 构建 | **CMake ≥ 3.22** |
-| 网络 | **Boost.Beast**（HTTP + WebSocket）+ **Boost.Asio** |
+| 网络 | **Boost.Asio**（仅 **127.0.0.1** TCP 网关；无 Beast / 无对外 WebSocket） |
 | 消息格式 | **Protocol Buffers**（`proto/poker.proto` → 生成 C++） |
 | JSON | **nlohmann/json**（CMake `FetchContent`，用于 HTTP JSON、房间快照等） |
 | 用户持久化（可选） | **MySQL**（`libmysqlclient` / MariaDB 客户端；未检测到库时内存回退） |
@@ -20,8 +20,8 @@ Single-process game server for **Nebula Poker**: HTTP + WebSocket, protobuf-fram
 
 ## 功能概览（Features）
 
-- **静态与前端兼容**：托管 `index.html`、`proto-socket.js`、`proto/poker.proto`、`/assets/*` 等，与现有浏览器客户端对齐。
-- **WebSocket**：二进制帧承载 protobuf `Envelope`，与前端 protobuf 编解码一致。
+- **静态与 HTTP**：由 Java 网关托管或代理到本进程的 `GatewayApiRequest`（与原先 HTTP 路由行为一致）。
+- **实时通道**：浏览器 WebSocket → Java → 本进程 `GatewayClientEnvelope`（载荷仍为 protobuf `Envelope`）。
 - **认证**：`/api/auth/register`、`login`、`logout`、`me`；HTTP Session Cookie + 连接时 WebSocket 侧会话绑定。
 - **房间**：创建 / 加入、桌内状态广播、AI 接管延迟、事件日志（含可恢复的 `envelopeB64` 条目）。
 - **匹配**：`/api/matchmaking/queue`、`cancel`、`status`；队列达阈值后自动建私密房并下发 `match_found`。
@@ -34,7 +34,7 @@ Single-process game server for **Nebula Poker**: HTTP + WebSocket, protobuf-fram
 
 ## Build
 
-Install Boost (Beast/Asio), Protobuf, and optionally MySQL / hiredis dev packages, e.g. on Ubuntu:
+Install Boost (system/thread for Asio), Protobuf, and optionally MySQL / hiredis dev packages, e.g. on Ubuntu:
 
 ```bash
 sudo apt install cmake libboost-system-dev libboost-thread-dev protobuf-compiler libprotobuf-dev
@@ -73,29 +73,25 @@ Optional environment overrides:
 
 ## Runtime
 
-The server exposes:
+The **Java gateway** (default `PORT=3000`) is what browsers talk to. It proxies the same paths to the C++ worker via `GatewayApiRequest` / `GatewayClientEnvelope`:
 
-- `/` → `index.html`
-- `/proto-socket.js` → frontend transport layer
-- `/proto/poker.proto` → runtime-loaded protobuf schema
-- `/assets/*` → lobby art/audio/static files
-- `/api/leaderboard?type=coins|winrate|weekly`
-- `/api/auth/register` | `/api/auth/login` | `/api/auth/logout` | `/api/auth/me`
-- `/api/rooms/create` | `/api/rooms/join`
-- `/api/matchmaking/queue` | `/api/matchmaking/cancel` | `/api/matchmaking/status`
+- `/` → static files (from `NEBULA_REPO_ROOT` or cwd)
+- `/proto-socket.js`, `/proto/poker.proto`, `/assets/*`
+- `/api/*` (auth, rooms, matchmaking, beans, …)
 - `/healthz` | `/readyz`
-- WebSocket upgrade path used by the client (e.g. `/ws` behind reverse proxy — match your deployment)
+- WebSocket `/ws` (binary protobuf `Envelope` frames)
 
 ### WSL: run the binary from Linux ext4, not `/mnt/d`
 
-The C++ server is a native ELF. Running it from the Windows drive mount (`/mnt/d/...`, drvfs) has caused **segmentation faults right after listen** on some setups. **Fix:** build or copy `nebula-poker-server` under the WSL home filesystem (e.g. `~/nebula-build/`) and run it from there. You can still set `NEBULA_REPO_ROOT=/mnt/d/DEZHOU` so static files are read from the repo on `D:`.
+The C++ worker is a native ELF. Running it from the Windows drive mount (`/mnt/d/...`, drvfs) has caused **segmentation faults right after listen** on some setups. **Fix:** build or copy `nebula-poker-server` under the WSL home filesystem (e.g. `~/nebula-build/`) and run it from there. Point the Java gateway at `NEBULA_ROOM_WORKER_HOST` / `NEBULA_ROOM_WORKER_PORT`; set `NEBULA_REPO_ROOT` on **Java** for static file resolution.
 
 ---
 
 ## Environment
 
 ```bash
-PORT=3000
+NEBULA_ROOM_WORKER_PORT=3101
+NEBULA_ROOM_WORKER_BIND=127.0.0.1
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=root
@@ -125,8 +121,7 @@ Rooms are persisted as **JSON** under **`<repo>/.runtime/rooms/<roomId>.json`** 
 ## Performance & scalability notes
 
 - **Threading:** Single-threaded `io_context::run()`; shared maps are touched on that thread. If you add worker threads, use a **strand** per connection and synchronize shared state.
-- **Buffers:** `beast::flat_buffer` with initial `reserve(65536)`; protobuf parsing uses `ParseFromArray` on contiguous Beast segments when possible.
-- **Timeouts:** WebSocket uses `websocket::stream_base::timeout::suggested(beast::role_type::server)`; pair with app heartbeats if you need strict liveness.
+- **Gateway framing:** Java ↔ C++ uses 4-byte big-endian length + protobuf `GatewayDown` / `GatewayUp` (max frame 32 MiB in reference implementation).
 - **Frontend (Three.js):** For motion smoothing, prefer updating targets on message and interpolating in `requestAnimationFrame` (see repo `frontend/src/utils/SyncManager.js` and `docs/three-smooth.md`).
 
 ---
@@ -156,7 +151,7 @@ chmod +x scripts/cloud/build-cpp-ubuntu.sh
 bash scripts/cloud/build-cpp-ubuntu.sh
 ```
 
-Binary: `build-cpp/nebula-poker-server` (per script). Set `NEBULA_REPO_ROOT` to the repo path. Optional systemd: `scripts/cloud/nebula-poker-cpp.service`. Open TCP for `PORT`; use Nginx/Caddy in front for HTTPS/WSS in production.
+Binary: `build-cpp/nebula-poker-server` (per script). Bind is **loopback-only** by default (`NEBULA_ROOM_WORKER_BIND`). Public traffic goes to **Java** (`PORT`, e.g. 3000); put TLS/reverse-proxy in front of Java in production.
 
 ---
 
