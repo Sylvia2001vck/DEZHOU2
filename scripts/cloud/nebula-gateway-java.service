@@ -12,12 +12,12 @@ After=network.target nebula-poker-cpp.service
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/DEZHOU
-Environment=NEBULA_REPO_ROOT=/home/ubuntu/DEZHOU
+WorkingDirectory=/home/ubuntu/DEZHOU2
+Environment=NEBULA_REPO_ROOT=/home/ubuntu/DEZHOU2
 Environment=PORT=3000
 Environment=NEBULA_ROOM_WORKER_HOST=127.0.0.1
 Environment=NEBULA_ROOM_WORKER_PORT=3101
-ExecStart=/usr/bin/java -jar /home/ubuntu/DEZHOU/backend-java/target/nebula-gateway.jar
+ExecStart=/usr/bin/java -jar /home/ubuntu/DEZHOU2/backend-java/target/nebula-gateway.jar
 Restart=on-failure
 RestartSec=3
 
