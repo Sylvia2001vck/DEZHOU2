@@ -1,2 +1,0 @@
-# Hashes of file build rules.
-2c02a2c564a24b77a8c3832322be0a68 proto/poker.pb.h

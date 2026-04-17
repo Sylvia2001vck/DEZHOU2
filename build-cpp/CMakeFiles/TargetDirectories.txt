@@ -1,5 +1,0 @@
-/mnt/d/DEZHOU/build-cpp/CMakeFiles/nebula-poker-server.dir
-/mnt/d/DEZHOU/build-cpp/CMakeFiles/edit_cache.dir
-/mnt/d/DEZHOU/build-cpp/CMakeFiles/rebuild_cache.dir
-/mnt/d/DEZHOU/build-cpp/_deps/nlohmann_json-build/CMakeFiles/edit_cache.dir
-/mnt/d/DEZHOU/build-cpp/_deps/nlohmann_json-build/CMakeFiles/rebuild_cache.dir

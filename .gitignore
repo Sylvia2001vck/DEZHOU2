@@ -1,5 +1,12 @@
 node_modules/
 build/
+# CMake build trees (never commit generated deps)
+build-cpp/
+backend-cpp/build-cpp/
+# Accidental nested clone tracked as gitlink without .gitmodules — keep local only
+scripts/DEZHOU/
+# Broken gitlink (no .gitmodules) — local nested clone only
+tmp_wspp/
 .vs/
 *.exe
 *.o
