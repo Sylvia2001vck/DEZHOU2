@@ -7,6 +7,7 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.UUID;
@@ -36,7 +37,14 @@ public final class GatewayMain {
     String cppHost = env("NEBULA_ROOM_WORKER_HOST", "127.0.0.1");
     int cppPort = Integer.parseInt(env("NEBULA_ROOM_WORKER_PORT", "3101"));
     int httpPort = Integer.parseInt(env("PORT", "3000"));
-    String staticRoot = env("NEBULA_REPO_ROOT", new File(".").getAbsolutePath());
+    Path repoRoot =
+        Paths.get(env("NEBULA_REPO_ROOT", new File(".").getAbsolutePath())).toAbsolutePath().normalize();
+    Path staticDir =
+        env("NEBULA_STATIC_ROOT", "").isEmpty()
+            ? repoRoot.resolve("frontend").resolve("static")
+            : Paths.get(env("NEBULA_STATIC_ROOT", "")).toAbsolutePath().normalize();
+    Files.createDirectories(staticDir);
+    String staticRoot = staticDir.toString();
 
     RoomWorkerBridge bridge = new RoomWorkerBridge(cppHost, cppPort);
     bridge.start();
