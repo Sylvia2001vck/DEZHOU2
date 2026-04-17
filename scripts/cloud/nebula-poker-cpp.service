@@ -2,6 +2,8 @@
 #   sudo cp scripts/cloud/nebula-poker-cpp.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now nebula-poker-cpp
+#
+# Pair with scripts/cloud/nebula-gateway-java.service (public HTTP + /ws).
 
 [Unit]
 Description=Nebula Poker C++ room worker (loopback gateway for Java)
