@@ -1,5 +1,11 @@
 node_modules/
 build/
+
+# Java / Maven (never commit build output)
+backend-java/target/
+backend-java/dependency-reduced-pom.xml
+*.log
+debug-*.log
 # CMake build trees (never commit generated deps)
 build-cpp/
 backend-cpp/build-cpp/
