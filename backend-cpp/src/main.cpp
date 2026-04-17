@@ -1306,7 +1306,7 @@ class PokerServer {
     return env.SerializeAsString();
   }
 
-  // Defined after struct GatewaySession (needs complete type for queue_up).
+  // Defined after struct GatewaySession (needs complete type for queue_frame).
   void send_envelope_bytes(const std::string& socket_id, const std::string& bytes);
 
   template <typename T>
@@ -4082,7 +4082,7 @@ class PokerServer {
   void attach_gateway(const std::shared_ptr<GatewaySession>& sess);
   void detach_gateway(const std::shared_ptr<GatewaySession>& sess);
   void remove_session(const std::string& socket_id);
-  void on_gateway_down(GatewaySession& gw, const nebula::poker::GatewayDown& msg);
+  void on_gateway_down_json(GatewaySession& gw, const nlohmann::json& msg);
   void close_ws_protocol_error(const std::string& socket_id);
   std::unordered_map<std::string, Room> rooms_;
   std::unordered_map<std::string, std::mutex> room_mutexes_;
@@ -4121,8 +4121,7 @@ struct GatewaySession : std::enable_shared_from_this<GatewaySession> {
   void start();
   void begin_read_frame();
 
-  void queue_up(const nebula::poker::GatewayUp& up) {
-    const std::string payload = up.SerializeAsString();
+  void queue_frame(std::string payload) {
     if (payload.size() > kMaxFrame) return;
     std::string framed;
     framed.reserve(4 + payload.size());
@@ -4181,12 +4180,14 @@ void GatewaySession::begin_read_frame() {
                                         server_->detach_gateway(self);
                                         return;
                                       }
-                                      nebula::poker::GatewayDown down;
-                                      if (!down.ParseFromArray(body_.data(), static_cast<int>(body_.size()))) {
+                                      try {
+                                        nlohmann::json j =
+                                            nlohmann::json::parse(std::string(body_.begin(), body_.end()));
+                                        server_->on_gateway_down_json(*self, j);
+                                      } catch (const std::exception&) {
                                         server_->detach_gateway(self);
                                         return;
                                       }
-                                      server_->on_gateway_down(*self, down);
                                       begin_read_frame();
                                     });
                   });
@@ -4194,11 +4195,11 @@ void GatewaySession::begin_read_frame() {
 
 void PokerServer::send_envelope_bytes(const std::string& socket_id, const std::string& bytes) {
   if (!gateway_session_) return;
-  nebula::poker::GatewayUp up;
-  auto* out = up.mutable_to_client_envelope();
-  out->set_socket_id(socket_id);
-  out->set_envelope(bytes);
-  gateway_session_->queue_up(up);
+  nlohmann::json j;
+  j["type"] = "to_client_envelope";
+  j["socket_id"] = socket_id;
+  j["envelope_b64"] = base64_encode(bytes);
+  gateway_session_->queue_frame(j.dump());
 }
 
 void PokerServer::attach_gateway(const std::shared_ptr<GatewaySession>& sess) {
@@ -4229,79 +4230,87 @@ void PokerServer::remove_session(const std::string& socket_id) {
   sessions_.erase(it);
 }
 
-void PokerServer::on_gateway_down(GatewaySession& /*gw*/, const nebula::poker::GatewayDown& msg) {
-  switch (msg.payload_case()) {
-    case nebula::poker::GatewayDown::kClientRegister: {
-      const auto& r = msg.client_register();
-      const std::string& socket_id = r.socket_id();
-      if (socket_id.empty()) return;
-      if (sessions_.count(socket_id) > 0) remove_session(socket_id);
-      Session session;
-      session.socket_id = socket_id;
-      bind_http_session_to_socket(session, r.cookie_header());
-      sessions_[socket_id] = std::move(session);
-      active_gateway_clients_.insert(socket_id);
-      gateway_tracked_socket_ids_.insert(socket_id);
-      nebula::poker::TextMessage tmsg;
-      tmsg.set_msg(socket_id);
-      send_event(socket_id, "connect", tmsg);
-      send_auth_state(socket_id, sessions_[socket_id]);
-      return;
-    }
-    case nebula::poker::GatewayDown::kClientUnregister: {
-      remove_session(msg.client_unregister().socket_id());
-      return;
-    }
-    case nebula::poker::GatewayDown::kClientEnvelope: {
-      const auto& e = msg.client_envelope();
-      const std::string& sid = e.socket_id();
-      const std::string& env = e.envelope();
-      (void)on_ws_message(sid, env.data(), env.size());
-      return;
-    }
-    case nebula::poker::GatewayDown::kApiRequest: {
-      if (!gateway_session_) return;
-      const auto& a = msg.api_request();
-      HttpRequestView v;
-      v.method = a.method();
-      v.uri = a.uri();
-      const std::size_t q = v.uri.find('?');
-      v.clean_uri = q == std::string::npos ? v.uri : v.uri.substr(0, q);
-      v.body = std::string(a.body());
-      v.cookie_header = a.cookie_header();
-      HttpReply rep;
-      try {
-        handle_http_request(v, rep);
-      } catch (const std::exception& e) {
-        std::cerr << "[api] handle_http_request: " << e.what() << "\n";
-        rep.status = 500;
-        rep.content_type = "text/plain; charset=utf-8";
-        rep.body = "Internal Server Error";
-      } catch (...) {
-        std::cerr << "[api] handle_http_request: unknown exception\n";
-        rep.status = 500;
-        rep.content_type = "text/plain; charset=utf-8";
-        rep.body = "Internal Server Error";
+void PokerServer::on_gateway_down_json(GatewaySession& /*gw*/, const nlohmann::json& j) {
+  if (!j.contains("type") || !j["type"].is_string()) return;
+  const std::string t = j["type"].get<std::string>();
+  if (t == "client_register") {
+    const std::string socket_id = j.value("socket_id", "");
+    if (socket_id.empty()) return;
+    if (sessions_.count(socket_id) > 0) remove_session(socket_id);
+    Session session;
+    session.socket_id = socket_id;
+    bind_http_session_to_socket(session, j.value("cookie_header", ""));
+    sessions_[socket_id] = std::move(session);
+    active_gateway_clients_.insert(socket_id);
+    gateway_tracked_socket_ids_.insert(socket_id);
+    nebula::poker::TextMessage tmsg;
+    tmsg.set_msg(socket_id);
+    send_event(socket_id, "connect", tmsg);
+    send_auth_state(socket_id, sessions_[socket_id]);
+    return;
+  }
+  if (t == "client_unregister") {
+    remove_session(j.value("socket_id", ""));
+    return;
+  }
+  if (t == "client_envelope") {
+    const std::string sid = j.value("socket_id", "");
+    const std::string env = base64_decode(j.value("envelope_b64", ""));
+    (void)on_ws_message(sid, env.data(), env.size());
+    return;
+  }
+  if (t == "api_request") {
+    if (!gateway_session_) return;
+    HttpRequestView v;
+    v.method = j.value("method", "GET");
+    v.uri = j.value("uri", "/");
+    const std::size_t q = v.uri.find('?');
+    v.clean_uri = q == std::string::npos ? v.uri : v.uri.substr(0, q);
+    v.body = base64_decode(j.value("body_b64", ""));
+    v.cookie_header = j.value("cookie_header", "");
+    std::uint64_t request_id = 0;
+    if (j.contains("request_id") && !j["request_id"].is_null()) {
+      if (j["request_id"].is_number_unsigned()) {
+        request_id = j["request_id"].get<std::uint64_t>();
+      } else if (j["request_id"].is_number_integer()) {
+        request_id = static_cast<std::uint64_t>(j["request_id"].get<std::int64_t>());
       }
-      nebula::poker::GatewayUp up;
-      auto* ar = up.mutable_api_response();
-      ar->set_request_id(a.request_id());
-      ar->set_status(static_cast<std::int32_t>(rep.status));
-      ar->set_content_type(rep.content_type);
-      ar->set_body(rep.body.data(), static_cast<int>(rep.body.size()));
-      if (rep.set_cookie) ar->set_set_cookie_header(*rep.set_cookie);
-      gateway_session_->queue_up(up);
-      return;
     }
-    case nebula::poker::GatewayDown::kPing: {
-      if (!gateway_session_) return;
-      nebula::poker::GatewayUp up;
-      up.mutable_pong()->set_nonce(msg.ping().nonce());
-      gateway_session_->queue_up(up);
-      return;
+    HttpReply rep;
+    try {
+      handle_http_request(v, rep);
+    } catch (const std::exception& e) {
+      std::cerr << "[api] handle_http_request: " << e.what() << "\n";
+      rep.status = 500;
+      rep.content_type = "text/plain; charset=utf-8";
+      rep.body = "Internal Server Error";
+    } catch (...) {
+      std::cerr << "[api] handle_http_request: unknown exception\n";
+      rep.status = 500;
+      rep.content_type = "text/plain; charset=utf-8";
+      rep.body = "Internal Server Error";
     }
-    default:
-      return;
+    nlohmann::json out;
+    out["type"] = "api_response";
+    out["request_id"] = request_id;
+    out["status"] = static_cast<int>(rep.status);
+    out["content_type"] = rep.content_type;
+    out["body_b64"] = base64_encode(rep.body);
+    out["set_cookie_header"] = rep.set_cookie ? *rep.set_cookie : "";
+    gateway_session_->queue_frame(out.dump());
+    return;
+  }
+  if (t == "ping") {
+    if (!gateway_session_) return;
+    std::int64_t nonce = 0;
+    if (j.contains("nonce") && j["nonce"].is_number_integer()) {
+      nonce = j["nonce"].get<std::int64_t>();
+    }
+    nlohmann::json out;
+    out["type"] = "pong";
+    out["nonce"] = nonce;
+    gateway_session_->queue_frame(out.dump());
+    return;
   }
 }
 
@@ -4376,11 +4385,11 @@ void PokerServer::do_accept() {
 
 void PokerServer::close_ws_protocol_error(const std::string& socket_id) {
   if (gateway_session_) {
-    nebula::poker::GatewayUp up;
-    auto* c = up.mutable_to_client_close();
-    c->set_socket_id(socket_id);
-    c->set_close_code(1002);
-    gateway_session_->queue_up(up);
+    nlohmann::json j;
+    j["type"] = "to_client_close";
+    j["socket_id"] = socket_id;
+    j["close_code"] = 1002;
+    gateway_session_->queue_frame(j.dump());
   }
   remove_session(socket_id);
 }

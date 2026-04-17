@@ -2,21 +2,37 @@ package nebula.gateway;
 
 import io.javalin.Javalin;
 import io.javalin.http.Context;
-import io.javalin.http.HandlerType;
+import io.javalin.http.Handler;
 import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
-import java.util.EnumSet;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import nebula.poker.GatewayApiResponse;
 
 /**
  * Public HTTP + WebSocket server. Forwards REST and binary game frames to the C++ room worker via
- * {@link RoomWorkerBridge} (no WebSocket stack in C++).
+ * {@link RoomWorkerBridge} (no WebSocket stack in C++). Java uses JSON+Base64 on the bridge, not Protobuf.
  */
 public final class GatewayMain {
 
   public static void main(String[] args) throws Exception {
+    // #region agent log
+    try {
+      Path logPath =
+          Path.of(System.getenv().getOrDefault("NEBULA_REPO_ROOT", System.getProperty("user.dir", ".")))
+              .resolve("debug-a49bab.log");
+      String line =
+          "{\"sessionId\":\"a49bab\",\"hypothesisId\":\"H-bridge\",\"location\":\"GatewayMain.main\","
+              + "\"message\":\"gateway_main_start\",\"timestamp\":"
+              + System.currentTimeMillis()
+              + "}\n";
+      Files.writeString(logPath, line, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    } catch (Exception ignored) {
+    }
+    // #endregion
+
     String cppHost = env("NEBULA_ROOM_WORKER_HOST", "127.0.0.1");
     int cppPort = Integer.parseInt(env("NEBULA_ROOM_WORKER_PORT", "3101"));
     int httpPort = Integer.parseInt(env("PORT", "3000"));
@@ -24,8 +40,6 @@ public final class GatewayMain {
 
     RoomWorkerBridge bridge = new RoomWorkerBridge(cppHost, cppPort);
     bridge.start();
-
-    final ConcurrentHashMap<String, String> jettySessionToSocketId = new ConcurrentHashMap<>();
 
     Javalin app =
         Javalin.create(
@@ -37,13 +51,16 @@ public final class GatewayMain {
               });
             });
 
-    EnumSet<HandlerType> apiMethods =
-        EnumSet.of(HandlerType.GET, HandlerType.POST, HandlerType.PUT, HandlerType.DELETE, HandlerType.PATCH, HandlerType.HEAD);
-    for (HandlerType ht : apiMethods) {
-      app.addHandler(ht, "/api/*", ctx -> proxyApi(ctx, bridge));
-    }
-    app.get("/healthz", ctx -> proxyApi(ctx, bridge));
-    app.get("/readyz", ctx -> proxyApi(ctx, bridge));
+    Handler api = ctx -> proxyApi(ctx, bridge);
+    app.get("/api/*", api);
+    app.post("/api/*", api);
+    app.put("/api/*", api);
+    app.patch("/api/*", api);
+    app.delete("/api/*", api);
+    app.head("/api/*", api);
+    app.options("/api/*", api);
+    app.get("/healthz", api);
+    app.get("/readyz", api);
 
     app.ws(
         "/ws",
@@ -51,19 +68,19 @@ public final class GatewayMain {
           ws.onConnect(
               ctx -> {
                 String sid = "ws-" + UUID.randomUUID().toString().replace("-", "");
-                jettySessionToSocketId.put(ctx.getSessionId(), sid);
+                ctx.attribute("nebulaSid", sid);
                 String cookie = ctx.header("Cookie");
                 try {
                   bridge.registerClient(sid, cookie == null ? "" : cookie, new BridgeSink(ctx));
                 } catch (Exception e) {
                   System.err.println("[ws] register failed: " + e.getMessage());
-                  jettySessionToSocketId.remove(ctx.getSessionId());
+                  ctx.attribute("nebulaSid", null);
                   ctx.closeSession(1011, "room worker offline");
                 }
               });
           ws.onBinaryMessage(
               ctx -> {
-                String sid = jettySessionToSocketId.get(ctx.getSessionId());
+                String sid = (String) ctx.attribute("nebulaSid");
                 if (sid == null) return;
                 try {
                   byte[] raw = ctx.data();
@@ -77,7 +94,7 @@ public final class GatewayMain {
               });
           ws.onClose(
               ctx -> {
-                String sid = jettySessionToSocketId.remove(ctx.getSessionId());
+                String sid = (String) ctx.attribute("nebulaSid");
                 if (sid == null) return;
                 try {
                   bridge.unregisterClient(sid);
@@ -97,7 +114,7 @@ public final class GatewayMain {
     if (qs != null && !qs.isEmpty()) uri = uri + "?" + qs;
     String cookie = ctx.header("Cookie");
     byte[] body = ctx.bodyAsBytes();
-    GatewayApiResponse r =
+    ApiProxyResult r =
         bridge.apiProxy(ctx.method().name(), uri, body, cookie == null ? "" : cookie, 60_000);
     ctx.status(r.getStatus());
     if (!r.getContentType().isEmpty()) {
@@ -106,7 +123,8 @@ public final class GatewayMain {
     if (!r.getSetCookieHeader().isEmpty()) {
       ctx.header("Set-Cookie", r.getSetCookieHeader());
     }
-    ctx.result(r.getBody().isEmpty() ? "" : r.getBody().toStringUtf8());
+    byte[] rb = r.getBody();
+    ctx.result(rb.length == 0 ? "" : new String(rb, StandardCharsets.UTF_8));
   }
 
   private static String env(String k, String dflt) {

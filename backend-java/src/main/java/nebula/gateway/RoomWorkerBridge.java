@@ -1,10 +1,15 @@
 package nebula.gateway;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -14,19 +19,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import nebula.poker.GatewayApiRequest;
-import nebula.poker.GatewayApiResponse;
-import nebula.poker.GatewayClientEnvelope;
-import nebula.poker.GatewayClientRegister;
-import nebula.poker.GatewayClientUnregister;
-import nebula.poker.GatewayDown;
-import nebula.poker.GatewayToClientClose;
-import nebula.poker.GatewayToClientEnvelope;
-import nebula.poker.GatewayUp;
 
 /**
- * One TCP connection to the C++ room worker (length-prefixed {@link GatewayDown} / {@link GatewayUp}).
- * Multiplexes browser WebSockets and HTTP API calls over that single link.
+ * One TCP connection to the C++ worker (length-prefixed UTF-8 JSON frames; binary fields Base64).
+ * Multiplexes browser WebSockets and HTTP API calls over that single link. No Protobuf on the Java side.
  */
 public final class RoomWorkerBridge implements AutoCloseable {
 
@@ -40,7 +36,7 @@ public final class RoomWorkerBridge implements AutoCloseable {
   private final int port;
   private final AtomicBoolean running = new AtomicBoolean(true);
   private final AtomicLong rpcId = new AtomicLong(1);
-  private final Map<Long, CompletableFuture<GatewayApiResponse>> pendingRpc = new ConcurrentHashMap<>();
+  private final Map<Long, CompletableFuture<ApiProxyResult>> pendingRpc = new ConcurrentHashMap<>();
   private final Map<String, ClientRegistration> clients = new ConcurrentHashMap<>();
   private final ExecutorService io = Executors.newSingleThreadExecutor(r -> {
     Thread t = new Thread(r, "room-worker-bridge");
@@ -89,14 +85,7 @@ public final class RoomWorkerBridge implements AutoCloseable {
       this.socket = s;
       this.out = new DataOutputStream(s.getOutputStream());
       for (ClientRegistration reg : clients.values()) {
-        sendDownUnsynchronized(
-            GatewayDown.newBuilder()
-                .setClientRegister(
-                    GatewayClientRegister.newBuilder()
-                        .setSocketId(reg.socketId)
-                        .setCookieHeader(reg.cookieHeader == null ? "" : reg.cookieHeader)
-                        .build())
-                .build());
+        sendDownUnsynchronized(clientRegisterJson(reg.socketId, reg.cookieHeader));
       }
     }
   }
@@ -110,88 +99,90 @@ public final class RoomWorkerBridge implements AutoCloseable {
       }
       byte[] body = new byte[len];
       in.readFully(body);
-      GatewayUp up = GatewayUp.parseFrom(body);
-      dispatchUp(up);
+      String utf8 = new String(body, StandardCharsets.UTF_8);
+      JsonObject msg = JsonParser.parseString(utf8).getAsJsonObject();
+      dispatchUp(msg);
     }
   }
 
-  private void dispatchUp(GatewayUp up) {
-    switch (up.getPayloadCase()) {
-      case TO_CLIENT_ENVELOPE -> deliverEnvelope(up.getToClientEnvelope());
-      case TO_CLIENT_CLOSE -> deliverClose(up.getToClientClose());
-      case API_RESPONSE -> completeRpc(up.getApiResponse());
-      case PONG -> { /* optional heartbeat */ }
-      case PAYLOAD_NOT_SET -> { }
+  private void dispatchUp(JsonObject msg) {
+    String type = msg.has("type") ? msg.get("type").getAsString() : "";
+    switch (type) {
+      case "to_client_envelope" -> deliverEnvelope(msg);
+      case "to_client_close" -> deliverClose(msg);
+      case "api_response" -> completeRpc(msg);
+      case "pong" -> { /* optional heartbeat */ }
+      default -> { }
     }
   }
 
-  private void deliverEnvelope(GatewayToClientEnvelope m) {
-    ClientRegistration reg = clients.get(m.getSocketId());
+  private void deliverEnvelope(JsonObject m) {
+    String socketId = m.has("socket_id") ? m.get("socket_id").getAsString() : "";
+    ClientRegistration reg = clients.get(socketId);
     if (reg == null) return;
-    reg.sink.sendBinary(m.getEnvelope().toByteArray());
+    String b64 = m.has("envelope_b64") ? m.get("envelope_b64").getAsString() : "";
+    reg.sink.sendBinary(Base64.getDecoder().decode(b64));
   }
 
-  private void deliverClose(GatewayToClientClose m) {
-    ClientRegistration reg = clients.remove(m.getSocketId());
+  private void deliverClose(JsonObject m) {
+    String socketId = m.has("socket_id") ? m.get("socket_id").getAsString() : "";
+    ClientRegistration reg = clients.remove(socketId);
     if (reg == null) return;
-    reg.sink.close(m.getCloseCode());
+    int code = m.has("close_code") ? m.get("close_code").getAsInt() : 1000;
+    reg.sink.close(code);
   }
 
-  private void completeRpc(GatewayApiResponse r) {
-    CompletableFuture<GatewayApiResponse> f = pendingRpc.remove(r.getRequestId());
-    if (f != null) f.complete(r);
+  private void completeRpc(JsonObject r) {
+    long reqId = jsonLong(r.get("request_id"));
+    CompletableFuture<ApiProxyResult> f = pendingRpc.remove(reqId);
+    if (f == null) return;
+    int status = r.has("status") ? r.get("status").getAsInt() : 500;
+    String ct = r.has("content_type") ? r.get("content_type").getAsString() : "text/plain; charset=utf-8";
+    String bodyB64 = r.has("body_b64") ? r.get("body_b64").getAsString() : "";
+    String setCk = r.has("set_cookie_header") ? r.get("set_cookie_header").getAsString() : "";
+    byte[] body = bodyB64.isEmpty() ? new byte[0] : Base64.getDecoder().decode(bodyB64);
+    f.complete(new ApiProxyResult(status, ct, body, setCk));
+  }
+
+  private static long jsonLong(JsonElement e) {
+    if (e == null || e.isJsonNull()) return 0L;
+    try {
+      return e.getAsLong();
+    } catch (Exception ex) {
+      try {
+        return e.getAsJsonPrimitive().getAsBigInteger().longValue();
+      } catch (Exception ex2) {
+        return 0L;
+      }
+    }
   }
 
   public synchronized void registerClient(String socketId, String cookieHeader, ClientSink sink) throws IOException {
     clients.put(socketId, new ClientRegistration(socketId, cookieHeader, sink));
     if (out != null) {
-      sendDownUnsynchronized(
-          GatewayDown.newBuilder()
-              .setClientRegister(
-                  GatewayClientRegister.newBuilder()
-                      .setSocketId(socketId)
-                      .setCookieHeader(cookieHeader == null ? "" : cookieHeader)
-                      .build())
-              .build());
+      sendDownUnsynchronized(clientRegisterJson(socketId, cookieHeader));
     }
   }
 
   public synchronized void unregisterClient(String socketId) throws IOException {
     clients.remove(socketId);
     if (out != null) {
-      sendDownUnsynchronized(
-          GatewayDown.newBuilder()
-              .setClientUnregister(GatewayClientUnregister.newBuilder().setSocketId(socketId).build())
-              .build());
+      sendDownUnsynchronized(clientUnregisterJson(socketId));
     }
   }
 
   public synchronized void sendClientEnvelope(String socketId, byte[] envelope) throws IOException {
     if (out == null) throw new IOException("room worker offline");
-    sendDownUnsynchronized(
-        GatewayDown.newBuilder()
-            .setClientEnvelope(
-                GatewayClientEnvelope.newBuilder().setSocketId(socketId).setEnvelope(com.google.protobuf.ByteString.copyFrom(envelope)).build())
-            .build());
+    sendDownUnsynchronized(clientEnvelopeJson(socketId, envelope));
   }
 
-  public GatewayApiResponse apiProxy(String method, String uri, byte[] body, String cookieHeader, long timeoutMs)
+  public ApiProxyResult apiProxy(String method, String uri, byte[] body, String cookieHeader, long timeoutMs)
       throws Exception {
     long id = rpcId.getAndIncrement();
-    CompletableFuture<GatewayApiResponse> f = new CompletableFuture<>();
+    CompletableFuture<ApiProxyResult> f = new CompletableFuture<>();
     pendingRpc.put(id, f);
     try {
-      GatewayDown down =
-          GatewayDown.newBuilder()
-              .setApiRequest(
-                  GatewayApiRequest.newBuilder()
-                      .setRequestId(id)
-                      .setMethod(method == null ? "GET" : method)
-                      .setUri(uri == null ? "/" : uri)
-                      .setBody(body == null ? com.google.protobuf.ByteString.EMPTY : com.google.protobuf.ByteString.copyFrom(body))
-                      .setCookieHeader(cookieHeader == null ? "" : cookieHeader)
-                      .build())
-              .build();
+      String down = apiRequestJson(id, method, uri, body, cookieHeader);
       synchronized (this) {
         if (out == null) throw new IOException("room worker offline");
         sendDownUnsynchronized(down);
@@ -202,9 +193,45 @@ public final class RoomWorkerBridge implements AutoCloseable {
     }
   }
 
+  private static String clientRegisterJson(String socketId, String cookieHeader) {
+    JsonObject o = new JsonObject();
+    o.addProperty("type", "client_register");
+    o.addProperty("socket_id", socketId);
+    o.addProperty("cookie_header", cookieHeader == null ? "" : cookieHeader);
+    return o.toString();
+  }
+
+  private static String clientUnregisterJson(String socketId) {
+    JsonObject o = new JsonObject();
+    o.addProperty("type", "client_unregister");
+    o.addProperty("socket_id", socketId);
+    return o.toString();
+  }
+
+  private static String clientEnvelopeJson(String socketId, byte[] envelope) {
+    JsonObject o = new JsonObject();
+    o.addProperty("type", "client_envelope");
+    o.addProperty("socket_id", socketId);
+    o.addProperty("envelope_b64", Base64.getEncoder().encodeToString(envelope == null ? new byte[0] : envelope));
+    return o.toString();
+  }
+
+  private static String apiRequestJson(long requestId, String method, String uri, byte[] body, String cookieHeader) {
+    JsonObject o = new JsonObject();
+    o.addProperty("type", "api_request");
+    o.addProperty("request_id", requestId);
+    o.addProperty("method", method == null ? "GET" : method);
+    o.addProperty("uri", uri == null ? "/" : uri);
+    o.addProperty(
+        "body_b64",
+        Base64.getEncoder().encodeToString(body == null ? new byte[0] : body));
+    o.addProperty("cookie_header", cookieHeader == null ? "" : cookieHeader);
+    return o.toString();
+  }
+
   /** Caller must hold {@code synchronized (bridge)}. */
-  private void sendDownUnsynchronized(GatewayDown down) throws IOException {
-    byte[] payload = down.toByteArray();
+  private void sendDownUnsynchronized(String jsonUtf8) throws IOException {
+    byte[] payload = jsonUtf8.getBytes(StandardCharsets.UTF_8);
     out.writeInt(payload.length);
     out.write(payload);
     out.flush();
@@ -219,7 +246,7 @@ public final class RoomWorkerBridge implements AutoCloseable {
       socket = null;
       out = null;
     }
-    for (CompletableFuture<GatewayApiResponse> f : pendingRpc.values()) {
+    for (CompletableFuture<ApiProxyResult> f : pendingRpc.values()) {
       f.completeExceptionally(new IOException("room worker disconnected"));
     }
     pendingRpc.clear();
