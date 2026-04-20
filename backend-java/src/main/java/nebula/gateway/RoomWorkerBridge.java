@@ -85,7 +85,7 @@ public final class RoomWorkerBridge implements AutoCloseable {
       this.socket = s;
       this.out = new DataOutputStream(s.getOutputStream());
       for (ClientRegistration reg : clients.values()) {
-        sendDownUnsynchronized(clientRegisterJson(reg.socketId, reg.cookieHeader));
+        sendDownUnsynchronized(clientRegisterJson(reg.socketId, reg.cookieHeader, reg.gatewayIdentity));
       }
     }
   }
@@ -157,10 +157,11 @@ public final class RoomWorkerBridge implements AutoCloseable {
     }
   }
 
-  public synchronized void registerClient(String socketId, String cookieHeader, ClientSink sink) throws IOException {
-    clients.put(socketId, new ClientRegistration(socketId, cookieHeader, sink));
+  public synchronized void registerClient(
+      String socketId, String cookieHeader, GatewayIdentity gatewayIdentity, ClientSink sink) throws IOException {
+    clients.put(socketId, new ClientRegistration(socketId, cookieHeader, gatewayIdentity, sink));
     if (out != null) {
-      sendDownUnsynchronized(clientRegisterJson(socketId, cookieHeader));
+      sendDownUnsynchronized(clientRegisterJson(socketId, cookieHeader, gatewayIdentity));
     }
   }
 
@@ -178,11 +179,17 @@ public final class RoomWorkerBridge implements AutoCloseable {
 
   public ApiProxyResult apiProxy(String method, String uri, byte[] body, String cookieHeader, long timeoutMs)
       throws Exception {
+    return apiProxy(method, uri, body, cookieHeader, timeoutMs, null);
+  }
+
+  public ApiProxyResult apiProxy(
+      String method, String uri, byte[] body, String cookieHeader, long timeoutMs, GatewayIdentity gatewayIdentity)
+      throws Exception {
     long id = rpcId.getAndIncrement();
     CompletableFuture<ApiProxyResult> f = new CompletableFuture<>();
     pendingRpc.put(id, f);
     try {
-      String down = apiRequestJson(id, method, uri, body, cookieHeader);
+      String down = apiRequestJson(id, method, uri, body, cookieHeader, gatewayIdentity);
       synchronized (this) {
         if (out == null) throw new IOException("room worker offline");
         sendDownUnsynchronized(down);
@@ -193,11 +200,16 @@ public final class RoomWorkerBridge implements AutoCloseable {
     }
   }
 
-  private static String clientRegisterJson(String socketId, String cookieHeader) {
+  private static String clientRegisterJson(String socketId, String cookieHeader, GatewayIdentity gatewayIdentity) {
     JsonObject o = new JsonObject();
     o.addProperty("type", "client_register");
     o.addProperty("socket_id", socketId);
     o.addProperty("cookie_header", cookieHeader == null ? "" : cookieHeader);
+    if (gatewayIdentity != null && gatewayIdentity.userId > 0) {
+      o.addProperty("gateway_user_id", gatewayIdentity.userId);
+      o.addProperty("gateway_login_username", gatewayIdentity.loginUsername);
+      o.addProperty("gateway_profile_b64", gatewayIdentity.profileB64);
+    }
     return o.toString();
   }
 
@@ -216,7 +228,8 @@ public final class RoomWorkerBridge implements AutoCloseable {
     return o.toString();
   }
 
-  private static String apiRequestJson(long requestId, String method, String uri, byte[] body, String cookieHeader) {
+  private static String apiRequestJson(
+      long requestId, String method, String uri, byte[] body, String cookieHeader, GatewayIdentity gatewayIdentity) {
     JsonObject o = new JsonObject();
     o.addProperty("type", "api_request");
     o.addProperty("request_id", requestId);
@@ -226,6 +239,11 @@ public final class RoomWorkerBridge implements AutoCloseable {
         "body_b64",
         Base64.getEncoder().encodeToString(body == null ? new byte[0] : body));
     o.addProperty("cookie_header", cookieHeader == null ? "" : cookieHeader);
+    if (gatewayIdentity != null && gatewayIdentity.userId > 0) {
+      o.addProperty("gateway_user_id", gatewayIdentity.userId);
+      o.addProperty("gateway_login_username", gatewayIdentity.loginUsername);
+      o.addProperty("gateway_profile_b64", gatewayIdentity.profileB64);
+    }
     return o.toString();
   }
 
@@ -259,5 +277,6 @@ public final class RoomWorkerBridge implements AutoCloseable {
     io.shutdownNow();
   }
 
-  private record ClientRegistration(String socketId, String cookieHeader, ClientSink sink) {}
+  private record ClientRegistration(
+      String socketId, String cookieHeader, GatewayIdentity gatewayIdentity, ClientSink sink) {}
 }

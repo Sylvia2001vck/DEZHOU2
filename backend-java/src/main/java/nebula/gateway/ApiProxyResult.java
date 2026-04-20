@@ -1,5 +1,7 @@
 package nebula.gateway;
 
+import java.nio.charset.StandardCharsets;
+
 /** HTTP response returned from the C++ worker for a proxied API call (JSON gateway wire, no Protobuf). */
 public final class ApiProxyResult {
   private final int status;
@@ -24,6 +26,10 @@ public final class ApiProxyResult {
 
   public byte[] getBody() {
     return body;
+  }
+
+  public String bodyString() {
+    return new String(body, StandardCharsets.UTF_8);
   }
 
   public String getSetCookieHeader() {

@@ -1,6 +1,6 @@
 # Nebula Poker — C++ Backend
 
-**C++ room worker** for **Nebula Poker**: game logic, protobuf `Envelope` events, optional MySQL users and Redis leaderboards. **HTTP and WebSocket are not implemented in C++** — run the **Java gateway** (`backend-java`) on the public port; it forwards REST and `/ws` binary frames to this process over a localhost TCP link (`GatewayDown` / `GatewayUp` in `proto/poker.proto`).
+**C++ room worker** for **Nebula Poker**: game logic, protobuf `Envelope` events, optional MySQL users and Redis leaderboards. **HTTP and WebSocket are not implemented in C++** — run the **Java gateway** (`backend-java`) on the public port; it forwards REST and `/ws` binary frames to this process over a **localhost TCP link** of **length-prefixed UTF-8 JSON** (binary fields Base64). Browser↔Java WebSocket payloads remain **protobuf `Envelope`** bytes.
 
 ---
 
@@ -20,11 +20,11 @@
 
 ## 功能概览（Features）
 
-- **静态与 HTTP**：由 Java 网关托管或代理到本进程的 `GatewayApiRequest`（与原先 HTTP 路由行为一致）。
-- **实时通道**：浏览器 WebSocket → Java → 本进程 `GatewayClientEnvelope`（载荷仍为 protobuf `Envelope`）。
-- **认证**：`/api/auth/register`、`login`、`logout`、`me`；HTTP Session Cookie + 连接时 WebSocket 侧会话绑定。
+- **静态与 HTTP**：由 Java 网关托管或代理到本进程的 `api_request` JSON（与原先由 C++ 直接处理的 HTTP 路由对齐，但 **鉴权与匹配** 已在 Java 侧实现）。
+- **实时通道**：浏览器 WebSocket → Java → 本进程 `client_envelope`（载荷仍为 protobuf `Envelope`）。
+- **认证**：`/api/auth/*` 由 **Java** 处理；本进程通过 JSON 中的 `gateway_user_id` / `gateway_profile_b64` 识别用户并更新 `java_profiles_` 缓存。
 - **房间**：创建 / 加入、桌内状态广播、AI 接管延迟、事件日志（含可恢复的 `envelopeB64` 条目）。
-- **匹配**：`/api/matchmaking/queue`、`cancel`、`status`；队列达阈值后自动建私密房并下发 `match_found`。
+- **匹配**：`/api/matchmaking/*` 由 **Java** 处理；凑满人后 Java 调本进程 **`POST /api/rooms/create`**（`roomType=bean_match`；可选表单 **`matchId`** 用于与 Java 异步队列对齐的**幂等**开房）与 **`POST /api/internal/match-notify`** 以写入 `pending_match_rooms_` 并下发 `match_found`。
 - **排行榜**：`/api/leaderboard?type=coins|winrate|weekly`（Redis 可用时优先）。
 - **健康检查**：`/healthz`、`/readyz`。
 - **冷恢复（可选）**：房间 JSON 快照至 `.runtime/rooms/`（与 Node 布局对齐；详见下文环境变量）。
@@ -121,7 +121,7 @@ Rooms are persisted as **JSON** under **`<repo>/.runtime/rooms/<roomId>.json`** 
 ## Performance & scalability notes
 
 - **Threading:** Single-threaded `io_context::run()`; shared maps are touched on that thread. If you add worker threads, use a **strand** per connection and synchronize shared state.
-- **Gateway framing:** Java ↔ C++ uses 4-byte big-endian length + protobuf `GatewayDown` / `GatewayUp` (max frame 32 MiB in reference implementation).
+- **Gateway framing:** Java ↔ C++ uses **4-byte big-endian length + UTF-8 JSON** (Base64 for binary blobs; max frame 32 MiB in reference implementation). Not protobuf on this hop.
 - **Frontend (Three.js):** For motion smoothing, prefer updating targets on message and interpolating in `requestAnimationFrame` (see repo `frontend/src/utils/SyncManager.js` and `docs/three-smooth.md`).
 
 ---
@@ -129,7 +129,7 @@ Rooms are persisted as **JSON** under **`<repo>/.runtime/rooms/<roomId>.json`** 
 ## Notes
 
 - Without MySQL or Redis dev libraries, the backend still builds with in-memory fallbacks.
-- Quick match is lightweight: `kMatchmakingThreshold` queued players trigger auto room creation and `match_found`.
+- Quick / bean matchmaking is owned by the **Java gateway** (threshold and MMR window live there); this worker only creates rooms and pushes `match_found` when asked via `match-notify`.
 - Frontend event names stay largely compatible; newer flow adds `auth_state`, `matchmaking_status`, `match_found`, and `seat_session`.
 
 ---

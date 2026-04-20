@@ -51,6 +51,9 @@ struct HttpRequestView {
   std::string clean_uri;
   std::string body;
   std::string cookie_header;
+  std::optional<int64_t> gateway_user_id;
+  std::string gateway_login_username;
+  std::string gateway_profile_b64;
 };
 
 struct HttpReply {
@@ -69,7 +72,6 @@ constexpr int kSeats = 10;
 constexpr int64_t kSessionTtlMs = 1000LL * 60LL * 60LL * 24LL * 30LL;
 constexpr int64_t kGameplaySessionTtlMs = 1000LL * 60LL * 5LL;
 constexpr int64_t kAiTakeoverDelayMs = 1000LL * 60LL;
-constexpr int kMatchmakingThreshold = 3;
 constexpr std::size_t kRoomEventLogLimit = 600;
 constexpr int kSnapshotFlushMs = 75;
 constexpr const char* kSessionCookieName = "nebula_session";
@@ -365,13 +367,6 @@ struct MatchStat {
   std::string username;
   int64_t gold_delta = 0;
   bool winner = false;
-};
-
-struct BeanQueueEntry {
-  int64_t user_id = 0;
-  int64_t bean_balance = 0;
-  int mmr = 1000;
-  int64_t queued_at = 0;
 };
 
 struct TournamentInfo {
@@ -1646,10 +1641,6 @@ class PokerServer {
     return 200;
   }
 
-  int bean_match_threshold_for_tier(const std::string& tier) const {
-    return tier == "expert" ? 6 : 6;
-  }
-
   std::string bean_profile_json(const UserProfileData& profile) {
     std::ostringstream out;
     out << "{"
@@ -1746,6 +1737,8 @@ class PokerServer {
   }
 
   std::optional<UserProfileData> get_profile_by_user_id(int64_t user_id) {
+    const auto jit = java_profiles_.find(user_id);
+    if (jit != java_profiles_.end()) return jit->second;
     const auto auth = auth_store_->find_by_user_id(user_id);
     if (!auth.has_value()) return std::nullopt;
     auto cached = cached_users_.find(auth->username);
@@ -1755,6 +1748,57 @@ class PokerServer {
     if (profile.username.empty()) profile.username = auth->username;
     cache_profile(profile);
     return profile;
+  }
+
+  void apply_gateway_profile_b64(const std::string& b64) {
+    if (b64.empty()) return;
+    try {
+      const auto pj = nlohmann::json::parse(base64_decode(b64));
+      UserProfileData p{};
+      p.user_id = pj.value("userId", static_cast<int64_t>(0));
+      if (p.user_id <= 0) return;
+      p.external_id = pj.value("externalId", std::string());
+      p.login_username = pj.value("loginUsername", std::string());
+      if (pj.contains("displayName") && pj["displayName"].is_string())
+        p.username = pj["displayName"].get<std::string>();
+      else
+        p.username = pj.value("username", std::string());
+      if (p.username.empty()) p.username = p.login_username.empty() ? p.external_id : p.login_username;
+      p.avatar = pj.value("avatar", std::string());
+      p.gold = pj.value("gold", static_cast<int64_t>(10000));
+      p.games_played = pj.value("gamesPlayed", 0);
+      p.games_won = pj.value("gamesWon", 0);
+      java_profiles_[p.user_id] = p;
+      cache_profile(p);
+    } catch (...) {}
+  }
+
+  std::optional<AuthSessionData> resolve_auth_http(const HttpRequestView& req) {
+    if (req.gateway_user_id.has_value() && *req.gateway_user_id > 0) {
+      apply_gateway_profile_b64(req.gateway_profile_b64);
+      return AuthSessionData{"gateway", *req.gateway_user_id, req.gateway_login_username,
+                             std::numeric_limits<int64_t>::max()};
+    }
+    return find_http_session(req.cookie_header);
+  }
+
+  void bind_gateway_or_cookie_session(Session& session, const nlohmann::json& j) {
+    int64_t gid = 0;
+    if (j.contains("gateway_user_id") && !j["gateway_user_id"].is_null()) {
+      if (j["gateway_user_id"].is_number_integer()) gid = j["gateway_user_id"].get<int64_t>();
+      else if (j["gateway_user_id"].is_number_unsigned())
+        gid = static_cast<int64_t>(j["gateway_user_id"].get<std::uint64_t>());
+    }
+    if (gid > 0) {
+      apply_gateway_profile_b64(j.value("gateway_profile_b64", ""));
+      const std::string login = j.value("gateway_login_username", "");
+      session.user_id = gid;
+      session.authenticated = true;
+      session.name = login;
+      if (const auto prof = get_profile_by_user_id(gid); prof.has_value()) session.profile = *prof;
+      return;
+    }
+    bind_http_session_to_socket(session, j.value("cookie_header", ""));
   }
 
   std::string create_session_cookie(int64_t user_id, const std::string& username) {
@@ -1897,120 +1941,6 @@ class PokerServer {
     return std::nullopt;
   }
 
-  void maybe_matchmake() {
-    while (matchmaking_queue_.size() >= static_cast<std::size_t>(kMatchmakingThreshold)) {
-      std::vector<int64_t> matched_users;
-      matched_users.reserve(kMatchmakingThreshold);
-      for (int i = 0; i < kMatchmakingThreshold; ++i) {
-        matched_users.push_back(matchmaking_queue_.front());
-        matchmaking_queue_.erase(matchmaking_queue_.begin());
-      }
-
-      auto profile = get_profile_by_user_id(matched_users.front());
-      if (!profile.has_value()) continue;
-      Room& room = create_room_for_user(*profile, "private", 5, 1000, "bean_match");
-      for (int64_t user_id : matched_users) {
-        pending_match_rooms_[user_id] = room.room_code;
-        const auto account = auth_store_->find_by_user_id(user_id);
-        if (!account.has_value()) continue;
-        for (auto& [_, session] : sessions_) {
-          if (!session.authenticated || session.user_id != user_id) continue;
-          nebula::poker::MatchmakingStatus status;
-          status.set_state("matched");
-          status.set_roomcode(room.room_code);
-          status.set_queuedplayers(kMatchmakingThreshold);
-          status.set_threshold(kMatchmakingThreshold);
-          send_event(session.socket_id, "matchmaking_status", status);
-          nebula::poker::MatchFound found;
-          found.set_roomcode(room.room_code);
-          found.set_queuedplayers(kMatchmakingThreshold);
-          send_event(session.socket_id, "match_found", found);
-        }
-      }
-    }
-  }
-
-  void remove_from_bean_queues(int64_t user_id) {
-    for (auto& [_, queue] : bean_matchmaking_queues_) {
-      queue.erase(std::remove_if(queue.begin(), queue.end(), [&](const BeanQueueEntry& item) {
-        return item.user_id == user_id;
-      }), queue.end());
-    }
-  }
-
-  const BeanQueueEntry* find_bean_queue_entry(int64_t user_id) const {
-    for (const auto& [_, queue] : bean_matchmaking_queues_) {
-      for (const auto& item : queue) {
-        if (item.user_id == user_id) return &item;
-      }
-    }
-    return nullptr;
-  }
-
-  int current_mmr_range(int64_t queued_at) const {
-    const int64_t waited_ms = std::max<int64_t>(0, now_ms() - queued_at);
-    if (waited_ms < 5000) return 120;
-    if (waited_ms < 15000) return 260;
-    return 1200;
-  }
-
-  void maybe_matchmake_beans(const std::string& tier) {
-    auto it = bean_matchmaking_queues_.find(tier);
-    if (it == bean_matchmaking_queues_.end()) return;
-    auto& queue = it->second;
-    const int threshold = bean_match_threshold_for_tier(tier);
-
-    bool matched_any = true;
-    while (matched_any && static_cast<int>(queue.size()) >= threshold) {
-      matched_any = false;
-      std::sort(queue.begin(), queue.end(), [](const BeanQueueEntry& a, const BeanQueueEntry& b) {
-        return a.queued_at < b.queued_at;
-      });
-      for (std::size_t anchor = 0; anchor < queue.size(); ++anchor) {
-        const BeanQueueEntry base = queue[anchor];
-        const int mmr_range = current_mmr_range(base.queued_at);
-        std::vector<std::size_t> picked = {anchor};
-        for (std::size_t i = 0; i < queue.size() && static_cast<int>(picked.size()) < threshold; ++i) {
-          if (i == anchor) continue;
-          if (std::abs(queue[i].mmr - base.mmr) <= mmr_range) picked.push_back(i);
-        }
-        if (static_cast<int>(picked.size()) < threshold) continue;
-
-        std::vector<int64_t> matched_users;
-        matched_users.reserve(static_cast<std::size_t>(threshold));
-        std::sort(picked.begin(), picked.end(), std::greater<std::size_t>());
-        for (std::size_t idx : picked) {
-          matched_users.push_back(queue[idx].user_id);
-          queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(idx));
-        }
-
-        auto profile = get_profile_by_user_id(matched_users.front());
-        if (!profile.has_value()) break;
-        Room& room = create_room_for_user(*profile, "private", 5, 1000, "bean_match");
-        room.status = "matching";
-        room.visibility = "matchmaking";
-        for (int64_t user_id : matched_users) {
-          pending_match_rooms_[user_id] = room.room_code;
-          for (auto& [_, session] : sessions_) {
-            if (!session.authenticated || session.user_id != user_id) continue;
-            nebula::poker::MatchmakingStatus status;
-            status.set_state("matched");
-            status.set_roomcode(room.room_code);
-            status.set_queuedplayers(threshold);
-            status.set_threshold(threshold);
-            send_event(session.socket_id, "matchmaking_status", status);
-            nebula::poker::MatchFound found;
-            found.set_roomcode(room.room_code);
-            found.set_queuedplayers(threshold);
-            send_event(session.socket_id, "match_found", found);
-          }
-        }
-        matched_any = true;
-        break;
-      }
-    }
-  }
-
   void handle_http_request(const HttpRequestView& req, HttpReply& reply) {
     const std::string& uri = req.uri;
     const std::string& clean_uri = req.clean_uri;
@@ -2030,8 +1960,47 @@ class PokerServer {
       reply.body = "{\"ok\":true}";
       return;
     }
+    if (clean_uri == "/api/internal/match-notify" && method == "POST") {
+      try {
+        const auto bodyj = nlohmann::json::parse(body);
+        if (bodyj.value("secret", "") != get_env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me")) {
+          send_json(reply, 403, "{\"ok\":false,\"message\":\"Forbidden\"}");
+          return;
+        }
+        const std::string room_code = to_upper_room_code(bodyj.value("roomCode", ""));
+        const int threshold = bodyj.value("threshold", 6);
+        if (!bodyj.contains("userIds") || !bodyj["userIds"].is_array()) {
+          send_json(reply, 400, "{\"ok\":false,\"message\":\"userIds required\"}");
+          return;
+        }
+        for (const auto& el : bodyj["userIds"]) {
+          if (!el.is_number_integer() && !el.is_number_unsigned()) continue;
+          const int64_t uid =
+              el.is_number_integer() ? el.get<int64_t>() : static_cast<int64_t>(el.get<std::uint64_t>());
+          if (uid <= 0) continue;
+          pending_match_rooms_[uid] = room_code;
+          for (auto& [_, session] : sessions_) {
+            if (!session.authenticated || session.user_id != uid) continue;
+            nebula::poker::MatchmakingStatus status;
+            status.set_state("matched");
+            status.set_roomcode(room_code);
+            status.set_queuedplayers(threshold);
+            status.set_threshold(threshold);
+            send_event(session.socket_id, "matchmaking_status", status);
+            nebula::poker::MatchFound found;
+            found.set_roomcode(room_code);
+            found.set_queuedplayers(threshold);
+            send_event(session.socket_id, "match_found", found);
+          }
+        }
+        send_json(reply, 200, "{\"ok\":true}");
+      } catch (...) {
+        send_json(reply, 400, "{\"ok\":false,\"message\":\"Bad JSON\"}");
+      }
+      return;
+    }
     const auto form = parse_form_body(body);
-    const auto auth_session = find_http_session(cookie_header);
+    const auto auth_session = resolve_auth_http(req);
     if (uri.rfind("/api/leaderboard", 0) == 0) {
       std::string type = "coins";
       auto pos = uri.find("type=");
@@ -2040,79 +2009,6 @@ class PokerServer {
       reply.status = 200;
       reply.content_type = "application/json; charset=utf-8";
       reply.body = lb_body;
-      return;
-    }
-    if (clean_uri == "/api/auth/register" && method == "POST") {
-      const std::string username = normalize_username(
-          form.count("loginUsername") ? form.at("loginUsername") : (form.count("username") ? form.at("username") : ""));
-      const std::string display_name = normalize_display_name(
-          form.count("displayName") ? form.at("displayName") : username);
-      const std::string password = form.count("password") ? form.at("password") : "";
-      if (!is_valid_username(username) || !is_valid_display_name(display_name) || password.size() < 6) {
-        send_json(reply, 400,
-                  "{\"ok\":false,\"message\":\"Use a 3-24 char login username, a 1-48 char display name, and a 6+ char password.\"}");
-        return;
-      }
-      if (auth_store_->find_by_username(username).has_value()) {
-        send_json(reply, 409, "{\"ok\":false,\"message\":\"Login username already exists.\"}");
-        return;
-      }
-      UserProfileData profile = user_store_->load_or_create(username, display_name);
-      profile.login_username = username;
-      cache_profile(profile);
-      std::string error;
-      const auto account = auth_store_->register_account(profile.user_id, username, hash_password_record(password, next_token(12)), error);
-      if (!account.has_value()) {
-        send_json(reply, 500,
-                  "{\"ok\":false,\"message\":\"" + escape_json(error.empty() ? "Registration failed." : error) + "\"}");
-        return;
-      }
-      auth_store_->update_last_login(profile.user_id, now_ms());
-      const std::string session_id = create_session_cookie(profile.user_id, username);
-      reply.set_cookie = build_session_cookie_header(session_id);
-      send_json(reply, 200,
-                "{\"ok\":true,\"user\":" + user_profile_json(profile) + "}");
-      return;
-    }
-    if (clean_uri == "/api/auth/login" && method == "POST") {
-      const std::string username = normalize_username(
-          form.count("loginUsername") ? form.at("loginUsername") : (form.count("username") ? form.at("username") : ""));
-      const std::string password = form.count("password") ? form.at("password") : "";
-      const auto account = auth_store_->find_by_username(username);
-      if (!account.has_value() || !verify_password_record(password, account->password_hash)) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
-        return;
-      }
-      auth_store_->update_last_login(account->user_id, now_ms());
-      const auto profile = get_profile_by_user_id(account->user_id);
-      if (!profile.has_value()) {
-        send_json(reply, 500, "{\"ok\":false,\"message\":\"Profile load failed.\"}");
-        return;
-      }
-      const std::string session_id = create_session_cookie(account->user_id, username);
-      reply.set_cookie = build_session_cookie_header(session_id);
-      send_json(reply, 200,
-                "{\"ok\":true,\"user\":" + user_profile_json(*profile) + "}");
-      return;
-    }
-    if (clean_uri == "/api/auth/logout" && method == "POST") {
-      if (auth_session.has_value()) auth_sessions_.erase(auth_session->session_id);
-      reply.set_cookie = build_session_cookie_header("", true);
-      send_json(reply, 200, "{\"ok\":true}");
-      return;
-    }
-    if (clean_uri == "/api/auth/me" && method == "GET") {
-      if (!auth_session.has_value()) {
-        send_json(reply, 401, "{\"ok\":false}");
-        return;
-      }
-      const auto profile = get_profile_by_user_id(auth_session->user_id);
-      if (!profile.has_value()) {
-        send_json(reply, 401, "{\"ok\":false}");
-        return;
-      }
-      send_json(reply, 200,
-                "{\"ok\":true,\"user\":" + user_profile_json(*profile) + "}");
       return;
     }
     if (clean_uri == "/api/home/overview" && method == "GET") {
@@ -2332,7 +2228,28 @@ class PokerServer {
       const int total_hands = form.count("totalHands") ? std::max(1, std::atoi(form.at("totalHands").c_str())) : 5;
       const int initial_chips = form.count("initialChips") ? std::max(1000, std::atoi(form.at("initialChips").c_str())) : 1000;
       const std::string visibility = form.count("visibility") ? form.at("visibility") : "private";
-      Room& room = create_room_for_user(*profile, visibility, total_hands, initial_chips, "friend");
+      const std::string room_type = form.count("roomType") ? form.at("roomType") : "friend";
+      const std::string match_id = form.count("matchId") ? form.at("matchId") : "";
+      if (!match_id.empty()) {
+        const auto mit = match_id_to_room_code_.find(match_id);
+        if (mit != match_id_to_room_code_.end()) {
+          Room* existing = get_room(mit->second);
+          if (existing) {
+            send_json(reply, 200, "{\"ok\":true,\"roomCode\":\"" + escape_json(existing->room_code) +
+                                        "\",\"room\":" + room_summary_json(*existing) + "}");
+            return;
+          }
+          match_id_to_room_code_.erase(mit);
+        }
+      }
+      Room& room = create_room_for_user(*profile, visibility, total_hands, initial_chips, room_type);
+      if (room_type == "bean_match") {
+        room.status = "matching";
+        room.visibility = "matchmaking";
+      }
+      if (!match_id.empty()) {
+        match_id_to_room_code_[match_id] = room.room_code;
+      }
       send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room.room_code) + "\",\"room\":" + room_summary_json(room) + "}");
       return;
@@ -2350,97 +2267,6 @@ class PokerServer {
       }
       send_json(reply, 200,
                 "{\"ok\":true,\"roomCode\":\"" + escape_json(room->room_code) + "\",\"room\":" + room_summary_json(*room) + "}");
-      return;
-    }
-    if (clean_uri == "/api/matchmaking/queue-bean" && method == "POST") {
-      if (!auth_session.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
-        return;
-      }
-      const auto profile = get_profile_by_user_id(auth_session->user_id);
-      if (!profile.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
-        return;
-      }
-      const std::string tier = form.count("tier") ? form.at("tier") : bean_tier_for_balance(profile->gold);
-      pending_match_rooms_.erase(auth_session->user_id);
-      remove_from_bean_queues(auth_session->user_id);
-      bean_matchmaking_queues_[tier].push_back({auth_session->user_id, profile->gold, bean_mmr(auth_session->user_id), now_ms()});
-      maybe_matchmake_beans(tier);
-      std::ostringstream out;
-      out << "{\"ok\":true,\"state\":\""
-          << (pending_match_rooms_.count(auth_session->user_id) ? "matched" : "queued")
-          << "\",\"queuedPlayers\":" << bean_matchmaking_queues_[tier].size()
-          << ",\"threshold\":" << bean_match_threshold_for_tier(tier)
-          << ",\"tier\":\"" << escape_json(tier) << "\"";
-      if (pending_match_rooms_.count(auth_session->user_id)) {
-        out << ",\"roomCode\":\"" << escape_json(pending_match_rooms_[auth_session->user_id]) << "\"";
-      }
-      out << "}";
-      send_json(reply, 200, out.str());
-      return;
-    }
-    if (clean_uri == "/api/matchmaking/queue" && method == "POST") {
-      if (!auth_session.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
-        return;
-      }
-      const auto profile = get_profile_by_user_id(auth_session->user_id);
-      if (!profile.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Session expired.\"}");
-        return;
-      }
-      const std::string tier = bean_tier_for_balance(profile->gold);
-      pending_match_rooms_.erase(auth_session->user_id);
-      remove_from_bean_queues(auth_session->user_id);
-      bean_matchmaking_queues_[tier].push_back({auth_session->user_id, profile->gold, bean_mmr(auth_session->user_id), now_ms()});
-      maybe_matchmake_beans(tier);
-      std::ostringstream out;
-      out << "{\"ok\":true,\"state\":\""
-          << (pending_match_rooms_.count(auth_session->user_id) ? "matched" : "queued")
-          << "\",\"queuedPlayers\":" << bean_matchmaking_queues_[tier].size()
-          << ",\"threshold\":" << bean_match_threshold_for_tier(tier)
-          << ",\"tier\":\"" << escape_json(tier) << "\"";
-      if (pending_match_rooms_.count(auth_session->user_id)) {
-        out << ",\"roomCode\":\"" << escape_json(pending_match_rooms_[auth_session->user_id]) << "\"";
-      }
-      out << "}";
-      send_json(reply, 200, out.str());
-      return;
-    }
-    if (clean_uri == "/api/matchmaking/cancel" && method == "POST") {
-      if (!auth_session.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
-        return;
-      }
-      matchmaking_queue_.erase(std::remove(matchmaking_queue_.begin(), matchmaking_queue_.end(), auth_session->user_id), matchmaking_queue_.end());
-      remove_from_bean_queues(auth_session->user_id);
-      send_json(reply, 200, "{\"ok\":true,\"state\":\"idle\"}");
-      return;
-    }
-    if (clean_uri == "/api/matchmaking/status" && method == "GET") {
-      if (!auth_session.has_value()) {
-        send_json(reply, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
-        return;
-      }
-      const bool queued = std::find(matchmaking_queue_.begin(), matchmaking_queue_.end(), auth_session->user_id) != matchmaking_queue_.end();
-      const BeanQueueEntry* bean_entry = find_bean_queue_entry(auth_session->user_id);
-      const auto matched = pending_match_rooms_.find(auth_session->user_id);
-      std::ostringstream out;
-      out << "{\"ok\":true,\"state\":\"";
-      if (matched != pending_match_rooms_.end()) out << "matched";
-      else if (bean_entry || queued) out << "queued";
-      else out << "idle";
-      out << "\",\"queuedPlayers\":";
-      if (bean_entry) out << bean_matchmaking_queues_[bean_tier_for_balance(bean_entry->bean_balance)].size();
-      else out << matchmaking_queue_.size();
-      out << ",\"threshold\":";
-      if (bean_entry) out << bean_match_threshold_for_tier(bean_tier_for_balance(bean_entry->bean_balance));
-      else out << kMatchmakingThreshold;
-      if (bean_entry) out << ",\"tier\":\"" << escape_json(bean_tier_for_balance(bean_entry->bean_balance)) << "\"";
-      if (matched != pending_match_rooms_.end()) out << ",\"roomCode\":\"" << escape_json(matched->second) << "\"";
-      out << "}";
-      send_json(reply, 200, out.str());
       return;
     }
     if (serve_static_file(reply, uri)) return;
@@ -4089,9 +3915,10 @@ class PokerServer {
   std::unordered_map<std::string, UserProfileData> cached_users_;
   std::unordered_map<std::string, AuthSessionData> auth_sessions_;
   std::unordered_map<std::string, GameplaySessionData> gameplay_sessions_;
-  std::vector<int64_t> matchmaking_queue_;
-  std::unordered_map<std::string, std::vector<BeanQueueEntry>> bean_matchmaking_queues_;
   std::unordered_map<int64_t, std::string> pending_match_rooms_;
+  /** Idempotent bean_match room create: same Java match_id returns the same room. */
+  std::unordered_map<std::string, std::string> match_id_to_room_code_;
+  std::unordered_map<int64_t, UserProfileData> java_profiles_;
   std::unordered_map<int64_t, int> user_mmr_;
   std::unordered_map<int64_t, int64_t> daily_claim_day_;
   std::unordered_map<int64_t, int64_t> ad_reward_day_;
@@ -4239,7 +4066,7 @@ void PokerServer::on_gateway_down_json(GatewaySession& /*gw*/, const nlohmann::j
     if (sessions_.count(socket_id) > 0) remove_session(socket_id);
     Session session;
     session.socket_id = socket_id;
-    bind_http_session_to_socket(session, j.value("cookie_header", ""));
+    bind_gateway_or_cookie_session(session, j);
     sessions_[socket_id] = std::move(session);
     active_gateway_clients_.insert(socket_id);
     gateway_tracked_socket_ids_.insert(socket_id);
@@ -4268,6 +4095,15 @@ void PokerServer::on_gateway_down_json(GatewaySession& /*gw*/, const nlohmann::j
     v.clean_uri = q == std::string::npos ? v.uri : v.uri.substr(0, q);
     v.body = base64_decode(j.value("body_b64", ""));
     v.cookie_header = j.value("cookie_header", "");
+    if (j.contains("gateway_user_id") && !j["gateway_user_id"].is_null()) {
+      if (j["gateway_user_id"].is_number_integer()) {
+        v.gateway_user_id = j["gateway_user_id"].get<int64_t>();
+      } else if (j["gateway_user_id"].is_number_unsigned()) {
+        v.gateway_user_id = static_cast<int64_t>(j["gateway_user_id"].get<std::uint64_t>());
+      }
+    }
+    v.gateway_login_username = j.value("gateway_login_username", "");
+    v.gateway_profile_b64 = j.value("gateway_profile_b64", "");
     std::uint64_t request_id = 0;
     if (j.contains("request_id") && !j["request_id"].is_null()) {
       if (j["request_id"].is_number_unsigned()) {
