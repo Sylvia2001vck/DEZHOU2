@@ -104,6 +104,7 @@ public final class MatchWorker {
     running.set(false);
     if (scheduler != null) scheduler.shutdownNow();
     if (thread != null) thread.interrupt();
+    System.err.println("[match-worker] MatchWorker stopped");
   }
 
   private void processOne(String matchId) {

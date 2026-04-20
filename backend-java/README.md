@@ -62,7 +62,7 @@ mvn -DskipTests compile
 - **构造器链**（与代码一致）：`NebulaRedis.init()` → `MatchMessageDao`（仅 `MYSQL_HOST` 非空）→ `RoomWorkerBridge.start()` → `new AuthService(NebulaRedis.commands())` → `new MatchmakingService(auth, bridge, matchDao)` → 条件满足时 `new MatchWorker(...).start()`。
 - **MatchWorker 是否启动**：启动后看 stderr  
   - 仅 Redis、**无** `MYSQL_HOST`：应出现 `[gateway] MatchWorker not started ...`，且**不应**出现 `[match-worker] BRPOP consumer ...`。  
-  - **Redis + MySQL** 且表可连：应出现 `[gateway] MatchWorker invoked ...` 与 `[match-worker] BRPOP consumer ...`。
+  - **Redis + MySQL** 且表可连：应出现 `[redis] connected`、`[nebula-redis] NebulaRedis init`、`[gateway] MatchWorker started ...` 与 `[match-worker] BRPOP consumer ...`。优雅关闭（SIGTERM）时应出现 `[match-worker] MatchWorker stopped`。
 
 与 `MatchWorker.start()` 内一致：`NebulaRedis.available() && JdbcEnv.enabled()`，否则直接 return（见 `MatchWorker.java`）。
 

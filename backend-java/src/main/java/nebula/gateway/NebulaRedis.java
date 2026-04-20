@@ -28,6 +28,7 @@ public final class NebulaRedis {
       connection = client.connect();
       commands = connection.sync();
       System.err.println("[redis] connected " + host + ":" + port);
+      System.err.println("[nebula-redis] NebulaRedis init");
     } catch (Exception e) {
       System.err.println("[redis] connect failed: " + e.getMessage());
       connection = null;
