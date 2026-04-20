@@ -45,3 +45,61 @@
 | `MYSQL_HOST` 等 | 非空则 JDBC 持久化用户；否则仅内存用户 |
 | `REDIS_HOST` / `REDIS_PORT` | 非空则 Lettuce 连接；与 MySQL 同时启用时打开异步匹配管线 |
 | `NEBULA_BRIDGE_SECRET` | 与 C++ 一致，用于 `match-notify` |
+| `NEBULA_MATCH_ID_TRACE` | 设为 `1` 时，C++ 在 `rooms/create` 对 `matchId` 打 stderr（幂等命中 vs 新建），仅用于验证 |
+
+---
+
+## 编译与冒烟验证（云或本地，一步不漏）
+
+### 1) Java：`mvn -DskipTests compile`
+
+```bash
+cd backend-java
+mvn -DskipTests compile
+```
+
+- **必须**出现 `BUILD SUCCESS`。若有 `WARNING`，原样保留终端输出备查。
+- **构造器链**（与代码一致）：`NebulaRedis.init()` → `MatchMessageDao`（仅 `MYSQL_HOST` 非空）→ `RoomWorkerBridge.start()` → `new AuthService(NebulaRedis.commands())` → `new MatchmakingService(auth, bridge, matchDao)` → 条件满足时 `new MatchWorker(...).start()`。
+- **MatchWorker 是否启动**：启动后看 stderr  
+  - 仅 Redis、**无** `MYSQL_HOST`：应出现 `[gateway] MatchWorker not started ...`，且**不应**出现 `[match-worker] BRPOP consumer ...`。  
+  - **Redis + MySQL** 且表可连：应出现 `[gateway] MatchWorker invoked ...` 与 `[match-worker] BRPOP consumer ...`。
+
+与 `MatchWorker.start()` 内一致：`NebulaRedis.available() && JdbcEnv.enabled()`，否则直接 return（见 `MatchWorker.java`）。
+
+### 2) C++：Debug 零错误
+
+```bash
+cd backend-cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j"$(nproc)"
+```
+
+（Windows 无 `nproc` 时可改为 `-j8`。）
+
+- **`matchId`**：从表单读 `matchId`；非空则先查 `match_id_to_room_code_` + `get_room`，命中则**不**调用 `create_room_for_user`；否则调用后写回 map（`main.cpp` 中 `/api/rooms/create` 分支）。
+
+### 3) 本地 / 云上集成冒烟
+
+**进程顺序**：先起 **C++ room worker**（默认 `NEBULA_ROOM_WORKER_PORT=3101`），再起 **Java 网关**（`PORT=3000`），Redis/MySQL 按场景设置。
+
+**场景 A — 只开 Redis，不开 MySQL**
+
+- 环境：`REDIS_HOST=...`，**不设置** `MYSQL_HOST`（或置空）。
+- 预期：网关日志 **MatchWorker not started**；凑满 Bean 队列后仍由 **同步** 路径调 C++ 开房（无 `matchId`）；Redis 上仍可有 Session / 锁等（若代码路径用到）。
+
+**场景 B — Redis + MySQL**
+
+- 环境：同时设置 `REDIS_HOST` 与 `MYSQL_HOST`（及 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 等）。
+- 预期：日志 **MatchWorker invoked** + **BRPOP consumer**；凑满后写 `match_message` 并 `LPUSH nebula:match:msg`，worker 消费后带 `matchId` 调 C++。
+
+**场景 C — `matchId` 幂等（直连 C++ HTTP 或经网关代理均可，需已登录 Session / gateway 身份）**
+
+1. 设置 C++：`export NEBULA_MATCH_ID_TRACE=1`（或 Windows 等价），重启 worker。  
+2. 对同一用户、同一表单连续两次 `POST .../api/rooms/create`（`roomType=bean_match` 等参数一致），**固定同一 `matchId`**。  
+3. 预期：两次响应 JSON 中 **`roomCode` 完全相同**；stderr 先一行 **`new room ... (create_room_for_user)`**，第二次仅 **`idempotent matchId=...`**（无第二次 `create_room_for_user` 日志）。
+
+经网关时：Cookie / gateway 头与直连 C++ 的鉴权方式需与现网一致（见 `RoomWorkerBridge` / C++ `resolve_auth_http`）。
+
+### 4) 文档
+
+- 本文档与 `backend-cpp/README.md` 中关于分支、Redis、MySQL、`matchId` 的描述即为最终口径；改行为前先改文档再改代码。
