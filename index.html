@@ -752,8 +752,8 @@
                     <label class="lobby-label">PASSWORD</label>
                     <input type="password" id="auth-login-password" class="lobby-input" placeholder="minimum 6 characters">
                 </div>
-                <button id="auth-login-btn" class="lobby-btn">Log In</button>
-                <button id="show-register-btn" class="lobby-btn" style="margin-top:10px;">Create New Account</button>
+                <button type="button" id="auth-login-btn" class="lobby-btn">Log In</button>
+                <button type="button" id="show-register-btn" class="lobby-btn" style="margin-top:10px;">Create New Account</button>
                 <button id="offline-debug-btn" type="button" class="lobby-btn" style="margin-top:10px;"
                     title="Enter offline / single-player mode (no server, no login)">Single Player (Offline)</button>
             </div>
@@ -771,8 +771,8 @@
                     <label class="lobby-label">PASSWORD</label>
                     <input type="password" id="auth-register-password" class="lobby-input" placeholder="minimum 6 characters">
                 </div>
-                <button id="auth-register-btn" class="lobby-btn">Register And Enter Lobby</button>
-                <button id="show-login-btn" class="lobby-btn" style="margin-top:10px;">Back To Login</button>
+                <button type="button" id="auth-register-btn" class="lobby-btn">Register And Enter Lobby</button>
+                <button type="button" id="show-login-btn" class="lobby-btn" style="margin-top:10px;">Back To Login</button>
                 <button id="offline-debug-register-btn" type="button" class="lobby-btn" style="margin-top:10px;"
                     title="Enter offline / single-player mode (no server, no login)">Single Player (Offline)</button>
             </div>
@@ -2151,6 +2151,11 @@
             if (!el) return;
             el.textContent = message || '';
             el.style.color = isError ? '#ffd6e4' : '#fff4fb';
+            if (message) {
+                try {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                } catch (_) {}
+            }
         }
 
         function setLobbyMode(mode) {
@@ -2475,23 +2480,66 @@
             );
         }
 
-        async function apiPost(path, payload = {}) {
-            const res = await fetch(path, {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-                body: toFormBody(payload)
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data?.message || 'Request failed');
-            return data;
+        async function apiPost(path, payload = {}, timeoutMs = 45_000) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), timeoutMs);
+            try {
+                const res = await fetch(path, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body: toFormBody(payload),
+                    signal: ctrl.signal
+                });
+                const ct = (res.headers.get('content-type') || '').toLowerCase();
+                const raw = await res.text();
+                let data = {};
+                if (raw && ct.includes('json')) {
+                    try {
+                        data = JSON.parse(raw);
+                    } catch (_) {
+                        data = {};
+                    }
+                }
+                if (!res.ok) {
+                    const msg = data?.message || (raw && !ct.includes('json') ? raw.slice(0, 200) : '') || `HTTP ${res.status}`;
+                    throw new Error(msg);
+                }
+                return data;
+            } catch (e) {
+                if (e && e.name === 'AbortError') throw new Error('Request timed out. Check network or server.');
+                throw e;
+            } finally {
+                clearTimeout(t);
+            }
         }
 
-        async function apiGet(path) {
-            const res = await fetch(path, { credentials: 'include' });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data?.message || 'Request failed');
-            return data;
+        async function apiGet(path, timeoutMs = 45_000) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), timeoutMs);
+            try {
+                const res = await fetch(path, { credentials: 'include', signal: ctrl.signal });
+                const ct = (res.headers.get('content-type') || '').toLowerCase();
+                const raw = await res.text();
+                let data = {};
+                if (raw && ct.includes('json')) {
+                    try {
+                        data = JSON.parse(raw);
+                    } catch (_) {
+                        data = {};
+                    }
+                }
+                if (!res.ok) {
+                    const msg = data?.message || (raw && !ct.includes('json') ? raw.slice(0, 200) : '') || `HTTP ${res.status}`;
+                    throw new Error(msg);
+                }
+                return data;
+            } catch (e) {
+                if (e && e.name === 'AbortError') throw new Error('Request timed out. Check network or server.');
+                throw e;
+            } finally {
+                clearTimeout(t);
+            }
         }
 
         function stopMatchmakingPolling() {
@@ -5756,44 +5804,55 @@
                         }
                     }, 60);
                 };
-                const tryAutoPlay = async () => {
-                    if (!bgm || bgmAssetMissing) return;
-                    if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
-                    try {
-                        bgm.muted = false;
-                        bgm.volume = 0;
-                        await playWithTimeout(bgm, 5000);
-                        fadeToVolume(0.32, 2400);
-                        return;
-                    } catch (_) {
-                        if (bgmAssetMissing) return;
-                        // Audible autoplay likely blocked. Try muted autoplay.
-                        try {
-                            bgm.muted = true;
-                            await playWithTimeout(bgm, 5000);
-                            return;
-                        } catch (e2) {
-                            console.warn('[bgm] autoplay failed', e2);
-                        }
-                    }
+                /** Serialize BGM play()/fade so load autoplay and first pointerdown never stack (reduces stutter). */
+                let bgmExclusiveChain = Promise.resolve();
+                const runBgmExclusive = (fn) => {
+                    const p = bgmExclusiveChain.then(() => fn());
+                    bgmExclusiveChain = p.catch(() => {});
+                    return p;
                 };
-                // Always: on first user gesture, ensure audio is playing (no need to toggle Off->On).
-                const ensurePlayingOnGesture = async () => {
-                    try {
+                const tryAutoPlay = () => {
+                    runBgmExclusive(async () => {
                         if (!bgm || bgmAssetMissing) return;
                         if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
-                        if (bgm.paused) {
+                        try {
                             bgm.muted = false;
                             bgm.volume = 0;
                             await playWithTimeout(bgm, 5000);
-                            fadeToVolume(0.32, 1800);
-                        } else if (bgm.muted) {
-                            bgm.muted = false;
-                            fadeToVolume(0.32, 1400);
-                        } else if (bgm.volume < 0.28) {
-                            fadeToVolume(0.32, 1200);
+                            fadeToVolume(0.32, 2400);
+                            return;
+                        } catch (_) {
+                            if (bgmAssetMissing) return;
+                            // Audible autoplay likely blocked. Try muted autoplay.
+                            try {
+                                bgm.muted = true;
+                                await playWithTimeout(bgm, 5000);
+                                return;
+                            } catch (e2) {
+                                console.warn('[bgm] autoplay failed', e2);
+                            }
                         }
-                    } catch (_) {}
+                    });
+                };
+                // Always: on first user gesture, ensure audio is playing (no need to toggle Off->On).
+                const ensurePlayingOnGesture = async () => {
+                    await runBgmExclusive(async () => {
+                        try {
+                            if (!bgm || bgmAssetMissing) return;
+                            if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
+                            if (bgm.paused) {
+                                bgm.muted = false;
+                                bgm.volume = 0;
+                                await playWithTimeout(bgm, 5000);
+                                fadeToVolume(0.32, 1800);
+                            } else if (bgm.muted) {
+                                bgm.muted = false;
+                                fadeToVolume(0.32, 1400);
+                            } else if (bgm.volume < 0.28) {
+                                fadeToVolume(0.32, 1200);
+                            }
+                        } catch (_) {}
+                    });
                 };
                 window.addEventListener('pointerdown', ensurePlayingOnGesture, { once: true });
                 window.addEventListener('keydown', ensurePlayingOnGesture, { once: true });
@@ -5807,27 +5866,29 @@
                         const wantOn = !(localStorage.getItem('nebula_bgm') === 'on');
                         localStorage.setItem('nebula_bgm', wantOn ? 'on' : 'off');
                         setLabel(wantOn);
-                        try {
-                            if (wantOn) {
-                                bgm.muted = false;
-                                bgm.volume = 0;
-                                await playWithTimeout(bgm, 8000);
-                                fadeToVolume(0.32, 1600);
-                            } else {
-                                try { clearInterval(bgmFadeTimer); } catch (_) {}
-                                bgm.pause();
-                                bgm.muted = false;
-                                bgm.volume = 0;
+                        await runBgmExclusive(async () => {
+                            try {
+                                if (wantOn) {
+                                    bgm.muted = false;
+                                    bgm.volume = 0;
+                                    await playWithTimeout(bgm, 8000);
+                                    fadeToVolume(0.32, 1600);
+                                } else {
+                                    try { clearInterval(bgmFadeTimer); } catch (_) {}
+                                    bgm.pause();
+                                    bgm.muted = false;
+                                    bgm.volume = 0;
+                                }
+                            } catch (e) {
+                                console.warn('[bgm] play failed', e);
+                                if (e && e.message === 'bgm-play-timeout') {
+                                    console.warn('[bgm] play timed out — leaving BGM off');
+                                }
+                                localStorage.setItem('nebula_bgm', 'off');
+                                setLabel(false);
+                                try { bgm.pause(); } catch (_) {}
                             }
-                        } catch (e) {
-                            console.warn('[bgm] play failed', e);
-                            if (e && e.message === 'bgm-play-timeout') {
-                                console.warn('[bgm] play timed out — leaving BGM off');
-                            }
-                            localStorage.setItem('nebula_bgm', 'off');
-                            setLabel(false);
-                            try { bgm.pause(); } catch (_) {}
-                        }
+                        });
                     };
                 }
                 // attempt autoplay on load (default ON) — skipped if asset missing (error handler runs first)
@@ -6048,11 +6109,19 @@
             }
             const authRegisterBtn = document.getElementById('auth-register-btn');
             if (authRegisterBtn) {
+                const registerDefaultLabel = authRegisterBtn.textContent;
                 authRegisterBtn.onclick = async () => {
+                    if (authRegisterBtn.disabled) return;
+                    const loginUsername = document.getElementById('auth-register-username').value.trim();
+                    const displayName = document.getElementById('auth-register-display-name').value.trim();
+                    const password = document.getElementById('auth-register-password').value;
+                    if (!loginUsername || !displayName || !password) {
+                        setLobbyFeedback('Please fill in username, display name, and password.', true);
+                        return;
+                    }
+                    authRegisterBtn.disabled = true;
+                    authRegisterBtn.textContent = 'Registering…';
                     try {
-                        const loginUsername = document.getElementById('auth-register-username').value.trim();
-                        const displayName = document.getElementById('auth-register-display-name').value.trim();
-                        const password = document.getElementById('auth-register-password').value;
                         const data = await apiPost('/api/auth/register', { loginUsername, displayName, password });
                         updateLobbyAccountCard(data.user);
                         setLobbyMode('home');
@@ -6060,6 +6129,9 @@
                         location.reload();
                     } catch (e) {
                         setLobbyFeedback(e?.message || 'Registration failed.', true);
+                    } finally {
+                        authRegisterBtn.disabled = false;
+                        authRegisterBtn.textContent = registerDefaultLabel;
                     }
                 };
             }

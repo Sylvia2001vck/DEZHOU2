@@ -67,6 +67,10 @@ public final class GatewayMain {
     if (matchDao != null && NebulaRedis.available()) {
       matchWorker = new MatchWorker(matchDao, bridge, auth, bridgeSecret);
       matchWorker.start();
+      System.err.println("[gateway] MatchWorker invoked (Redis + MYSQL_HOST: async match pipeline).");
+    } else {
+      System.err.println(
+          "[gateway] MatchWorker not started (needs non-empty REDIS_HOST and MYSQL_HOST together). Sync match still OK.");
     }
 
     Javalin app =

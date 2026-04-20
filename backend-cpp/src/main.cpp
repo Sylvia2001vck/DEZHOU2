@@ -2230,17 +2230,25 @@ class PokerServer {
       const std::string visibility = form.count("visibility") ? form.at("visibility") : "private";
       const std::string room_type = form.count("roomType") ? form.at("roomType") : "friend";
       const std::string match_id = form.count("matchId") ? form.at("matchId") : "";
+      const bool trace_match_id = get_env("NEBULA_MATCH_ID_TRACE", "") == "1";
       if (!match_id.empty()) {
         const auto mit = match_id_to_room_code_.find(match_id);
         if (mit != match_id_to_room_code_.end()) {
           Room* existing = get_room(mit->second);
           if (existing) {
+            if (trace_match_id) {
+              std::cerr << "[nebula] rooms/create idempotent matchId=" << match_id << " room=" << existing->room_code
+                        << "\n";
+            }
             send_json(reply, 200, "{\"ok\":true,\"roomCode\":\"" + escape_json(existing->room_code) +
                                         "\",\"room\":" + room_summary_json(*existing) + "}");
             return;
           }
           match_id_to_room_code_.erase(mit);
         }
+      }
+      if (trace_match_id && !match_id.empty()) {
+        std::cerr << "[nebula] rooms/create new room for matchId=" << match_id << " (create_room_for_user)\n";
       }
       Room& room = create_room_for_user(*profile, visibility, total_hands, initial_chips, room_type);
       if (room_type == "bean_match") {

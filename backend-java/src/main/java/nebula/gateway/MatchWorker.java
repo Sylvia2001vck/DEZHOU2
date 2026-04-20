@@ -64,6 +64,7 @@ public final class MatchWorker {
             "nebula-match-consumer");
     thread.setDaemon(true);
     thread.start();
+    System.err.println("[match-worker] BRPOP consumer + retry scheduler running on " + NebulaRedis.KEY_MATCH_MSG);
 
     scheduler =
         Executors.newSingleThreadScheduledExecutor(
