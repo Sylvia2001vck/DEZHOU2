@@ -111,6 +111,7 @@ Rooms are persisted as **JSON** under **`<repo>/.runtime/rooms/<roomId>.json`** 
 | `NEBULA_SNAPSHOT_DIR` | (empty) | Absolute path to the `rooms` directory; overrides the path below. |
 | `NEBULA_REPO_ROOT` | (empty) | If set, snapshots go to `$NEBULA_REPO_ROOT/.runtime/rooms/`. |
 | (fallback) | `.runtime/rooms` | Relative to the process current working directory. |
+| `NEBULA_MATCH_ID_TRACE` | (empty) | Set to `1` to log `POST /api/rooms/create` **matchId** idempotent hits vs new `create_room_for_user` (stderr); for verification only. |
 
 **Node vs C++ snapshots:** Core game fields align so Node-produced files can load in C++. Event log formats differ; C++ only restores `eventLog` entries that contain **`envelopeB64`**.
 
