@@ -1,11 +1,11 @@
 # Docker 部署（腾讯云 CVM）
 
-双进程：**gateway**（Java，桥接网络，默认 **宿主机 8088 → 容器内 8080**，可用 `GATEWAY_PUBLISH_PORT` 改）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`）。
+双进程：**gateway**（Java，桥接网络，**宿主机端口 = `GATEWAY_PUBLISH_PORT`，默认 8080 → 容器内 8080**）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`）。
 
 ## 前置
 
 - CVM 安装 **Docker** 与 **Compose V2**（`docker compose version`）。
-- **安全组**：对公网放行 **`GATEWAY_PUBLISH_PORT`（默认 8088）**，**不要**放行 **3101**。
+- **安全组**：对公网放行与 **`.env` 里 `GATEWAY_PUBLISH_PORT` 一致**的端口（默认 **8080** 即可，不必再开 8088）；**不要**放行 **3101**。
 - 腾讯云 **MySQL / Redis** 与 CVM 同 VPC，使用**内网地址**；`NEBULA_BRIDGE_SECRET` 与线上一致。
 
 ## 配置
@@ -48,9 +48,39 @@ docker compose logs -f
    把 `docker-compose.yaml` 里 gateway 的 `NEBULA_ROOM_WORKER_HOST` 改成**宿主机内网 IP**（例如 `172.19.0.5`，与 `ip -4 addr` / `ip route` 一致），保存后 `docker compose up -d`。
 3. **C++ 未监听**  
    `docker compose logs room-worker --tail 80`，应能看到 `listening on 0.0.0.0:3101`。宿主机执行 `ss -tlnp | grep 3101` 应有 `nebula-poker-server`。
-4. 更新 compose 后务必 **`docker compose down` 再 `up`**。
+4. 改了 compose 网络或排查卡死容器时，可 **`docker compose down` 再 `up`**；**日常发版不必每次都 `down`**（见下文「down 与端口」）。
 
-验证（网关容器内应能连上宿主机 3101）：
+---
+
+## `down` 再 `up` 和「只 kill 8080 再起」为啥表现不一样？
+
+**不是** `unset`、`grep`、和 `grep` 后面那行注释有冲突；`grep NEBULA_ROOM .env` 只是查看 `.env`，不会改端口。
+
+真正常见情况是：
+
+| 做法 | 发生了什么 |
+|------|------------|
+| **只 kill 宿主机 Java，再 `docker compose up -d`** | 8080/8088 空出来了；若容器**本来就在**、`up` 只是启动或增量更新，有时**不会**重新走一遍「删容器 → 新建 → 绑宿主机端口」 |
+| **`docker compose down` 再 `up -d --build`** | **网关容器被删掉再新建**，必须在宿主机上**重新绑定** `GATEWAY_PUBLISH_PORT`。若 `.env` 仍是 **8080**，或 **systemd/cron/另一终端** 又拉起本机 Java，**绑定瞬间就会 `address already in use`** |
+
+所以问题本质是：**`down` 会强制重新占端口**；和「仪式」里的其它命令无关。
+
+**建议**：
+
+1. **默认用 8080** 即可（与安全组只开 8080 一致）。若某次报错 `8080 address already in use`，说明**宿主机上还有别的进程**（常见是另一个 `java -jar`）：`sudo ss -tlnp | grep 8080` 找到 PID 后关掉，或把 `.env` 改成 **`GATEWAY_PUBLISH_PORT=8088`**（并在安全组放行 8088）。
+2. **日常更新**：在 `deploy/docker` 下执行 **`git pull && docker compose up -d --build`** 即可，**不必每次 `down`**。  
+3. **只有**换网络、容器状态异常、或文档要求清栈时，再 **`docker compose down`**，然后 **`ss -tlnp | grep :8080`**（或你的 `GATEWAY_PUBLISH_PORT`）确认空闲后立刻 `up`。
+
+```bash
+# 日常推荐（少 down）
+cd ~/DEZHOU2/deploy/docker
+unset NEBULA_ROOM_WORKER_HOST
+git pull
+docker compose up -d --build
+docker compose logs gateway --tail 40
+```
+
+`grep`、`unset` 只在 **`.env` 里误写了 `NEBULA_ROOM_WORKER_*`** 时需要；没有误配可以不用每次跑。
 
 ```bash
 docker compose exec gateway curl -sv http://host.docker.internal:3101/ 2>&1 | head -5
@@ -79,11 +109,31 @@ docker compose -f deploy/docker/docker-compose.yaml --project-directory deploy/d
 
 ---
 
-## 宿主机端口
+## 只起 Docker、关掉本机 `java -jar` 网关
 
-- 默认 **8088**，避免与本机在宿主机上直接跑的 **`java -jar …`（常占 8080）**冲突。
-- 若仍冲突，在 `.env` 里改 `GATEWAY_PUBLISH_PORT`（例如 `13000`），并在安全组放行同端口。
-- **长期建议**：生产只保留 **Docker 网关** 或只保留**本机 Java**，不要两个同时占临近端口。
+仓库里脚本会：在 **`.env` 里的 `GATEWAY_PUBLISH_PORT`**（默认 8080）上，**只结束 `java` 进程**，不碰 `docker-proxy`，然后 **`docker compose up -d --build`**。
+
+```bash
+cd ~/DEZHOU2/deploy/docker
+chmod +x start-docker-only.sh   # 仅需一次
+bash start-docker-only.sh
+```
+
+若本机用 **systemd** 拉网关，需禁用，否则下次开机 Java 又占 8080：
+
+```bash
+systemctl list-units --type=service | grep -iE 'nebula|java|gateway'
+# 若有，例如：
+# sudo systemctl disable --now 你的服务名
+```
+
+---
+
+## 宿主机端口与安全组
+
+- **默认 `GATEWAY_PUBLISH_PORT=8080`**：腾讯云安全组只放行 **TCP 8080** 即可访问网页，**不必**再开 8088。
+- 之前出现 **「8080 被占用」** 是因为当时 **`ss` 能看到本机 `java` 在监听 8080**，并不是「不能用 8080」；你确认本机没有别的服务占 8080 后，继续用 8080 没问题。
+- 若必须与宿主机 Java 共存，再把 `.env` 改成 **8088**（或其它端口），并在安全组**同步放行**该端口。
 
 ---
 

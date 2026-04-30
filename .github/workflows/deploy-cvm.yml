@@ -28,5 +28,4 @@ jobs:
             set -e
             cd /home/ubuntu/DEZHOU2/deploy/docker
             git pull origin main
-            docker compose build
-            docker compose up -d
+            bash start-docker-only.sh
