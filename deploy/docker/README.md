@@ -111,7 +111,7 @@ docker compose -f deploy/docker/docker-compose.yaml --project-directory deploy/d
 
 ## 只起 Docker、关掉本机 `java -jar` 网关
 
-仓库里脚本会：在 **`.env` 里的 `GATEWAY_PUBLISH_PORT`**（默认 8080）上，**只结束 `java` 进程**，不碰 `docker-proxy`，然后 **`docker compose up -d --build`**。
+仓库里脚本会：**先 `docker compose down`**（去掉旧网关容器，释放 **`docker-proxy` 占用的宿主机端口**——只杀 `java` 不够），再结束仍占用 **`GATEWAY_PUBLISH_PORT`** 上的 **java / 孤儿 docker-proxy**，最后 **`docker compose up -d --build`**。
 
 ```bash
 cd ~/DEZHOU2/deploy/docker

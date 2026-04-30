@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 只走 Docker 网关：杀掉占用宿主机端口的本机 Java（不杀 docker-proxy），再起 compose。
+# 只走 Docker：先 down 掉旧容器（释放 docker-proxy 占用的宿主机端口），再杀掉本机 java，最后 up。
 # 用法：在 deploy/docker 目录执行  bash start-docker-only.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,40 +16,48 @@ if [[ -f .env ]]; then
 fi
 
 echo "[nebula] host port: ${PORT}"
-echo "[nebula] killing Java process(es) listening on :${PORT} (docker-proxy left untouched)..."
 
-kill_java_on_port() {
+echo "[nebula] docker compose down (remove old gateway + release docker-proxy on :${PORT})..."
+docker compose down --remove-orphans 2>/dev/null || true
+sleep 2
+
+echo "[nebula] killing listeners on :${PORT} — java (host jar) and orphan docker-proxy..."
+
+kill_on_port_by_comm() {
+  local match="$1"
   local p comm
   if command -v lsof >/dev/null 2>&1; then
     for p in $(sudo lsof -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true); do
       [[ -z "$p" ]] && continue
       comm="$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ' || true)"
-      if [[ "$comm" == "java" ]]; then
-        echo "  kill java pid=$p"
+      if [[ "$comm" == "$match" ]]; then
+        echo "  kill $match pid=$p"
         sudo kill "$p" 2>/dev/null || true
       fi
     done
     return
   fi
-  # lsof 未安装时用 ss（需 procps / iproute2）
   while read -r p; do
     [[ -z "$p" ]] && continue
     comm="$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ' || true)"
-    if [[ "$comm" == "java" ]]; then
-      echo "  kill java pid=$p (via ss)"
+    if [[ "$comm" == "$match" ]]; then
+      echo "  kill $match pid=$p (via ss)"
       sudo kill "$p" 2>/dev/null || true
     fi
   done < <(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
 }
 
-kill_java_on_port
+kill_on_port_by_comm java
+kill_on_port_by_comm docker-proxy
 sleep 1
-kill_java_on_port
+kill_on_port_by_comm java
+kill_on_port_by_comm docker-proxy
 
 for p in $(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u); do
   [[ -z "$p" ]] && continue
-  if [[ "$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ')" == "java" ]]; then
-    echo "[nebula] WARN: java still holding :${PORT} (pid=$p) — sudo kill -9 $p then re-run"
+  comm="$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$comm" == "java" ]] || [[ "$comm" == "docker-proxy" ]]; then
+    echo "[nebula] WARN: $comm still on :${PORT} pid=$p — sudo kill -9 $p"
   fi
 done
 
