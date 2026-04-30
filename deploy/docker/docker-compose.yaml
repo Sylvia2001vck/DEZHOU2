@@ -1,0 +1,47 @@
+# 腾讯云 CVM：在主机上安装 Docker + Compose V2 后
+#   cd deploy/docker && cp env.example .env && nano .env
+#   docker compose build && docker compose up -d
+#
+# MySQL / Redis 在宿主机或腾讯云托管时，不要用 127.0.0.1（那是容器自己）。
+# 可填云数据库内网地址；若服务跑在宿主机，用 extra_hosts 里的 host.docker.internal。
+
+services:
+  room-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.room-worker
+    image: nebula-room-worker:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NEBULA_REPO_ROOT: /app
+      NEBULA_ROOM_WORKER_BIND: "0.0.0.0"
+      NEBULA_ROOM_WORKER_PORT: "3101"
+    # 无对外端口；仅网关容器访问
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.gateway
+    image: nebula-gateway:latest
+    restart: unless-stopped
+    depends_on:
+      - room-worker
+    ports:
+      - "${GATEWAY_PUBLISH_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      NEBULA_REPO_ROOT: /app
+      PORT: "8080"
+      NEBULA_ROOM_WORKER_HOST: room-worker
+      NEBULA_ROOM_WORKER_PORT: "3101"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

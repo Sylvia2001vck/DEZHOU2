@@ -1,0 +1,26 @@
+# Build contexts smaller &Safer
+.git
+.github
+node_modules
+**/node_modules
+**/.git
+
+# Java
+backend-java/target
+backend-java/dependency-reduced-pom.xml
+backend-java/.env.local
+
+# C++
+backend-cpp/build
+backend-cpp/build-cpp
+build-cpp
+
+# Local / IDE
+.vs
+*.log
+debug-*.log
+scripts/DEZHOU
+tmp_wspp
+
+# Large optional asset (mount at runtime if needed)
+assets/ifcan.mp3

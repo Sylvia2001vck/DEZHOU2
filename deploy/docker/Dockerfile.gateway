@@ -1,0 +1,30 @@
+# Java 网关（对外 HTTP/WS，静态页，代理 C++）
+# 构建：在仓库根目录执行
+#   docker build -f deploy/docker/Dockerfile.gateway -t nebula-gateway:latest .
+
+FROM maven:3.9-eclipse-temurin-17 AS build
+WORKDIR /build
+COPY backend-java/pom.xml backend-java/pom.xml
+COPY backend-java/src backend-java/src
+RUN cd backend-java && mvn -B -ntp -DskipTests package
+
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+ENV NEBULA_REPO_ROOT=/app
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# Shade JAR
+COPY --from=build /build/backend-java/target/nebula-gateway.jar /app/nebula-gateway.jar
+
+# 静态资源：Javalin 根目录 = $NEBULA_REPO_ROOT/frontend/static
+# index 中引用 ./frontend/src/...、./proto-socket.js、/proto/poker.proto
+RUN mkdir -p /app/frontend/static/frontend/src /app/frontend/static/proto /app/frontend/static/assets
+COPY frontend/static/index.html /app/frontend/static/
+COPY frontend/src /app/frontend/static/frontend/src/
+COPY proto-socket.js /app/frontend/static/proto-socket.js
+COPY backend-cpp/proto/poker.proto /app/frontend/static/proto/poker.proto
+
+EXPOSE 8080
+ENV PORT=8080
+ENTRYPOINT ["java", "-jar", "/app/nebula-gateway.jar"]

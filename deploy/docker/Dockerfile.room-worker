@@ -1,0 +1,44 @@
+# C++ Room Worker（仅内网，Java 通过 TCP 连接）
+# 构建：在仓库根目录执行
+#   docker build -f deploy/docker/Dockerfile.room-worker -t nebula-room-worker:latest .
+
+FROM ubuntu:22.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config git ca-certificates \
+    libboost-system-dev libboost-thread-dev \
+    protobuf-compiler libprotobuf-dev \
+    default-libmysqlclient-dev libhiredis-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY backend-cpp/ backend-cpp/
+RUN cmake -S backend-cpp -B build -DCMAKE_BUILD_TYPE=Release \
+    -DNEBULA_ENABLE_MYSQL=ON -DNEBULA_ENABLE_REDIS=ON \
+ && cmake --build build -j"$(nproc)"
+
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libboost-system1.74.0 \
+    libboost-thread1.74.0 \
+    libprotobuf23 \
+    libmysqlclient21 \
+    libhiredis0.14 \
+    libssl3 \
+    zlib1g \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/build/nebula-poker-server /usr/local/bin/nebula-poker-server
+WORKDIR /app
+ENV NEBULA_REPO_ROOT=/app
+RUN mkdir -p /app/.runtime/rooms /app/proto
+COPY backend-cpp/proto/poker.proto /app/proto/poker.proto
+
+# 必须监听 0.0.0.0 以便其它容器访问
+ENV NEBULA_ROOM_WORKER_BIND=0.0.0.0
+ENV NEBULA_ROOM_WORKER_PORT=3101
+
+EXPOSE 3101
+CMD ["nebula-poker-server"]
