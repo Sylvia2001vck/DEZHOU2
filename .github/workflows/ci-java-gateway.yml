@@ -1,0 +1,28 @@
+# 推 main / PR 时编译 Java 网关（不访问云、不含密钥）。
+# CD（自动部署到你的云）在 Railway/Render/VPS 等平台另行绑定分支并配置环境变量。
+name: CI Java Gateway
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-java
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Package (shade JAR)
+        run: mvn -B -ntp -DskipTests package
