@@ -29,6 +29,10 @@
 #include <google/protobuf/message.h>
 #include <nlohmann/json.hpp>
 
+#include "engine/holdem_evaluator.hpp"
+#include "engine/pot_manager.hpp"
+#include "engine/round_phase.hpp"
+#include "engine/holdem_types.hpp"
 #include "poker.pb.h"
 #include "sha256.hpp"
 
@@ -42,8 +46,13 @@
 
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
+namespace engine = nebula::engine;
 
 namespace {
+
+using engine::Card;
+using engine::HandEval;
+using engine::RoundPhase;
 
 struct HttpRequestView {
   std::string method;
@@ -272,12 +281,6 @@ bool verify_password_record(const std::string& password, const std::string& reco
   return password_digest(password, salt, iterations) == record.substr(c + 1);
 }
 
-struct Card {
-  std::string s;
-  std::string r;
-  int v = 0;
-};
-
 struct Seat {
   enum class Type { Empty, Player, AI };
 
@@ -298,6 +301,7 @@ struct PlayerState {
   int seat_idx = -1;
   int chips = 1000;
   int current_bet = 0;
+  int hand_contribution = 0;
   bool is_folded = false;
   bool is_bankrupt = false;
   std::vector<Card> hand;
@@ -414,7 +418,7 @@ struct Room {
   int sb_seat_idx = -1;
   int bb_seat_idx = -1;
   int pot = 0;
-  std::string round = "WAITING";
+  std::string round = engine::to_string(RoundPhase::Waiting);
   std::vector<Card> community_cards;
   std::vector<Card> deck;
   int current_max_bet = 0;
@@ -527,6 +531,7 @@ nlohmann::json player_to_json(const PlayerState& p) {
   j["seatIdx"] = p.seat_idx;
   j["chips"] = p.chips;
   j["currentBet"] = p.current_bet;
+  j["handContribution"] = p.hand_contribution;
   j["isFolded"] = p.is_folded;
   j["isBankrupt"] = p.is_bankrupt;
   j["totalBuyIn"] = p.total_buy_in;
@@ -542,6 +547,7 @@ void player_from_json(const nlohmann::json& j, PlayerState& p) {
   p.seat_idx = j.value("seatIdx", -1);
   p.chips = j.value("chips", 1000);
   p.current_bet = j.value("currentBet", 0);
+  p.hand_contribution = j.value("handContribution", 0);
   p.is_folded = j.value("isFolded", false);
   p.is_bankrupt = j.value("isBankrupt", false);
   p.total_buy_in = j.value("totalBuyIn", 1000);
@@ -735,7 +741,7 @@ void room_from_json(const nlohmann::json& j, Room& out) {
   if (j.contains("bbSeatIdx") && j["bbSeatIdx"].is_number_integer()) out.bb_seat_idx = j["bbSeatIdx"].get<int>();
   else out.bb_seat_idx = -1;
   out.pot = std::max(0, j.value("pot", 0));
-  out.round = j.value("round", std::string("WAITING"));
+  out.round = j.value("round", std::string(engine::to_string(RoundPhase::Waiting)));
   out.community_cards.clear();
   if (j.contains("communityCards") && j["communityCards"].is_array()) {
     for (const auto& cj : j["communityCards"]) {
@@ -809,12 +815,6 @@ void room_from_json(const nlohmann::json& j, Room& out) {
   out.expected_acks.clear();
   out.match_acks.clear();
 }
-
-struct HandEval {
-  int rank = 0;
-  std::vector<int> value;
-  std::string desc;
-};
 
 struct Session {
   std::string socket_id;
@@ -2503,144 +2503,13 @@ class PokerServer {
     return deck;
   }
 
-  std::vector<std::vector<Card>> combinations(const std::vector<Card>& arr, int k) {
-    std::vector<std::vector<Card>> out;
-    std::vector<Card> current;
-    std::function<void(int)> dfs = [&](int start) {
-      if (static_cast<int>(current.size()) == k) {
-        out.push_back(current);
-        return;
-      }
-      for (int i = start; i < static_cast<int>(arr.size()); ++i) {
-        current.push_back(arr[i]);
-        dfs(i + 1);
-        current.pop_back();
-      }
-    };
-    dfs(0);
-    return out;
-  }
-
-  HandEval evaluate5(const std::vector<Card>& cards) {
-    std::vector<Card> sorted = cards;
-    std::sort(sorted.begin(), sorted.end(), [](const Card& a, const Card& b) { return a.v > b.v; });
-
-    std::vector<int> ranks;
-    std::vector<std::string> suits;
-    for (const auto& c : sorted) {
-      ranks.push_back(c.v);
-      suits.push_back(c.s);
-    }
-
-    bool flush = std::all_of(suits.begin(), suits.end(), [&](const std::string& s) { return s == suits.front(); });
-    bool straight = false;
-    int straight_max = 0;
-    std::vector<int> uniq = ranks;
-    std::sort(uniq.begin(), uniq.end());
-    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-    std::sort(uniq.begin(), uniq.end(), std::greater<int>());
-    if (uniq.size() == 5) {
-      if (uniq.front() - uniq.back() == 4) {
-        straight = true;
-        straight_max = uniq.front();
-      } else if (uniq == std::vector<int>({14, 5, 4, 3, 2})) {
-        straight = true;
-        straight_max = 5;
-      }
-    }
-
-    std::map<int, int, std::greater<int>> counts;
-    for (int r : ranks) counts[r] += 1;
-    std::vector<std::pair<int, int>> by_freq;
-    for (const auto& [rank, count] : counts) by_freq.push_back({count, rank});
-    std::sort(by_freq.begin(), by_freq.end(), [](auto a, auto b) {
-      if (a.first != b.first) return a.first > b.first;
-      return a.second > b.second;
-    });
-
-    HandEval out;
-    if (flush && straight) {
-      out.rank = (straight_max == 14) ? 10 : 9;
-      out.value = {straight_max};
-      out.desc = (straight_max == 14) ? "Royal Flush" : "Straight Flush";
-      return out;
-    }
-    if (by_freq[0].first == 4) {
-      out.rank = 8;
-      out.value = {by_freq[0].second, by_freq[1].second};
-      out.desc = "Four of a Kind";
-      return out;
-    }
-    if (by_freq[0].first == 3 && by_freq[1].first == 2) {
-      out.rank = 7;
-      out.value = {by_freq[0].second, by_freq[1].second};
-      out.desc = "Full House";
-      return out;
-    }
-    if (flush) {
-      out.rank = 6;
-      out.value = ranks;
-      out.desc = "Flush";
-      return out;
-    }
-    if (straight) {
-      out.rank = 5;
-      out.value = {straight_max};
-      out.desc = "Straight";
-      return out;
-    }
-    if (by_freq[0].first == 3) {
-      out.rank = 4;
-      out.value = {by_freq[0].second, by_freq[1].second, by_freq[2].second};
-      out.desc = "Three of a Kind";
-      return out;
-    }
-    if (by_freq[0].first == 2 && by_freq[1].first == 2) {
-      out.rank = 3;
-      out.value = {by_freq[0].second, by_freq[1].second, by_freq[2].second};
-      out.desc = "Two Pair";
-      return out;
-    }
-    if (by_freq[0].first == 2) {
-      out.rank = 2;
-      out.value = {by_freq[0].second, by_freq[1].second, by_freq[2].second, by_freq[3].second};
-      out.desc = "One Pair";
-      return out;
-    }
-    out.rank = 1;
-    out.value = ranks;
-    out.desc = "High Card";
-    return out;
-  }
-
-  int compare_hands(const HandEval& a, const HandEval& b) {
-    if (a.rank != b.rank) return a.rank - b.rank;
-    for (size_t i = 0; i < std::min(a.value.size(), b.value.size()); ++i) {
-      if (a.value[i] != b.value[i]) return a.value[i] - b.value[i];
-    }
-    return 0;
-  }
-
-  HandEval best_hand(const std::vector<Card>& cards) {
-    auto combos = combinations(cards, 5);
-    HandEval best;
-    bool has_best = false;
-    for (const auto& combo : combos) {
-      HandEval current = evaluate5(combo);
-      if (!has_best || compare_hands(current, best) > 0) {
-        best = current;
-        has_best = true;
-      }
-    }
-    return best;
-  }
-
   int place_bet(Room& room, int seat_idx, int amount) {
     PlayerState* p = get_player(room, seat_idx);
     if (!p || p->is_folded || p->is_bankrupt) return 0;
     int real = std::max(0, std::min(amount, p->chips));
     p->chips -= real;
     p->current_bet += real;
+    p->hand_contribution += real;
     room.pot += real;
     return real;
   }
@@ -2655,7 +2524,7 @@ class PokerServer {
   void reset_hand(Room& room) {
     room.hand_num += 1;
     room.pot = 0;
-    room.round = "PRE-FLOP";
+    room.round = engine::to_string(RoundPhase::PreFlop);
     room.community_cards.clear();
     room.deck = fresh_deck();
     room.current_max_bet = 0;
@@ -2665,6 +2534,7 @@ class PokerServer {
     for (auto& [seat_idx, p] : room.players) {
       p.hand.clear();
       p.current_bet = 0;
+      p.hand_contribution = 0;
       const Seat& seat = room.seats[seat_idx];
       const bool disconnected = seat.type == Seat::Type::Player && !is_online(seat.socket_id) && !seat.ai_managed;
       const bool sit_out = p.sit_out_until_hand > room.hand_num;
@@ -2824,22 +2694,44 @@ class PokerServer {
     return room.pending_action_seats.empty();
   }
 
+  std::vector<int> winners_by_odd_chip_priority(const Room& room, const std::vector<int>& winners) {
+    std::vector<int> ordered = winners;
+    std::sort(ordered.begin(), ordered.end(), [&](int a, int b) {
+      const int first_odd_chip_seat = (room.dealer_seat_idx + 1) % kSeats;
+      const int da = (a - first_odd_chip_seat + kSeats) % kSeats;
+      const int db = (b - first_odd_chip_seat + kSeats) % kSeats;
+      if (da != db) return da < db;
+      return a < b;
+    });
+    return ordered;
+  }
+
+  std::string join_winner_names(const Room& room, const std::vector<int>& winners) {
+    std::ostringstream names;
+    for (size_t i = 0; i < winners.size(); ++i) {
+      if (i) names << " & ";
+      names << room.seats[winners[i]].name;
+    }
+    return names.str();
+  }
+
   void proceed_to_next_street(Room& room) {
     for (auto& [_, p] : room.players) p.current_bet = 0;
     room.current_max_bet = 0;
-    if (room.round == "PRE-FLOP") {
-      room.round = "FLOP";
+    const RoundPhase phase = engine::round_phase_from_string(room.round);
+    if (phase == RoundPhase::PreFlop) {
+      room.round = engine::to_string(RoundPhase::Flop);
       deal_community(room, 3);
-    } else if (room.round == "FLOP") {
-      room.round = "TURN";
+    } else if (phase == RoundPhase::Flop) {
+      room.round = engine::to_string(RoundPhase::Turn);
       deal_community(room, 1);
-    } else if (room.round == "TURN") {
-      room.round = "RIVER";
+    } else if (phase == RoundPhase::Turn) {
+      room.round = engine::to_string(RoundPhase::River);
       deal_community(room, 1);
     } else {
-      room.round = "SHOWDOWN";
+      room.round = engine::to_string(RoundPhase::Showdown);
     }
-    if (room.round == "SHOWDOWN") {
+    if (engine::round_phase_from_string(room.round) == RoundPhase::Showdown) {
       finish_hand(room);
       return;
     }
@@ -2863,7 +2755,7 @@ class PokerServer {
 
     if (in_hand.empty()) {
       room.pot = 0;
-      room.round = "HAND_OVER";
+      room.round = engine::to_string(RoundPhase::HandOver);
       nebula::poker::HandOver msg;
       msg.set_handnum(room.hand_num);
       msg.set_totalhands(room.total_hands);
@@ -2872,60 +2764,114 @@ class PokerServer {
       return;
     }
 
-    if (in_hand.size() == 1) {
-      int winner = in_hand.front();
-      PlayerState* p = get_player(room, winner);
-      if (p) p->chips += room.pot;
-      room.pot = 0;
-      room.round = "HAND_OVER";
-      broadcast_activity(room, "Game Over. " + room.seats[winner].name + " wins (all others folded)!");
-      nebula::poker::HandOver msg;
-      msg.set_handnum(room.hand_num);
-      msg.set_totalhands(room.total_hands);
-      auto* w = msg.add_winners();
-      w->set_seatidx(winner);
-      w->set_name(room.seats[winner].name);
-      msg.set_desc("All others folded");
-      send_hand_over(room, msg, showdown_cards);
-      return;
+    std::vector<engine::PotContributor> contributors;
+    contributors.reserve(room.players.size());
+    int tracked_total_pot = 0;
+    for (const auto& [seat_idx, p] : room.players) {
+      if (p.hand_contribution <= 0) continue;
+      contributors.push_back(engine::PotContributor{seat_idx, p.hand_contribution, !p.is_folded});
+      tracked_total_pot += p.hand_contribution;
     }
+    if (!contributors.empty()) room.pot = tracked_total_pot;
+    std::vector<engine::Pot> pots = engine::build_pots(contributors);
 
-    while (room.community_cards.size() < 5 && !room.deck.empty()) deal_community(room, 1);
-
-    struct EvalRow { int seat_idx; HandEval hand; };
-    std::vector<EvalRow> evals;
-    for (int seat_idx : in_hand) {
-      PlayerState* p = get_player(room, seat_idx);
-      if (!p) continue;
-      std::vector<Card> cards = p->hand;
-      cards.insert(cards.end(), room.community_cards.begin(), room.community_cards.end());
-      evals.push_back({seat_idx, best_hand(cards)});
-    }
-    std::sort(evals.begin(), evals.end(), [&](const EvalRow& a, const EvalRow& b) { return compare_hands(a.hand, b.hand) > 0; });
-
-    HandEval best = evals.front().hand;
-    std::vector<int> winners;
-    for (const auto& row : evals) if (compare_hands(row.hand, best) == 0) winners.push_back(row.seat_idx);
-    int win_amount = winners.empty() ? 0 : room.pot / static_cast<int>(winners.size());
-    for (int seat_idx : winners) {
-      PlayerState* p = get_player(room, seat_idx);
-      if (p) p->chips += win_amount;
-    }
-    room.pot = 0;
-    room.round = "HAND_OVER";
-    {
-      std::ostringstream names;
-      for (size_t i = 0; i < winners.size(); ++i) {
-        if (i) names << " & ";
-        names << room.seats[winners[i]].name;
+    std::map<int, int> awarded_by_seat;
+    std::vector<int> hand_winner_order;
+    auto note_winner = [&](int seat_idx, int amount) {
+      if (amount <= 0) return;
+      awarded_by_seat[seat_idx] += amount;
+      if (std::find(hand_winner_order.begin(), hand_winner_order.end(), seat_idx) == hand_winner_order.end()) {
+        hand_winner_order.push_back(seat_idx);
       }
-      broadcast_activity(room, "Game Over. " + names.str() + " wins with " + best.desc + "!");
+    };
+
+    std::string hand_desc = "All others folded";
+    if (in_hand.size() == 1) {
+      const int winner = in_hand.front();
+      int awarded = 0;
+      for (const auto& pot : pots) awarded += pot.amount;
+      PlayerState* p = get_player(room, winner);
+      if (p) p->chips += awarded;
+      note_winner(winner, awarded);
+      broadcast_activity(room, "Game Over. " + room.seats[winner].name + " wins (all others folded)!");
+    } else {
+      while (room.community_cards.size() < 5 && !room.deck.empty()) deal_community(room, 1);
+
+      struct EvalRow {
+        int seat_idx;
+        HandEval hand;
+      };
+      std::vector<EvalRow> evals;
+      for (int seat_idx : in_hand) {
+        PlayerState* p = get_player(room, seat_idx);
+        if (!p) continue;
+        std::vector<Card> cards = p->hand;
+        cards.insert(cards.end(), room.community_cards.begin(), room.community_cards.end());
+        evals.push_back({seat_idx, engine::best_hand(cards)});
+      }
+
+      const bool has_side_pots = pots.size() > 1;
+      for (size_t pot_index = 0; pot_index < pots.size(); ++pot_index) {
+        const auto& pot = pots[pot_index];
+        std::vector<int> eligible;
+        for (int seat_idx : pot.eligible_seat_indices) {
+          if (std::any_of(evals.begin(), evals.end(), [&](const EvalRow& row) { return row.seat_idx == seat_idx; })) {
+            eligible.push_back(seat_idx);
+          }
+        }
+        if (eligible.empty()) continue;
+
+        const EvalRow* best_row = nullptr;
+        for (const auto& row : evals) {
+          if (std::find(eligible.begin(), eligible.end(), row.seat_idx) == eligible.end()) continue;
+          if (best_row == nullptr || engine::compare_hands(row.hand, best_row->hand) > 0) {
+            best_row = &row;
+          }
+        }
+        if (best_row == nullptr) continue;
+
+        std::vector<int> winners;
+        for (const auto& row : evals) {
+          if (std::find(eligible.begin(), eligible.end(), row.seat_idx) == eligible.end()) continue;
+          if (engine::compare_hands(row.hand, best_row->hand) == 0) winners.push_back(row.seat_idx);
+        }
+        if (winners.empty()) continue;
+
+        const int share = pot.amount / static_cast<int>(winners.size());
+        int odd_chips = pot.amount % static_cast<int>(winners.size());
+        std::vector<int> odd_chip_order = winners_by_odd_chip_priority(room, winners);
+        for (int seat_idx : winners) {
+          PlayerState* p = get_player(room, seat_idx);
+          if (p) p->chips += share;
+          note_winner(seat_idx, share);
+        }
+        for (int seat_idx : odd_chip_order) {
+          if (odd_chips-- <= 0) break;
+          PlayerState* p = get_player(room, seat_idx);
+          if (p) p->chips += 1;
+          note_winner(seat_idx, 1);
+        }
+
+        const std::string pot_label = pot_index == 0 ? "main pot" : "side pot #" + std::to_string(pot_index);
+        broadcast_activity(
+            room,
+            join_winner_names(room, winners) + " wins " + pot_label + " $" + std::to_string(pot.amount) + " with " +
+                best_row->hand.desc + "!");
+        if (!has_side_pots && pot_index == 0) {
+          hand_desc = best_row->hand.desc;
+        } else {
+          hand_desc = "Side pots settled";
+        }
+      }
     }
+
+    room.pot = 0;
+    room.round = engine::to_string(RoundPhase::HandOver);
     nebula::poker::HandOver msg;
     msg.set_handnum(room.hand_num);
     msg.set_totalhands(room.total_hands);
-    msg.set_desc(best.desc);
-    for (int seat_idx : winners) {
+    msg.set_desc(hand_desc);
+    for (int seat_idx : hand_winner_order) {
       auto* w = msg.add_winners();
       w->set_seatidx(seat_idx);
       w->set_name(room.seats[seat_idx].name);
@@ -2962,7 +2908,7 @@ class PokerServer {
       return;
     }
     if (get_actable_seats(room).empty()) {
-      room.round = "SHOWDOWN";
+      room.round = engine::to_string(RoundPhase::Showdown);
       finish_hand(room);
       return;
     }
@@ -3053,32 +2999,53 @@ class PokerServer {
       }
       room.pending_action_seats.erase(seat_idx);
     } else if (type == "raise") {
-      int raise_by = std::max(room.min_raise, action.raiseby());
+      const int requested_raise_by = action.raiseby();
+      if (requested_raise_by < room.min_raise) {
+        reject_illegal_action(
+            actor_socket_id,
+            "raise is below minimum re-raise (" + std::to_string(room.min_raise) + ")");
+        return;
+      }
+      const int raise_by = requested_raise_by;
       if (p->chips < call_amt + raise_by) {
         reject_illegal_action(actor_socket_id, "insufficient chips for requested raise");
         return;
       }
       place_bet(room, seat_idx, call_amt + raise_by);
       room.current_max_bet = p->current_bet;
+      room.min_raise = raise_by;
       room.pending_action_seats.clear();
       for (int idx : get_actable_seats(room)) room.pending_action_seats.insert(idx);
       room.pending_action_seats.erase(seat_idx);
       broadcast_activity(room, room.seats[seat_idx].name + " Raises to " + std::to_string(p->current_bet) + ".");
       broadcast_player_action(room, seat_idx, "RAISE " + std::to_string(p->current_bet));
     } else if (type == "allin") {
+      const int prev_max_bet = room.current_max_bet;
+      const int prev_min_raise = room.min_raise;
       int all = p->chips;
       if (all <= 0) {
         reject_illegal_action(actor_socket_id, "no chips left for all-in");
         return;
       } else {
         place_bet(room, seat_idx, all);
-        if (p->current_bet > room.current_max_bet) {
+        if (p->current_bet > prev_max_bet) {
           room.current_max_bet = p->current_bet;
-          room.pending_action_seats.clear();
-          for (int idx : get_actable_seats(room)) room.pending_action_seats.insert(idx);
-          room.pending_action_seats.erase(seat_idx);
-          broadcast_activity(room, room.seats[seat_idx].name + " ALL-IN to " + std::to_string(p->current_bet) + ".");
-          broadcast_player_action(room, seat_idx, "ALL-IN " + std::to_string(p->current_bet));
+          const int raise_by = p->current_bet - prev_max_bet;
+          if (raise_by >= prev_min_raise) {
+            room.min_raise = raise_by;
+            room.pending_action_seats.clear();
+            for (int idx : get_actable_seats(room)) room.pending_action_seats.insert(idx);
+            room.pending_action_seats.erase(seat_idx);
+            broadcast_activity(room, room.seats[seat_idx].name + " ALL-IN to " + std::to_string(p->current_bet) + ".");
+            broadcast_player_action(room, seat_idx, "ALL-IN " + std::to_string(p->current_bet));
+          } else {
+            room.pending_action_seats.erase(seat_idx);
+            broadcast_activity(
+                room,
+                room.seats[seat_idx].name + " is ALL-IN to " + std::to_string(p->current_bet) +
+                    " (short raise; betting not reopened).");
+            broadcast_player_action(room, seat_idx, "ALL-IN " + std::to_string(p->current_bet));
+          }
         } else {
           room.pending_action_seats.erase(seat_idx);
           broadcast_activity(room, room.seats[seat_idx].name + " is ALL-IN!");
@@ -3151,7 +3118,7 @@ class PokerServer {
     room.closing = !reusable_friend_room;
     room.started = false;
     room.status = reusable_friend_room ? "room_lobby" : "closed";
-    room.round = "WAITING";
+    room.round = engine::to_string(RoundPhase::Waiting);
     room.active_seat_idx = -1;
     room.pending_action_seats.clear();
     if (!reason.empty()) broadcast_activity(room, reason);
@@ -3434,7 +3401,7 @@ class PokerServer {
     broadcast_game(room);
     if (room.started && !room.closing && session.seat_idx >= 0) {
       replay_missed_events(session, room);
-      if (room.round != "HAND_OVER") request_turn(room);
+      if (engine::round_phase_from_string(room.round) != RoundPhase::HandOver) request_turn(room);
     }
   }
 

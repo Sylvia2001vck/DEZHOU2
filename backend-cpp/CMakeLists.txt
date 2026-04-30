@@ -44,6 +44,9 @@ endif()
 add_executable(
   nebula-poker-server
   src/main.cpp
+  src/engine/holdem_evaluator.cpp
+  src/engine/pot_manager.cpp
+  src/engine/round_phase.cpp
 )
 
 set(PROTO_FILE ${CMAKE_CURRENT_SOURCE_DIR}/proto/poker.proto)

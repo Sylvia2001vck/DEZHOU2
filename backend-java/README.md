@@ -47,6 +47,31 @@
 | `NEBULA_BRIDGE_SECRET` | 与 C++ 一致，用于 `match-notify` |
 | `NEBULA_MATCH_ID_TRACE` | 设为 `1` 时，C++ 在 `rooms/create` 对 `matchId` 打 stderr（幂等命中 vs 新建），仅用于验证 |
 
+### 本地密钥与中间件（不入库）
+
+1. 复制模板并只留在本机编辑：
+
+   ```bash
+   cd backend-java
+   cp .env.local.example .env.local
+   ```
+
+2. 用编辑器打开 **`.env.local`**，把 `NEBULA_BRIDGE_SECRET`、MySQL 密码等改成你的真实值。该文件已在仓库 **`.gitignore`** 中，**不会被 `git add` 进仓库**。
+
+3. 启动方式任选其一：
+
+   ```bash
+   # A) 手动 source 再 java
+   source .env.local
+   java -jar target/nebula-gateway.jar
+
+   # B) 脚本（默认 PORT=8080、连本机 3101；可被环境变量覆盖）
+   chmod +x run-gateway.sh
+   ./run-gateway.sh
+   ```
+
+4. **C++** 若要与 Java 校验 `match-notify`，请在起 C++ 的终端里设置 **同一个** `NEBULA_BRIDGE_SECRET`（可手写 `export`，或自建 `backend-cpp/.env.local` 自行 `source`，勿提交）。
+
 ---
 
 ## 编译与冒烟验证（云或本地，一步不漏）
