@@ -4,20 +4,37 @@
 #
 # MySQL / Redis 在宿主机或腾讯云托管时，不要用 127.0.0.1（那是容器自己）。
 # 可填云数据库内网地址；若服务跑在宿主机，用 extra_hosts 里的 host.docker.internal。
+#
+# 务必将 Java 与 C++ 放在同一 compose 网络。
+# C++ 容器固定名为 nebula-room-worker（便于内网 DNS 解析；勿与本机其它栈重名）。
+# 勿在 shell 里 export NEBULA_ROOM_WORKER_HOST=127.0.0.1，否则会覆盖 compose 注入、导致桥连不上。
+
+networks:
+  nebula:
+    driver: bridge
 
 services:
   room-worker:
+    container_name: nebula-room-worker
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.room-worker
     image: nebula-room-worker:latest
     restart: unless-stopped
+    networks:
+      - nebula
     env_file:
       - .env
     environment:
       NEBULA_REPO_ROOT: /app
       NEBULA_ROOM_WORKER_BIND: "0.0.0.0"
       NEBULA_ROOM_WORKER_PORT: "3101"
+    healthcheck:
+      test: ["CMD-SHELL", "ss -ltn | grep -q ':3101 ' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
     # 无对外端口；仅网关容器访问
 
   gateway:
@@ -26,8 +43,11 @@ services:
       dockerfile: deploy/docker/Dockerfile.gateway
     image: nebula-gateway:latest
     restart: unless-stopped
+    networks:
+      - nebula
     depends_on:
-      - room-worker
+      room-worker:
+        condition: service_healthy
     ports:
       - "${GATEWAY_PUBLISH_PORT:-8080}:8080"
     env_file:
@@ -35,7 +55,7 @@ services:
     environment:
       NEBULA_REPO_ROOT: /app
       PORT: "8080"
-      NEBULA_ROOM_WORKER_HOST: room-worker
+      NEBULA_ROOM_WORKER_HOST: nebula-room-worker
       NEBULA_ROOM_WORKER_PORT: "3101"
     extra_hosts:
       - "host.docker.internal:host-gateway"
