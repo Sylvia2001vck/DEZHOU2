@@ -1,11 +1,11 @@
 # Docker 部署（腾讯云 CVM）
 
-双容器：**gateway**（Java，对外 `8080`）+ **room-worker**（C++，仅 compose 内网）。
+双进程：**gateway**（Java，桥接网络，对外映射 **8080**）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`，避免容器 DNS 解析失败）。
 
 ## 前置
 
 - CVM 安装 **Docker** 与 **Compose V2**（`docker compose version`）。
-- 安全组放行 **8080**（或你改的 `GATEWAY_PUBLISH_PORT`）。
+- **安全组**：只对公网放行 **8080**（或 `GATEWAY_PUBLISH_PORT`），**不要**放行 **3101**（C++ 在 host 上监听，仅给本机/网关用）。
 - 腾讯云 **MySQL / Redis** 与 CVM 同 VPC，使用**内网地址**；`NEBULA_BRIDGE_SECRET` 与线上一致。
 
 ## 配置
@@ -41,17 +41,23 @@ docker compose logs -f
 
 表示 **Java 连不上 C++**（不是 MySQL 的典型报错）。常见原因：
 
-1. **宿主机上 `export NEBULA_ROOM_WORKER_HOST=127.0.0.1`**  
-   会覆盖 compose 为网关注入的 **`nebula-room-worker` 容器名**，容器内 `127.0.0.1` 是网关自己，没有 3101 → 断连。  
-   **处理**：`unset NEBULA_ROOM_WORKER_HOST`，`.env` 里也不要写这两项，然后 `docker compose up -d`。
-2. **C++ 崩了或未监听**  
-   `docker compose logs room-worker --tail 80`，应能看到 `listening on 0.0.0.0:3101`。
-3. **网络 / DNS**  
-   更新 compose 后务必 **`docker compose down` 再 `up`**；确认两个容器在同一网络：  
-   `docker inspect docker-gateway-1 nebula-room-worker --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'`  
-   应出现同一个 `…_nebula` 网桥名。
+1. **宿主机上 `export NEBULA_ROOM_WORKER_HOST=127.0.0.1`** 或在 `.env` 里写死错误主机  
+   容器里 `127.0.0.1` 是**容器自己**，连不到宿主机上的 C++。  
+   **处理**：`unset NEBULA_ROOM_WORKER_HOST`，从 `.env` 中删除 `NEBULA_ROOM_WORKER_*`，依靠 compose 里默认的 **`host.docker.internal`**。
+2. **`host.docker.internal` 在你这台机上不生效**（少见）  
+   把 `docker-compose.yaml` 里 gateway 的 `NEBULA_ROOM_WORKER_HOST` 改成**宿主机内网 IP**（例如 `172.19.0.5`，与 `ip -4 addr` / `ip route` 一致），保存后 `docker compose up -d`。
+3. **C++ 未监听**  
+   `docker compose logs room-worker --tail 80`，应能看到 `listening on 0.0.0.0:3101`。宿主机执行 `ss -tlnp | grep 3101` 应有 `nebula-poker-server`。
+4. 更新 compose 后务必 **`docker compose down` 再 `up`**。
 
-在网关容器内（可选）：`getent hosts nebula-room-worker` 应能解析出 IP（旧版 compose 下服务名 `room-worker` 可能不注册 DNS，已改为固定容器名）。
+验证（网关容器内应能连上宿主机 3101）：
+
+```bash
+docker compose exec gateway curl -sv http://host.docker.internal:3101/ 2>&1 | head -5
+# 可能返回 404，有 HTTP 回应即说明 TCP 通
+```
+
+在网关容器内：`getent hosts host.docker.internal` 应有一行 IP。
 
 ## 静态资源 BGM
 

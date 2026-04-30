@@ -2,12 +2,13 @@
 #   cd deploy/docker && cp env.example .env && nano .env
 #   docker compose build && docker compose up -d
 #
-# MySQL / Redis 在宿主机或腾讯云托管时，不要用 127.0.0.1（那是容器自己）。
-# 可填云数据库内网地址；若服务跑在宿主机，用 extra_hosts 里的 host.docker.internal。
+# MySQL / Redis：容器内用 host.docker.internal 访问宿主机上的服务（勿用 127.0.0.1）。
 #
-# 务必将 Java 与 C++ 放在同一 compose 网络。
-# C++ 容器固定名为 nebula-room-worker（便于内网 DNS 解析；勿与本机其它栈重名）。
-# 勿在 shell 里 export NEBULA_ROOM_WORKER_HOST=127.0.0.1，否则会覆盖 compose 注入、导致桥连不上。
+# C++ 使用 host 网络在宿主机上监听 3101，避免 compose 内嵌 DNS 不解析容器名（UnknownHostException）。
+# 网关通过 host.docker.internal:3101 连 C++（已配 extra_hosts: host-gateway）。
+# 若仍失败，可把网关的 NEBULA_ROOM_WORKER_HOST 改成宿主机内网 IP（如 172.19.0.5），与 `ip -4 route` 里默认网卡一致。
+# 安全组请勿对公网放行 3101，只放行网关端口（如 8080）。
+# 勿 export NEBULA_ROOM_WORKER_HOST=127.0.0.1（在网关容器内 127.0.0.1 是自己）。
 
 networks:
   nebula:
@@ -21,8 +22,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.room-worker
     image: nebula-room-worker:latest
     restart: unless-stopped
-    networks:
-      - nebula
+    network_mode: host
     env_file:
       - .env
     environment:
@@ -35,7 +35,6 @@ services:
       timeout: 3s
       retries: 12
       start_period: 20s
-    # 无对外端口；仅网关容器访问
 
   gateway:
     build:
@@ -55,7 +54,7 @@ services:
     environment:
       NEBULA_REPO_ROOT: /app
       PORT: "8080"
-      NEBULA_ROOM_WORKER_HOST: nebula-room-worker
+      NEBULA_ROOM_WORKER_HOST: host.docker.internal
       NEBULA_ROOM_WORKER_PORT: "3101"
     extra_hosts:
       - "host.docker.internal:host-gateway"
