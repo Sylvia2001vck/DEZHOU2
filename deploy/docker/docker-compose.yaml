@@ -7,7 +7,7 @@
 # C++ 使用 host 网络在宿主机上监听 3101，避免 compose 内嵌 DNS 不解析容器名（UnknownHostException）。
 # 网关通过 host.docker.internal:3101 连 C++（已配 extra_hosts: host-gateway）。
 # 若仍失败，可把网关的 NEBULA_ROOM_WORKER_HOST 改成宿主机内网 IP（如 172.19.0.5），与 `ip -4 route` 里默认网卡一致。
-# 安全组请勿对公网放行 3101，只放行网关端口（如 8080）。
+# 安全组请勿对公网放行 3101；对外默认映射宿主机 8088→容器内 8080（可用 GATEWAY_PUBLISH_PORT 改）。
 # 勿 export NEBULA_ROOM_WORKER_HOST=127.0.0.1（在网关容器内 127.0.0.1 是自己）。
 
 networks:
@@ -48,7 +48,7 @@ services:
       room-worker:
         condition: service_healthy
     ports:
-      - "${GATEWAY_PUBLISH_PORT:-8080}:8080"
+      - "${GATEWAY_PUBLISH_PORT:-8088}:8080"
     env_file:
       - .env
     environment:

@@ -1,11 +1,11 @@
 # Docker 部署（腾讯云 CVM）
 
-双进程：**gateway**（Java，桥接网络，对外映射 **8080**）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`，避免容器 DNS 解析失败）。
+双进程：**gateway**（Java，桥接网络，默认 **宿主机 8088 → 容器内 8080**，可用 `GATEWAY_PUBLISH_PORT` 改）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`）。
 
 ## 前置
 
 - CVM 安装 **Docker** 与 **Compose V2**（`docker compose version`）。
-- **安全组**：只对公网放行 **8080**（或 `GATEWAY_PUBLISH_PORT`），**不要**放行 **3101**（C++ 在 host 上监听，仅给本机/网关用）。
+- **安全组**：对公网放行 **`GATEWAY_PUBLISH_PORT`（默认 8088）**，**不要**放行 **3101**。
 - 腾讯云 **MySQL / Redis** 与 CVM 同 VPC，使用**内网地址**；`NEBULA_BRIDGE_SECRET` 与线上一致。
 
 ## 配置
@@ -79,16 +79,11 @@ docker compose -f deploy/docker/docker-compose.yaml --project-directory deploy/d
 
 ---
 
-## 释放宿主机端口（与 Docker 冲突时）
+## 宿主机端口
 
-若 `8080` 已被本机 Java 占用：
-
-```bash
-sudo ss -tlnp | grep 8080
-sudo kill 2401189
-```
-
-把 `2401189` 换成你机器上**实际的 PID**（不要用尖括号或字面量 `<PID>`）。
+- 默认 **8088**，避免与本机在宿主机上直接跑的 **`java -jar …`（常占 8080）**冲突。
+- 若仍冲突，在 `.env` 里改 `GATEWAY_PUBLISH_PORT`（例如 `13000`），并在安全组放行同端口。
+- **长期建议**：生产只保留 **Docker 网关** 或只保留**本机 Java**，不要两个同时占临近端口。
 
 ---
 
