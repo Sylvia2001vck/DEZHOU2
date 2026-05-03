@@ -4,6 +4,8 @@ build/
 # Java / Maven (never commit build output)
 backend-java/target/
 backend-java/dependency-reduced-pom.xml
+backend-spring/target/
+backend-spring/dependency-reduced-pom.xml
 # Local secrets (copy from backend-java/.env.local.example)
 backend-java/.env.local
 deploy/docker/.env
