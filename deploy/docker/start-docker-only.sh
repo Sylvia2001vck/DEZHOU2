@@ -14,6 +14,16 @@ dbg_log() {
   printf '{"sessionId":"f4aaa4","runId":"%s","hypothesisId":"%s","location":"deploy/docker/start-docker-only.sh","message":"%s","data":%s,"timestamp":%s}\n' \
     "$RUN_ID" "$hypothesis" "$message" "$data" "$(date +%s%3N)" >> "$LOG_FILE"
 }
+
+port_snapshot() {
+  local tag="$1"
+  local ss_line
+  ss_line="$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " || true)"
+  echo "[nebula][${tag}] ${ss_line:-<empty>}"
+  # #region agent log
+  dbg_log "H5" "port_snapshot_${tag}" "{\"ss\":\"$(printf '%s' "$ss_line" | sed 's/"/\\"/g')\"}"
+  # #endregion
+}
 #endregion
 
 PORT=8080
@@ -32,6 +42,7 @@ dbg_log "H1" "script_start" "{\"port\":\"${PORT}\",\"pwd\":\"$(pwd)\"}"
 #endregion
 
 echo "[nebula] host port: ${PORT}"
+port_snapshot "start"
 
 echo "[nebula] docker compose down (remove old gateway + release docker-proxy on :${PORT})..."
 #region agent log
@@ -39,6 +50,7 @@ dbg_log "H2" "before_down_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null 
 #endregion
 docker compose down --remove-orphans 2>/dev/null || true
 sleep 2
+port_snapshot "after_down"
 #region agent log
 dbg_log "H2" "after_down_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
 #endregion
@@ -74,6 +86,7 @@ kill_on_port_by_comm docker-proxy
 sleep 1
 kill_on_port_by_comm java
 kill_on_port_by_comm docker-proxy
+port_snapshot "after_kill"
 
 for p in $(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u); do
   [[ -z "$p" ]] && continue
@@ -92,6 +105,7 @@ if docker compose up -d --build; then
   dbg_log "H4" "compose_up_success" "{\"status\":\"ok\"}"
   #endregion
 else
+  port_snapshot "after_up_failed"
   #region agent log
   dbg_log "H4" "compose_up_failed" "{\"status\":\"failed\",\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
   #endregion
