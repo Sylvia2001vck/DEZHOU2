@@ -4,6 +4,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+#region agent log
+LOG_FILE="$(cd ../.. && pwd)/debug-f4aaa4.log"
+RUN_ID="run-$(date +%s)-$$"
+dbg_log() {
+  local hypothesis="$1"
+  local message="$2"
+  local data="$3"
+  printf '{"sessionId":"f4aaa4","runId":"%s","hypothesisId":"%s","location":"deploy/docker/start-docker-only.sh","message":"%s","data":%s,"timestamp":%s}\n' \
+    "$RUN_ID" "$hypothesis" "$message" "$data" "$(date +%s%3N)" >> "$LOG_FILE"
+}
+#endregion
+
 PORT=8080
 if [[ -f .env ]]; then
   line="$(grep -E '^GATEWAY_PUBLISH_PORT=' .env | tail -1 || true)"
@@ -15,11 +27,21 @@ if [[ -f .env ]]; then
   fi
 fi
 
+#region agent log
+dbg_log "H1" "script_start" "{\"port\":\"${PORT}\",\"pwd\":\"$(pwd)\"}"
+#endregion
+
 echo "[nebula] host port: ${PORT}"
 
 echo "[nebula] docker compose down (remove old gateway + release docker-proxy on :${PORT})..."
+#region agent log
+dbg_log "H2" "before_down_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
+#endregion
 docker compose down --remove-orphans 2>/dev/null || true
 sleep 2
+#region agent log
+dbg_log "H2" "after_down_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
+#endregion
 
 echo "[nebula] killing listeners on :${PORT} — java (host jar) and orphan docker-proxy..."
 
@@ -62,5 +84,17 @@ for p in $(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9
 done
 
 unset NEBULA_ROOM_WORKER_HOST || true
-docker compose up -d --build
+#region agent log
+dbg_log "H3" "before_up_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
+#endregion
+if docker compose up -d --build; then
+  #region agent log
+  dbg_log "H4" "compose_up_success" "{\"status\":\"ok\"}"
+  #endregion
+else
+  #region agent log
+  dbg_log "H4" "compose_up_failed" "{\"status\":\"failed\",\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
+  #endregion
+  exit 1
+fi
 docker compose ps
