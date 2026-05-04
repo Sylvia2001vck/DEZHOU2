@@ -3407,14 +3407,27 @@ class PokerServer {
 
   void handle_take_seat(Session& session, int seat_idx, const std::string& reconnect_token) {
     Room* room = get_room(session.room_id);
-    if (!room || room->closing) return;
+    if (!room) {
+      send_error(session.socket_id, "Cannot take seat: room not found.");
+      return;
+    }
+    if (room->closing) {
+      send_error(session.socket_id, "Cannot take seat: room is closing.");
+      return;
+    }
     std::lock_guard<std::mutex> lock(room_mutex(room->room_id));
-    if (seat_idx < 0 || seat_idx >= kSeats) return;
+    if (seat_idx < 0 || seat_idx >= kSeats) {
+      send_error(session.socket_id, "Cannot take seat: invalid seat index.");
+      return;
+    }
 
     if (room->started) {
       Seat& seat = room->seats[seat_idx];
       const bool can_reclaim = can_reclaim_started_seat(seat, session, reconnect_token);
-      if (!can_reclaim) return;
+      if (!can_reclaim) {
+        send_error(session.socket_id, "Cannot take seat: this started seat cannot be reclaimed by current session.");
+        return;
+      }
       seat.socket_id = session.socket_id;
       seat.user_id = session.profile.user_id;
       if (!session.gameplay_session_id.empty()) seat.gameplay_session_id = session.gameplay_session_id;
@@ -3444,7 +3457,10 @@ class PokerServer {
       return;
     }
 
-    if (is_seat_occupied(*room, seat_idx) && room->seats[seat_idx].socket_id != session.socket_id) return;
+    if (is_seat_occupied(*room, seat_idx) && room->seats[seat_idx].socket_id != session.socket_id) {
+      send_error(session.socket_id, "Cannot take seat: seat already occupied.");
+      return;
+    }
     for (int i = 0; i < kSeats; ++i) {
       Seat& seat = room->seats[i];
       if (seat.type == Seat::Type::Player && seat.socket_id == session.socket_id) room->seats[i] = Seat{};
@@ -3489,11 +3505,32 @@ class PokerServer {
 
   void handle_toggle_ai(Session& session, int seat_idx) {
     Room* room = get_room(session.room_id);
-    if (!room || room->started || room->closing || session.socket_id != room->host_socket_id) return;
+    if (!room) {
+      send_error(session.socket_id, "Cannot toggle AI: room not found.");
+      return;
+    }
+    if (room->started) {
+      send_error(session.socket_id, "Cannot toggle AI: game already started.");
+      return;
+    }
+    if (room->closing) {
+      send_error(session.socket_id, "Cannot toggle AI: room is closing.");
+      return;
+    }
+    if (session.socket_id != room->host_socket_id) {
+      send_error(session.socket_id, "Cannot toggle AI: only host can add or remove AI.");
+      return;
+    }
     std::lock_guard<std::mutex> lock(room_mutex(room->room_id));
-    if (seat_idx < 0 || seat_idx >= kSeats) return;
+    if (seat_idx < 0 || seat_idx >= kSeats) {
+      send_error(session.socket_id, "Cannot toggle AI: invalid seat index.");
+      return;
+    }
     Seat& seat = room->seats[seat_idx];
-    if (seat.type == Seat::Type::Player) return;
+    if (seat.type == Seat::Type::Player) {
+      send_error(session.socket_id, "Cannot toggle AI: player is already seated there.");
+      return;
+    }
     if (seat.type == Seat::Type::AI) {
       seat = Seat{};
       room->players.erase(seat_idx);
