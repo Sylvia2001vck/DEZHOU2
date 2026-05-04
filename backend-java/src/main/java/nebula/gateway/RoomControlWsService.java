@@ -5,24 +5,31 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.javalin.websocket.WsContext;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Java-owned pregame room control over WS text frames.
- *
- * <p>Scope (current phase): join room, take seat, toggle AI, host detection, reconnect token emit.
+ * Java-owned room control + gameplay over WS text frames.
  */
 public final class RoomControlWsService {
   private static final int MAX_SEATS = 10;
+  private static final int SMALL_BLIND = 50;
+  private static final int BIG_BLIND = 100;
+  private static final int MIN_PLAYERS_TO_START = 2;
 
   private final AuthService auth;
   private final Gson gson = new Gson();
+  private final Random random = new Random();
   private final Map<String, Client> clients = new ConcurrentHashMap<>();
   private final Map<String, Room> rooms = new ConcurrentHashMap<>();
 
@@ -172,6 +179,15 @@ public final class RoomControlWsService {
       s.decor = "none";
       room.seats.set(seatIdx, s);
       c.seatIdx = seatIdx;
+      if (!room.players.containsKey(seatIdx)) {
+        PlayerState p = new PlayerState();
+        p.seatIdx = seatIdx;
+        p.type = "player";
+        p.name = s.name;
+        p.chips = room.initialChips;
+        p.totalBuyIn = room.initialChips;
+        room.players.put(seatIdx, p);
+      }
       c.sessionId = c.sessionId == null || c.sessionId.isEmpty() ? randomToken() : c.sessionId;
       c.reconnectToken = randomToken();
       sendEvent(c, "seat_taken", mapOf("seatIdx", seatIdx));
@@ -211,6 +227,7 @@ public final class RoomControlWsService {
       }
       if (cur != null && "ai".equals(cur.type)) {
         room.seats.set(seatIdx, null);
+        room.players.remove(seatIdx);
       } else {
         Seat ai = new Seat();
         ai.type = "ai";
@@ -219,6 +236,16 @@ public final class RoomControlWsService {
         ai.clientId = "";
         ai.decor = "none";
         room.seats.set(seatIdx, ai);
+        PlayerState p = room.players.get(seatIdx);
+        if (p == null) p = new PlayerState();
+        p.seatIdx = seatIdx;
+        p.type = "ai";
+        p.name = ai.name;
+        if (p.totalBuyIn <= 0) {
+          p.totalBuyIn = room.initialChips;
+          p.chips = room.initialChips;
+        }
+        room.players.put(seatIdx, p);
       }
       broadcastRoomState(room);
     }
@@ -260,29 +287,32 @@ public final class RoomControlWsService {
         sendEvent(c, "error_msg", mapOf("msg", "Only host can start game."));
         return;
       }
-      int occupied = 0;
-      for (int i = 0; i < MAX_SEATS; i++) {
-        if (room.seats.get(i) != null) occupied++;
-      }
-      if (occupied < 2) {
+      List<Integer> activeSeats = activeSeatList(room);
+      if (activeSeats.size() < MIN_PLAYERS_TO_START) {
         sendEvent(c, "error_msg", mapOf("msg", "At least 2 players (or AI) are required."));
         return;
       }
       room.totalHands = payload.has("totalHands") ? Math.max(1, payload.get("totalHands").getAsInt()) : room.totalHands;
       room.initialChips = payload.has("initialChips") ? Math.max(1000, payload.get("initialChips").getAsInt()) : room.initialChips;
       room.started = true;
-      room.handNum = 1;
-      room.round = "PRE_FLOP";
-      room.pot = 0;
-      room.currentMaxBet = 0;
-      room.minRaise = 50;
-      room.currentTurnSeatIdx = firstPlayerSeat(room);
-      room.dealerSeatIdx = room.currentTurnSeatIdx;
+      room.handHistory.clear();
+      room.handNum = 0;
+      room.dealerSeatIdx = firstPlayerSeat(room);
+      for (int seatIdx : activeSeats) {
+        PlayerState p = room.players.computeIfAbsent(seatIdx, k -> new PlayerState());
+        p.seatIdx = seatIdx;
+        p.type = room.seats.get(seatIdx).type;
+        p.name = room.seats.get(seatIdx).name;
+        if (p.totalBuyIn <= 0) p.totalBuyIn = room.initialChips;
+        if (p.chips <= 0) p.chips = room.initialChips;
+      }
+      startNewHandLocked(room);
       broadcastRoomState(room);
       broadcastGameState(room);
       if (room.currentTurnSeatIdx >= 0) {
         broadcastTurn(room, room.currentTurnSeatIdx);
       }
+      processAiTurns(room);
     }
   }
 
@@ -294,15 +324,8 @@ public final class RoomControlWsService {
         sendEvent(c, "error_msg", mapOf("msg", "Not your turn."));
         return;
       }
-      String type = safe(payload.has("type") ? payload.get("type").getAsString() : "").toUpperCase();
-      if (type.isEmpty()) type = "CHECK";
-      broadcastPlayerAction(room, c.seatIdx, type);
-      int next = nextPlayerSeat(room, c.seatIdx);
-      room.currentTurnSeatIdx = next;
-      if (next >= 0) {
-        broadcastTurn(room, next);
-      }
-      broadcastGameState(room);
+      applyActionLocked(room, c.seatIdx, payload);
+      processAiTurns(room);
     }
   }
 
@@ -312,11 +335,15 @@ public final class RoomControlWsService {
     synchronized (room) {
       if (!room.started) return;
       if (!c.socketId.equals(room.hostSocketId)) return;
-      room.handNum += 1;
-      room.round = "PRE_FLOP";
-      room.currentTurnSeatIdx = firstPlayerSeat(room);
+      if (!"HAND_OVER".equals(room.round) && !"WAITING".equals(room.round)) return;
+      if (room.handNum >= room.totalHands) return;
+      startNewHandLocked(room);
       broadcastGameState(room);
-      if (room.currentTurnSeatIdx >= 0) broadcastTurn(room, room.currentTurnSeatIdx);
+      broadcastRoomState(room);
+      if (room.currentTurnSeatIdx >= 0) {
+        broadcastTurn(room, room.currentTurnSeatIdx);
+      }
+      processAiTurns(room);
     }
   }
 
@@ -356,8 +383,8 @@ public final class RoomControlWsService {
     Map<String, Object> settings = new HashMap<>();
     settings.put("totalHands", room.totalHands);
     settings.put("initialChips", room.initialChips);
-    settings.put("smallBlind", 50);
-    settings.put("bigBlind", 100);
+    settings.put("smallBlind", SMALL_BLIND);
+    settings.put("bigBlind", BIG_BLIND);
 
     Map<String, Object> state = new HashMap<>();
     state.put("roomId", room.roomId);
@@ -414,22 +441,23 @@ public final class RoomControlWsService {
 
   private void broadcastGameState(Room room) {
     List<Map<String, Object>> players = new ArrayList<>();
-    for (int i = 0; i < MAX_SEATS; i++) {
-      Seat s = room.seats.get(i);
-      if (s == null) continue;
+    for (int seatIdx : activeSeatList(room)) {
+      Seat s = room.seats.get(seatIdx);
+      PlayerState p = room.players.get(seatIdx);
+      if (s == null || p == null) continue;
       players.add(
           mapOf(
-              "seatIdx", i,
+              "seatIdx", seatIdx,
               "name", s.name,
               "type", s.type,
-              "chips", room.initialChips,
-              "currentBet", 0,
-              "isFolded", false,
-              "isBankrupt", false,
-              "totalBuyIn", room.initialChips));
+              "chips", p.chips,
+              "currentBet", p.currentBet,
+              "isFolded", p.folded,
+              "isBankrupt", p.chips <= 0,
+              "totalBuyIn", p.totalBuyIn));
     }
     Map<String, Object> settings =
-        mapOf("totalHands", room.totalHands, "initialChips", room.initialChips, "smallBlind", 50, "bigBlind", 100);
+        mapOf("totalHands", room.totalHands, "initialChips", room.initialChips, "smallBlind", SMALL_BLIND, "bigBlind", BIG_BLIND);
     Map<String, Object> game =
         mapOf(
             "roomId", room.roomId,
@@ -442,7 +470,7 @@ public final class RoomControlWsService {
             "activeSeatIdx", room.currentTurnSeatIdx,
             "pot", room.pot,
             "round", room.round,
-            "communityCards", new ArrayList<>(),
+            "communityCards", toCardMaps(room.communityCards),
             "currentMaxBet", room.currentMaxBet,
             "minRaise", room.minRaise,
             "players", players);
@@ -454,23 +482,531 @@ public final class RoomControlWsService {
   }
 
   private int firstPlayerSeat(Room room) {
-    for (int i = 0; i < MAX_SEATS; i++) {
-      Seat s = room.seats.get(i);
-      if (s == null) continue;
-      if ("player".equals(s.type) || "ai".equals(s.type)) return i;
+    List<Integer> seats = activeSeatList(room);
+    return seats.isEmpty() ? -1 : seats.get(0);
+  }
+
+  private int nextPlayerSeat(Room room, int current) {
+    return nextSeatFrom(room, current, activeSeatList(room));
+  }
+
+  private void applyActionLocked(Room room, int seatIdx, JsonObject payload) {
+    PlayerState actor = room.players.get(seatIdx);
+    if (actor == null || actor.folded || actor.chips <= 0) return;
+    String type = safe(payload.has("type") ? payload.get("type").getAsString() : "").toLowerCase();
+    int callNeed = Math.max(0, room.currentMaxBet - actor.currentBet);
+    int paid = 0;
+    String actionText;
+
+    switch (type) {
+      case "fold" -> {
+        actor.folded = true;
+        actionText = "FOLD";
+      }
+      case "allin" -> {
+        paid = actor.chips;
+        actor.chips = 0;
+        actor.currentBet += paid;
+        actor.allIn = true;
+        int raiseDelta = actor.currentBet - room.currentMaxBet;
+        if (raiseDelta > 0) {
+          room.currentMaxBet = actor.currentBet;
+          room.minRaise = Math.max(room.minRaise, raiseDelta);
+          resetPendingAfterAggression(room, seatIdx);
+          actionText = "ALL-IN $" + paid;
+        } else {
+          actionText = callNeed > 0 ? "CALL $" + paid : "ALL-IN $" + paid;
+        }
+        room.pot += paid;
+      }
+      case "raise" -> {
+        int raiseBy = payload.has("raiseBy") ? Math.max(1, payload.get("raiseBy").getAsInt()) : room.minRaise;
+        int target = room.currentMaxBet + Math.max(room.minRaise, raiseBy);
+        int need = Math.max(0, target - actor.currentBet);
+        if (need >= actor.chips) {
+          // degrade to all-in
+          paid = actor.chips;
+          actor.chips = 0;
+          actor.currentBet += paid;
+          actor.allIn = true;
+          int raiseDelta = actor.currentBet - room.currentMaxBet;
+          if (raiseDelta > 0) {
+            room.currentMaxBet = actor.currentBet;
+            room.minRaise = Math.max(room.minRaise, raiseDelta);
+            resetPendingAfterAggression(room, seatIdx);
+          }
+          room.pot += paid;
+          actionText = "ALL-IN $" + paid;
+        } else {
+          paid = need;
+          actor.chips -= paid;
+          actor.currentBet += paid;
+          room.pot += paid;
+          int raiseDelta = actor.currentBet - room.currentMaxBet;
+          if (raiseDelta > 0) {
+            room.currentMaxBet = actor.currentBet;
+            room.minRaise = Math.max(room.minRaise, raiseDelta);
+          }
+          resetPendingAfterAggression(room, seatIdx);
+          actionText = callNeed > 0 ? "RAISE $" + raiseDelta : "BET $" + raiseDelta;
+        }
+      }
+      default -> {
+        // call/check
+        if (callNeed <= 0) {
+          actionText = "CHECK";
+        } else {
+          paid = Math.min(callNeed, actor.chips);
+          actor.chips -= paid;
+          actor.currentBet += paid;
+          room.pot += paid;
+          if (actor.chips == 0) actor.allIn = true;
+          actionText = paid < callNeed ? "ALL-IN $" + paid : "CALL $" + paid;
+        }
+      }
+    }
+
+    room.pendingToAct.remove(seatIdx);
+    broadcastPlayerAction(room, seatIdx, actionText);
+
+    settleStreetOrAdvanceTurn(room);
+    if ("HAND_OVER".equals(room.round)) {
+      maybeFinishMatch(room);
+      broadcastRoomState(room);
+    }
+    broadcastGameState(room);
+    if (room.currentTurnSeatIdx >= 0 && room.started && !"HAND_OVER".equals(room.round)) {
+      broadcastTurn(room, room.currentTurnSeatIdx);
+    }
+  }
+
+  private void settleStreetOrAdvanceTurn(Room room) {
+    List<Integer> contenders = contenders(room);
+    if (contenders.size() <= 1) {
+      finishHand(room, contenders);
+      return;
+    }
+    if (room.pendingToAct.isEmpty()) {
+      // end street
+      for (int seatIdx : activeSeatList(room)) {
+        PlayerState p = room.players.get(seatIdx);
+        if (p != null) p.currentBet = 0;
+      }
+      room.currentMaxBet = 0;
+      room.minRaise = BIG_BLIND;
+      if ("PRE_FLOP".equals(room.round)) {
+        room.round = "FLOP";
+        dealCommunity(room, 3);
+      } else if ("FLOP".equals(room.round)) {
+        room.round = "TURN";
+        dealCommunity(room, 1);
+      } else if ("TURN".equals(room.round)) {
+        room.round = "RIVER";
+        dealCommunity(room, 1);
+      } else {
+        finishHand(room, contenders);
+        return;
+      }
+      resetPendingForStreet(room);
+      room.currentTurnSeatIdx = firstActionSeatForStreet(room);
+      return;
+    }
+    room.currentTurnSeatIdx = nextPendingSeat(room, room.currentTurnSeatIdx);
+  }
+
+  private void finishHand(Room room, List<Integer> contenders) {
+    room.round = "HAND_OVER";
+    room.currentTurnSeatIdx = -1;
+    List<Integer> winners = new ArrayList<>();
+    String desc;
+    List<Map<String, Object>> showdownHands = new ArrayList<>();
+
+    if (contenders.size() == 1) {
+      int winnerSeat = contenders.get(0);
+      winners.add(winnerSeat);
+      desc = "All others folded";
+    } else {
+      long bestScore = Long.MIN_VALUE;
+      for (int seatIdx : contenders) {
+        PlayerState p = room.players.get(seatIdx);
+        if (p == null) continue;
+        List<Card> all = new ArrayList<>(p.holeCards);
+        all.addAll(room.communityCards);
+        HandRank hr = bestHand(all);
+        if (hr.score > bestScore) {
+          bestScore = hr.score;
+          winners.clear();
+          winners.add(seatIdx);
+          desc = hr.desc;
+        } else if (hr.score == bestScore) {
+          winners.add(seatIdx);
+        }
+        showdownHands.add(
+            mapOf(
+                "seatIdx", seatIdx,
+                "name", p.name,
+                "hand", toCardMaps(p.holeCards)));
+      }
+      desc = winners.size() == 1 ? bestHand(concat(room.players.get(winners.get(0)).holeCards, room.communityCards)).desc : "Split pot";
+    }
+
+    int share = winners.isEmpty() ? 0 : room.pot / winners.size();
+    int rem = winners.isEmpty() ? 0 : room.pot % winners.size();
+    for (int i = 0; i < winners.size(); i++) {
+      PlayerState p = room.players.get(winners.get(i));
+      if (p == null) continue;
+      p.chips += share + (i == 0 ? rem : 0);
+    }
+
+    List<Map<String, Object>> winnerRows = new ArrayList<>();
+    for (int seatIdx : winners) {
+      PlayerState p = room.players.get(seatIdx);
+      winnerRows.add(mapOf("seatIdx", seatIdx, "name", p == null ? ("Seat " + (seatIdx + 1)) : p.name));
+    }
+    room.handHistory.add(new HandRec(room.handNum, winnerRows, desc == null ? "Hand over" : desc));
+    for (String sid : room.socketIds) {
+      Client cc = clients.get(sid);
+      if (cc == null) continue;
+      sendEvent(
+          cc,
+          "hand_over",
+          mapOf(
+              "handNum", room.handNum,
+              "totalHands", room.totalHands,
+              "winners", winnerRows,
+              "desc", desc == null ? "Hand over" : desc,
+              "showdownHands", showdownHands));
+    }
+  }
+
+  private void maybeFinishMatch(Room room) {
+    if (room.handNum < room.totalHands) return;
+    room.started = false;
+    room.round = "WAITING";
+    List<Map<String, Object>> standings = new ArrayList<>();
+    for (int seatIdx : activeSeatList(room)) {
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null) continue;
+      standings.add(
+          mapOf(
+              "seatIdx", seatIdx,
+              "type", p.type,
+              "name", p.name,
+              "chips", p.chips,
+              "buyIn", p.totalBuyIn,
+              "net", p.chips - p.totalBuyIn));
+    }
+    standings.sort((a, b) -> Integer.compare(((Number) b.get("chips")).intValue(), ((Number) a.get("chips")).intValue()));
+    for (String sid : room.socketIds) {
+      Client cc = clients.get(sid);
+      if (cc == null) continue;
+      sendEvent(
+          cc,
+          "match_over",
+          mapOf(
+              "roomId", room.roomId,
+              "totalHands", room.totalHands,
+              "scheduledHands", room.totalHands,
+              "playedHands", room.handNum,
+              "standings", standings,
+              "hands", room.handHistory));
+    }
+  }
+
+  private void startNewHandLocked(Room room) {
+    List<Integer> seats = activeSeatList(room);
+    if (seats.size() < MIN_PLAYERS_TO_START) return;
+    room.handNum += 1;
+    room.round = "PRE_FLOP";
+    room.pot = 0;
+    room.currentMaxBet = BIG_BLIND;
+    room.minRaise = BIG_BLIND;
+    room.communityCards.clear();
+    room.deck = freshDeck();
+    Collections.shuffle(room.deck, random);
+
+    // rotate dealer
+    int prevDealer = room.dealerSeatIdx;
+    room.dealerSeatIdx = nextSeatFrom(room, prevDealer, seats);
+    int sbSeat = nextSeatFrom(room, room.dealerSeatIdx, seats);
+    int bbSeat = nextSeatFrom(room, sbSeat, seats);
+
+    // reset players + deal holes
+    for (int seatIdx : seats) {
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null) continue;
+      p.folded = p.chips <= 0;
+      p.allIn = false;
+      p.currentBet = 0;
+      p.holeCards.clear();
+      if (!p.folded) {
+        p.holeCards.add(draw(room));
+        p.holeCards.add(draw(room));
+      }
+    }
+
+    // blinds
+    postBlind(room, sbSeat, SMALL_BLIND);
+    postBlind(room, bbSeat, BIG_BLIND);
+    room.currentTurnSeatIdx = nextSeatFrom(room, bbSeat, seats);
+    resetPendingForStreet(room);
+
+    // send private hands
+    for (int seatIdx : seats) {
+      Seat seat = room.seats.get(seatIdx);
+      PlayerState p = room.players.get(seatIdx);
+      if (seat == null || p == null) continue;
+      if (!"player".equals(seat.type)) continue;
+      if (seat.socketId == null || seat.socketId.isEmpty()) continue;
+      Client cc = clients.get(seat.socketId);
+      if (cc == null) continue;
+      sendEvent(cc, "private_hand", mapOf("seatIdx", seatIdx, "hand", toCardMaps(p.holeCards)));
+    }
+  }
+
+  private void processAiTurns(Room room) {
+    int guard = 64;
+    while (guard-- > 0 && room.started && room.currentTurnSeatIdx >= 0 && !"HAND_OVER".equals(room.round)) {
+      Seat seat = room.seats.get(room.currentTurnSeatIdx);
+      if (seat == null || !"ai".equals(seat.type)) return;
+      JsonObject aiAction = new JsonObject();
+      PlayerState p = room.players.get(room.currentTurnSeatIdx);
+      if (p == null) return;
+      int callNeed = Math.max(0, room.currentMaxBet - p.currentBet);
+      if (callNeed == 0) {
+        if (p.chips > room.minRaise && random.nextDouble() < 0.2) {
+          aiAction.addProperty("type", "raise");
+          aiAction.addProperty("raiseBy", room.minRaise);
+        } else {
+          aiAction.addProperty("type", "check");
+        }
+      } else {
+        if (callNeed >= p.chips) aiAction.addProperty("type", "allin");
+        else if (callNeed > p.chips / 2 && random.nextDouble() < 0.35) aiAction.addProperty("type", "fold");
+        else aiAction.addProperty("type", "call");
+      }
+      applyActionLocked(room, room.currentTurnSeatIdx, aiAction);
+    }
+  }
+
+  private void postBlind(Room room, int seatIdx, int blind) {
+    PlayerState p = room.players.get(seatIdx);
+    if (p == null || p.folded) return;
+    int pay = Math.min(p.chips, blind);
+    p.chips -= pay;
+    p.currentBet += pay;
+    room.pot += pay;
+    if (p.chips == 0) p.allIn = true;
+  }
+
+  private void resetPendingForStreet(Room room) {
+    room.pendingToAct.clear();
+    for (int seatIdx : activeSeatList(room)) {
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null || p.folded || p.allIn || p.chips <= 0) continue;
+      room.pendingToAct.add(seatIdx);
+    }
+    room.pendingToAct.remove(room.currentTurnSeatIdx);
+  }
+
+  private void resetPendingAfterAggression(Room room, int aggressorSeatIdx) {
+    room.pendingToAct.clear();
+    for (int seatIdx : activeSeatList(room)) {
+      if (seatIdx == aggressorSeatIdx) continue;
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null || p.folded || p.allIn || p.chips <= 0) continue;
+      room.pendingToAct.add(seatIdx);
+    }
+  }
+
+  private int firstActionSeatForStreet(Room room) {
+    List<Integer> seats = activeSeatList(room);
+    if (seats.isEmpty()) return -1;
+    if ("PRE_FLOP".equals(room.round)) return room.currentTurnSeatIdx;
+    // post-flop action starts from seat after dealer
+    int seat = nextSeatFrom(room, room.dealerSeatIdx, seats);
+    if (!room.pendingToAct.contains(seat)) return nextPendingSeat(room, seat);
+    room.pendingToAct.remove(seat);
+    return seat;
+  }
+
+  private int nextPendingSeat(Room room, int current) {
+    if (room.pendingToAct.isEmpty()) return -1;
+    List<Integer> seats = activeSeatList(room);
+    int idx = current;
+    for (int i = 0; i < MAX_SEATS + 1; i++) {
+      idx = nextSeatFrom(room, idx, seats);
+      if (room.pendingToAct.remove(idx)) return idx;
     }
     return -1;
   }
 
-  private int nextPlayerSeat(Room room, int current) {
-    if (current < 0) return firstPlayerSeat(room);
-    for (int step = 1; step <= MAX_SEATS; step++) {
-      int idx = (current + step) % MAX_SEATS;
-      Seat s = room.seats.get(idx);
+  private List<Integer> activeSeatList(Room room) {
+    List<Integer> out = new ArrayList<>();
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
       if (s == null) continue;
-      if ("player".equals(s.type) || "ai".equals(s.type)) return idx;
+      if (!"player".equals(s.type) && !"ai".equals(s.type)) continue;
+      out.add(i);
     }
+    return out;
+  }
+
+  private List<Integer> contenders(Room room) {
+    List<Integer> out = new ArrayList<>();
+    for (int seatIdx : activeSeatList(room)) {
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null) continue;
+      if (!p.folded) out.add(seatIdx);
+    }
+    return out;
+  }
+
+  private int nextSeatFrom(Room room, int current, List<Integer> seats) {
+    if (seats.isEmpty()) return -1;
+    if (current < 0) return seats.get(0);
+    int pos = seats.indexOf(current);
+    if (pos < 0) return seats.get(0);
+    return seats.get((pos + 1) % seats.size());
+  }
+
+  private Card draw(Room room) {
+    if (room.deck.isEmpty()) room.deck = freshDeck();
+    return room.deck.remove(room.deck.size() - 1);
+  }
+
+  private List<Card> freshDeck() {
+    List<Card> deck = new ArrayList<>(52);
+    List<String> suits = Arrays.asList("S", "H", "D", "C");
+    for (String s : suits) {
+      for (int v = 2; v <= 14; v++) {
+        Card c = new Card();
+        c.s = s;
+        c.v = v;
+        c.r = rankLabel(v);
+        deck.add(c);
+      }
+    }
+    return deck;
+  }
+
+  private static String rankLabel(int v) {
+    return switch (v) {
+      case 14 -> "A";
+      case 13 -> "K";
+      case 12 -> "Q";
+      case 11 -> "J";
+      case 10 -> "T";
+      default -> String.valueOf(v);
+    };
+  }
+
+  private List<Map<String, Object>> toCardMaps(List<Card> cards) {
+    List<Map<String, Object>> out = new ArrayList<>();
+    for (Card c : cards) {
+      out.add(mapOf("s", c.s, "r", c.r, "v", c.v));
+    }
+    return out;
+  }
+
+  private List<Card> concat(List<Card> a, List<Card> b) {
+    List<Card> out = new ArrayList<>(a);
+    out.addAll(b);
+    return out;
+  }
+
+  private HandRank bestHand(List<Card> cards) {
+    if (cards == null || cards.size() < 5) return new HandRank(0, "High Card");
+    HandRank best = null;
+    int n = cards.size();
+    for (int i = 0; i < n - 4; i++) {
+      for (int j = i + 1; j < n - 3; j++) {
+        for (int k = j + 1; k < n - 2; k++) {
+          for (int l = k + 1; l < n - 1; l++) {
+            for (int m = l + 1; m < n; m++) {
+              HandRank cur = eval5(cards.get(i), cards.get(j), cards.get(k), cards.get(l), cards.get(m));
+              if (best == null || cur.score > best.score) best = cur;
+            }
+          }
+        }
+      }
+    }
+    return best == null ? new HandRank(0, "High Card") : best;
+  }
+
+  private HandRank eval5(Card a, Card b, Card c, Card d, Card e) {
+    Card[] cards = new Card[] {a, b, c, d, e};
+    int[] cnt = new int[15];
+    Map<String, Integer> suitCnt = new HashMap<>();
+    for (Card x : cards) {
+      cnt[x.v]++;
+      suitCnt.put(x.s, suitCnt.getOrDefault(x.s, 0) + 1);
+    }
+    boolean flush = suitCnt.values().stream().anyMatch(v -> v == 5);
+    int straightHigh = straightHigh(cnt);
+
+    List<Integer> fours = new ArrayList<>();
+    List<Integer> threes = new ArrayList<>();
+    List<Integer> pairs = new ArrayList<>();
+    List<Integer> singles = new ArrayList<>();
+    for (int v = 14; v >= 2; v--) {
+      if (cnt[v] == 4) fours.add(v);
+      else if (cnt[v] == 3) threes.add(v);
+      else if (cnt[v] == 2) pairs.add(v);
+      else if (cnt[v] == 1) singles.add(v);
+    }
+
+    if (flush && straightHigh > 0) return new HandRank(score(8, straightHigh), "Straight Flush");
+    if (!fours.isEmpty()) return new HandRank(score(7, fours.get(0), singles.get(0)), "Four of a Kind");
+    if (!threes.isEmpty() && !pairs.isEmpty()) return new HandRank(score(6, threes.get(0), pairs.get(0)), "Full House");
+    if (flush) return new HandRank(score(5, sortedValues(cnt)), "Flush");
+    if (straightHigh > 0) return new HandRank(score(4, straightHigh), "Straight");
+    if (!threes.isEmpty()) return new HandRank(score(3, threes.get(0), singles), "Three of a Kind");
+    if (pairs.size() >= 2) return new HandRank(score(2, pairs.get(0), pairs.get(1), singles.get(0)), "Two Pair");
+    if (pairs.size() == 1) return new HandRank(score(1, pairs.get(0), singles), "One Pair");
+    return new HandRank(score(0, sortedValues(cnt)), "High Card");
+  }
+
+  private int straightHigh(int[] cnt) {
+    for (int hi = 14; hi >= 5; hi--) {
+      boolean ok = true;
+      for (int v = hi; v > hi - 5; v--) {
+        if (cnt[v] == 0) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return hi;
+    }
+    // wheel: A-2-3-4-5
+    if (cnt[14] > 0 && cnt[2] > 0 && cnt[3] > 0 && cnt[4] > 0 && cnt[5] > 0) return 5;
     return -1;
+  }
+
+  private List<Integer> sortedValues(int[] cnt) {
+    List<Integer> out = new ArrayList<>();
+    for (int v = 14; v >= 2; v--) {
+      for (int i = 0; i < cnt[v]; i++) out.add(v);
+    }
+    return out;
+  }
+
+  private long score(int cat, int... vals) {
+    long s = cat;
+    for (int v : vals) s = s * 15 + v;
+    return s;
+  }
+
+  private long score(int cat, List<Integer> vals) {
+    long s = cat;
+    for (int v : vals) s = s * 15 + v;
+    return s;
+  }
+
+  private long score(int cat, int first, List<Integer> tails) {
+    long s = score(cat, first);
+    for (int v : tails) s = s * 15 + v;
+    return s;
   }
 
   private static String randomToken() {
@@ -514,6 +1050,28 @@ public final class RoomControlWsService {
     String decor = "none";
   }
 
+  private static final class PlayerState {
+    int seatIdx = -1;
+    String type = "player";
+    String name = "Player";
+    int chips = 0;
+    int currentBet = 0;
+    int totalBuyIn = 0;
+    boolean folded = false;
+    boolean allIn = false;
+    List<Card> holeCards = new ArrayList<>();
+  }
+
+  private static final class Card {
+    String s;
+    String r;
+    int v;
+  }
+
+  private record HandRank(long score, String desc) {}
+
+  private record HandRec(int handNum, List<Map<String, Object>> winners, String desc) {}
+
   private static final class Room {
     final String roomId;
     final List<Seat> seats = new ArrayList<>();
@@ -530,6 +1088,11 @@ public final class RoomControlWsService {
     int currentMaxBet = 0;
     int minRaise = 50;
     String round = "WAITING";
+    Map<Integer, PlayerState> players = new HashMap<>();
+    List<Card> deck = new ArrayList<>();
+    List<Card> communityCards = new ArrayList<>();
+    Set<Integer> pendingToAct = new LinkedHashSet<>();
+    List<HandRec> handHistory = new ArrayList<>();
 
     Room(String roomId) {
       this.roomId = roomId;
