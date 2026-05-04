@@ -1125,10 +1125,13 @@
         const FORCE_OFFLINE = urlParams.get('offline') === '1';
         let IS_MULTIPLAYER = (!FORCE_OFFLINE && location.protocol !== 'file:');
         let socket = null;
+        let createProtoSocketFactory = null;
+        let socketBoundAuthUserId = 0;
         if (IS_MULTIPLAYER) {
             try {
                 const { createProtoSocket } = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
-                socket = await createProtoSocket({ protoUrl: '/proto/poker.proto' });
+                createProtoSocketFactory = createProtoSocket;
+                socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
             } catch (e) {
                 console.warn('[bootstrap] multiplayer init failed; fallback to offline mode', e);
                 IS_MULTIPLAYER = false;
@@ -2334,8 +2337,51 @@
             return null;
         }
 
+        async function waitSocketConnected(timeoutMs = 3500) {
+            if (!IS_MULTIPLAYER || !socket) return false;
+            if (socket.connected) return true;
+            return await new Promise((resolve) => {
+                let done = false;
+                const finish = (ok) => {
+                    if (done) return;
+                    done = true;
+                    try { socket.off('connect', onConnect); } catch (_) {}
+                    clearTimeout(timer);
+                    resolve(!!ok);
+                };
+                const onConnect = () => finish(true);
+                const timer = setTimeout(() => finish(!!socket?.connected), timeoutMs);
+                try { socket.on('connect', onConnect); } catch (_) {}
+            });
+        }
+
+        async function rebindSocketToCurrentSession(reason = '') {
+            if (!IS_MULTIPLAYER) return true;
+            const uid = Number(currentAuthUser?.userId || 0);
+            if (uid <= 0) return false;
+            if (socket && socket.connected && socketBoundAuthUserId === uid) return true;
+            try {
+                if (!createProtoSocketFactory) {
+                    const mod = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
+                    createProtoSocketFactory = mod?.createProtoSocket || null;
+                }
+                if (!createProtoSocketFactory) return false;
+                try { socket?.disconnect?.(); } catch (_) {}
+                mpWired = false;
+                socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
+                wireMultiplayer();
+                const ok = await waitSocketConnected(4500);
+                if (ok) socketBoundAuthUserId = uid;
+                return ok;
+            } catch (e) {
+                console.warn(`[auth-ws] rebind failed (${reason || 'unknown'})`, e);
+                return false;
+            }
+        }
+
         function updateLobbyAccountCard(user) {
             currentAuthUser = user || null;
+            socketBoundAuthUserId = user ? socketBoundAuthUserId : 0;
             const displayName = user?.displayName || user?.username || '';
             const loginUsername = user?.loginUsername || '';
             currentUsername = displayName || loginUsername || '';
@@ -2818,6 +2864,7 @@
                 const user = await syncAuthFromServer({ retries: 2, allowDowngrade: true });
                 if (user) {
                     applyAuthenticatedLobby(user, 'Signed in and ready.');
+                    await rebindSocketToCurrentSession('bootstrap');
                     await loadLobbyOverview();
                     return;
                 }
@@ -6508,6 +6555,7 @@
                         // verify with retry; do not force reload (avoids login flicker).
                         const user = await syncAuthFromServer({ retries: 3, allowDowngrade: false });
                         if (user) applyAuthenticatedLobby(user, 'Login successful.');
+                        await rebindSocketToCurrentSession('login');
                         await loadLobbyOverview().catch(() => {});
                     } catch (e) {
                         setLobbyFeedback(e?.message || 'Login failed.', true);
@@ -6536,6 +6584,7 @@
                         applyAuthenticatedLobby(data?.user, 'Registration successful.');
                         const user = await syncAuthFromServer({ retries: 3, allowDowngrade: false });
                         if (user) applyAuthenticatedLobby(user, 'Registration successful.');
+                        await rebindSocketToCurrentSession('register');
                         await loadLobbyOverview().catch(() => {});
                     } catch (e) {
                         setLobbyFeedback(e?.message || 'Registration failed.', true);
