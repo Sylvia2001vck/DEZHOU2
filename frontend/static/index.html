@@ -1198,6 +1198,10 @@
         let mpWired = false;
         let pendingJoin = false;
         let joinedRoomOnce = false;
+        let joiningMatchedRoom = false;
+        let joinRoomTimeoutTimer = null;
+        let lastHandledMatchRoom = '';
+        let lastHandledMatchAt = 0;
         let mySeatIdx = -1;
         let isHost = false;
         let lastRoomState = null;
@@ -2792,9 +2796,22 @@
 
         async function handleMatchFound(roomCode, source = 'queue') {
             if (!roomCode) return;
+            const room = String(roomCode || '').trim().toUpperCase();
+            const now = Date.now();
+            if (!room) return;
+            if (joiningMatchedRoom && room === lastHandledMatchRoom) return;
+            if (room === lastHandledMatchRoom && now - lastHandledMatchAt < 6000) return;
+            joiningMatchedRoom = true;
+            lastHandledMatchRoom = room;
+            lastHandledMatchAt = now;
             stopMatchmakingPolling();
-            setLobbyFeedback(source === 'queue' ? `Match found: ${roomCode}` : `Joining room ${roomCode}...`);
-            await enterLobbyRoom(roomCode);
+            setLobbyFeedback(source === 'queue' ? `Match found: ${room}` : `Joining room ${room}...`);
+            try {
+                await enterLobbyRoom(room);
+            } catch (e) {
+                joiningMatchedRoom = false;
+                throw e;
+            }
         }
 
         function startMatchmakingPolling() {
@@ -2823,10 +2840,11 @@
             joinedRoomOnce = false;
             wireMultiplayer();
             if (IS_MULTIPLAYER && socket) {
-                const seatOverlay = document.getElementById('seat-overlay');
-                if (seatOverlay) {
-                    seatOverlay.style.display = 'block';
-                    seatOverlay.style.opacity = '1';
+                const connected = await waitSocketConnected(4500);
+                if (!connected) {
+                    pendingJoin = false;
+                    joiningMatchedRoom = false;
+                    throw new Error('Realtime connection is not ready. Please retry quick match.');
                 }
                 socket.emit('join_room', {
                     roomId: room,
@@ -2835,8 +2853,18 @@
                     reconnectToken: getReconnectToken(room),
                     sessionId: getSessionId(room)
                 });
-                document.getElementById('lobby-overlay').style.display = 'none';
-                showSeatSelection();
+                if (joinRoomTimeoutTimer) clearTimeout(joinRoomTimeoutTimer);
+                joinRoomTimeoutTimer = setTimeout(() => {
+                    if (!pendingJoin || joinedRoomOnce) return;
+                    pendingJoin = false;
+                    joiningMatchedRoom = false;
+                    const lobby = document.getElementById('lobby-overlay');
+                    const seat = document.getElementById('seat-overlay');
+                    if (seat) seat.style.display = 'none';
+                    if (lobby) lobby.style.display = 'flex';
+                    setLobbyFeedback('Join room timed out. Please tap Quick Match again.', true);
+                    updateRoomContextUI();
+                }, 12000);
                 return;
             }
             document.getElementById('lobby-overlay').style.display = 'none';
@@ -3018,8 +3046,24 @@
                 lastRoomState = state;
                 currentRoomId = state?.roomId || currentRoomId;
                 updateRoomContextUI();
+                const wasPendingJoin = pendingJoin && !joinedRoomOnce;
                 joinedRoomOnce = true;
                 pendingJoin = false;
+                joiningMatchedRoom = false;
+                if (joinRoomTimeoutTimer) {
+                    clearTimeout(joinRoomTimeoutTimer);
+                    joinRoomTimeoutTimer = null;
+                }
+                if (wasPendingJoin) {
+                    const seatOverlay = document.getElementById('seat-overlay');
+                    if (seatOverlay) {
+                        seatOverlay.style.display = 'block';
+                        seatOverlay.style.opacity = '1';
+                    }
+                    const lobby = document.getElementById('lobby-overlay');
+                    if (lobby) lobby.style.display = 'none';
+                    showSeatSelection();
+                }
                 // 服务器广播时 isHost 可能为 null；这里用 hostSocketId vs 当前 socket.id 自行计算
                 isHost = (state.isHost !== null && state.isHost !== undefined)
                     ? !!state.isHost
@@ -3093,6 +3137,11 @@
                 // If we failed to join (e.g. room already started), return to lobby instead of getting stuck on seat screen.
                 if (pendingJoin && !joinedRoomOnce) {
                     pendingJoin = false;
+                    joiningMatchedRoom = false;
+                    if (joinRoomTimeoutTimer) {
+                        clearTimeout(joinRoomTimeoutTimer);
+                        joinRoomTimeoutTimer = null;
+                    }
                     const lobby = document.getElementById('lobby-overlay');
                     const seat = document.getElementById('seat-overlay');
                     if (seat) seat.style.display = 'none';

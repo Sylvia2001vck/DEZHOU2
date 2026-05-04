@@ -114,7 +114,7 @@ public final class MatchWorker {
 
       JsonObject payload = JsonParser.parseString(row.payloadJson()).getAsJsonObject();
       String tier = payload.has("tier") ? payload.get("tier").getAsString() : "novice";
-      int threshold = payload.has("threshold") ? payload.get("threshold").getAsInt() : 6;
+      int threshold = payload.has("threshold") ? payload.get("threshold").getAsInt() : 2;
       JsonArray players = payload.getAsJsonArray("players");
       if (players == null || players.size() == 0) {
         dao.updateStatus(matchId, 2, null, "empty players");

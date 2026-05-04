@@ -22,7 +22,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * room creation runs synchronously in this thread.
  */
 public final class MatchmakingService {
-  private static final int THRESHOLD = 6;
+  // Quick match starts as soon as 2 players are available.
+  private static final int THRESHOLD = 2;
 
   private final AuthService auth;
   private final RoomWorkerBridge bridge;
