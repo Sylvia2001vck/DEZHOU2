@@ -53,6 +53,10 @@ const INCOMING_TYPES = {
 
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
 const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
+// Safety toggle:
+// - false (default): keep legacy C++ authoritative room-control flow end-to-end
+// - true: route selected control events to Java text WS channel (experimental)
+const ENABLE_JAVA_ROOM_CONTROL = false;
 const JAVA_CONTROL_EVENTS = new Set(["join_room", "take_seat", "toggle_ai", "kick_seat", "set_decor"]);
 
 function bytesFromJson(value) {
@@ -359,7 +363,7 @@ export async function createProtoSocket(options = {}) {
       return api;
     },
     emit(eventName, payload = {}) {
-      if (JAVA_CONTROL_EVENTS.has(eventName)) {
+      if (ENABLE_JAVA_ROOM_CONTROL && JAVA_CONTROL_EVENTS.has(eventName)) {
         const textFrame = JSON.stringify({
           type: "control_event",
           eventName,

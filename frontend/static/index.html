@@ -2038,8 +2038,25 @@
                 setVoiceStatus('Voice: Connected (muted)');
                 updateMicButton();
             } catch (e) {
-                setVoiceStatus('Voice: Mic permission denied');
+                const name = String(e?.name || '');
+                if (!window.isSecureContext) {
+                    setVoiceStatus('Voice: Mic blocked (HTTPS required)');
+                } else if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+                    setVoiceStatus('Voice: Mic permission denied');
+                } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+                    setVoiceStatus('Voice: No microphone detected');
+                } else {
+                    setVoiceStatus('Voice: Mic unavailable');
+                }
                 console.warn('[voice] join failed', e);
+                if (!window.__voicePermHintShown) {
+                    window.__voicePermHintShown = true;
+                    if (!window.isSecureContext) {
+                        alert('Microphone is blocked on HTTP pages. Please use HTTPS for voice.');
+                    } else {
+                        alert(`Microphone access failed (${name || 'Error'}). Allow mic for this site and retry.`);
+                    }
+                }
             }
         }
 
@@ -5663,6 +5680,19 @@
                         const choice = String(sel.value || 'none');
                         if (IS_MULTIPLAYER) {
                             try { socket.emit('set_decor', { decor: choice }); } catch (_) {}
+                            // Optimistic local update for immediate visual feedback.
+                            try {
+                                if (!gameState.seatMeta) gameState.seatMeta = {};
+                                if (!gameState.seatMeta[seatIdx]) {
+                                    gameState.seatMeta[seatIdx] = { type: 'player', name: 'YOU', decor: 'none' };
+                                }
+                                gameState.seatMeta[seatIdx].decor = choice;
+                                const me = gameState.players.find(p => p.id === seatIdx);
+                                if (me) {
+                                    me.decorType = choice;
+                                    updatePlayerDecorMesh(me);
+                                }
+                            } catch (_) {}
                         } else {
                             seatDecor[seatIdx] = choice;
                             // if already at table, update my mesh now
