@@ -6061,7 +6061,13 @@
                         setLobbyFeedback('Daily beans claimed.');
                         await loadLobbyOverview();
                     } catch (e) {
-                        setLobbyFeedback(e?.message || 'Daily reward failed.', true);
+                        const msg = String(e?.message || '');
+                        if (/already|claimed|conflict|409/i.test(msg)) {
+                            setLobbyFeedback('Daily reward already claimed.');
+                            try { await loadLobbyOverview(); } catch (_) {}
+                            return;
+                        }
+                        setLobbyFeedback(msg || 'Daily reward failed.', true);
                     }
                 };
             }

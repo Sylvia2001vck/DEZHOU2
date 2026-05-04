@@ -52,6 +52,7 @@ const INCOMING_TYPES = {
 };
 
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
+const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
 
 function bytesFromJson(value) {
   const text = JSON.stringify(value ?? {});
@@ -307,6 +308,18 @@ export async function createProtoSocket(options = {}) {
     options.url ||
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
+  // Keep one websocket per page runtime to avoid connection leaks.
+  const host = typeof window !== "undefined" ? window : globalThis;
+  const existing = host[SOCKET_SINGLETON_KEY];
+  if (existing?.api && existing.wsUrl === wsUrl && existing.protoUrl === protoUrl) {
+    return existing.api;
+  }
+  if (existing?.api) {
+    try {
+      existing.api.disconnect();
+    } catch (_) {}
+  }
+
   if (!window.protobuf) {
     throw new Error("protobuf.js is required before createProtoSocket()");
   }
@@ -368,6 +381,9 @@ export async function createProtoSocket(options = {}) {
         reconnectTimer = null;
       }
       ws?.close();
+      if (host[SOCKET_SINGLETON_KEY]?.api === api) {
+        host[SOCKET_SINGLETON_KEY] = null;
+      }
     }
   };
 
@@ -438,5 +454,6 @@ export async function createProtoSocket(options = {}) {
   };
 
   connect();
+  host[SOCKET_SINGLETON_KEY] = { api, wsUrl, protoUrl };
   return api;
 }
