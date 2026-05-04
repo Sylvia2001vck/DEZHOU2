@@ -4915,6 +4915,7 @@
             const suitChar = ({hearts:'♥',diamonds:'♦',clubs:'♣',spades:'♠'}[normalized.s]) || '?';
             const isRed = (normalized.s === 'hearts' || normalized.s === 'diamonds');
             const ink = isRed ? '#c21807' : '#111111';
+            const rankText = (normalized.r === 'T') ? '10' : String(normalized.r);
 
             // background
             ctx.clearRect(0,0,W,H);
@@ -4932,7 +4933,7 @@
             ctx.textAlign = 'left';
             ctx.textBaseline = 'top';
             ctx.font = 'bold 54px Arial, sans-serif';
-            ctx.fillText(String(normalized.r), 22, 18);
+            ctx.fillText(rankText, 22, 18);
             ctx.font = 'bold 52px Arial, sans-serif';
             ctx.fillText(suitChar, 24, 76);
 
@@ -4944,7 +4945,7 @@
             ctx.textBaseline = 'top';
             ctx.fillStyle = ink;
             ctx.font = 'bold 54px Arial, sans-serif';
-            ctx.fillText(String(normalized.r), 22, 18);
+            ctx.fillText(rankText, 22, 18);
             ctx.font = 'bold 52px Arial, sans-serif';
             ctx.fillText(suitChar, 24, 76);
             ctx.restore();
