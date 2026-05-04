@@ -43,7 +43,14 @@ public final class AuthService {
       String pass = env("MYSQL_PASSWORD", "");
       String db = env("MYSQL_DATABASE", "nebula_poker");
       int port = Integer.parseInt(env("MYSQL_PORT", "3306"));
-      jdbcUrl = "jdbc:mysql://" + host + ":" + port + "/" + db + "?useSSL=false&allowPublicKeyRetrieval=true";
+      jdbcUrl =
+          "jdbc:mysql://"
+              + host
+              + ":"
+              + port
+              + "/"
+              + db
+              + "?useSSL=false&allowPublicKeyRetrieval=true&connectTimeout=5000&socketTimeout=10000";
       jdbcUser = user;
       jdbcPassword = pass;
     } else {
@@ -158,48 +165,53 @@ public final class AuthService {
       return;
     }
     if (jdbcEnabled) {
-      try (Connection c = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword)) {
-        ensureSchema(c);
-        try (PreparedStatement chk =
-            c.prepareStatement("SELECT 1 FROM auth_users WHERE username=? LIMIT 1")) {
-          chk.setString(1, login);
-          try (ResultSet rs = chk.executeQuery()) {
-            if (rs.next()) {
-              json(ctx, 409, "{\"ok\":false,\"message\":\"Login username already exists.\"}");
-              return;
+      try {
+        try (Connection c = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword)) {
+          ensureSchema(c);
+          try (PreparedStatement chk =
+              c.prepareStatement("SELECT 1 FROM auth_users WHERE username=? LIMIT 1")) {
+            chk.setString(1, login);
+            try (ResultSet rs = chk.executeQuery()) {
+              if (rs.next()) {
+                json(ctx, 409, "{\"ok\":false,\"message\":\"Login username already exists.\"}");
+                return;
+              }
             }
           }
-        }
-        long userId;
-        try (PreparedStatement ins =
-            c.prepareStatement(
-                "INSERT INTO users (external_id, username, avatar, gold, games_played, games_won) VALUES (?,?,?,?,0,0)",
-                Statement.RETURN_GENERATED_KEYS)) {
-          ins.setString(1, login);
-          ins.setString(2, display.isEmpty() ? "Player" : display);
-          ins.setString(3, "");
-          ins.setLong(4, 10000L);
-          ins.executeUpdate();
-          try (ResultSet keys = ins.getGeneratedKeys()) {
-            keys.next();
-            userId = keys.getLong(1);
+          long userId;
+          try (PreparedStatement ins =
+              c.prepareStatement(
+                  "INSERT INTO users (external_id, username, avatar, gold, games_played, games_won) VALUES (?,?,?,?,0,0)",
+                  Statement.RETURN_GENERATED_KEYS)) {
+            ins.setString(1, login);
+            ins.setString(2, display.isEmpty() ? "Player" : display);
+            ins.setString(3, "");
+            ins.setLong(4, 10000L);
+            ins.executeUpdate();
+            try (ResultSet keys = ins.getGeneratedKeys()) {
+              keys.next();
+              userId = keys.getLong(1);
+            }
           }
+          String salt = PasswordHasher.randomSaltHex(12);
+          String hash = PasswordHasher.hashPasswordRecord(password, salt);
+          long now = System.currentTimeMillis();
+          try (PreparedStatement a =
+              c.prepareStatement(
+                  "INSERT INTO auth_users (user_id, username, password_hash, created_at, last_login_at) VALUES (?,?,?,?,?)")) {
+            a.setLong(1, userId);
+            a.setString(2, login);
+            a.setString(3, hash);
+            a.setLong(4, now);
+            a.setLong(5, now);
+            a.executeUpdate();
+          }
+          UserProfile prof = new UserProfile(userId, login, display, "", 10000L, 0, 0);
+          startSession(ctx, prof);
         }
-        String salt = PasswordHasher.randomSaltHex(12);
-        String hash = PasswordHasher.hashPasswordRecord(password, salt);
-        long now = System.currentTimeMillis();
-        try (PreparedStatement a =
-            c.prepareStatement(
-                "INSERT INTO auth_users (user_id, username, password_hash, created_at, last_login_at) VALUES (?,?,?,?,?)")) {
-          a.setLong(1, userId);
-          a.setString(2, login);
-          a.setString(3, hash);
-          a.setLong(4, now);
-          a.setLong(5, now);
-          a.executeUpdate();
-        }
-        UserProfile prof = new UserProfile(userId, login, display, "", 10000L, 0, 0);
-        startSession(ctx, prof);
+      } catch (Exception e) {
+        json(ctx, 503, "{\"ok\":false,\"message\":\"Auth database unavailable. Please try again shortly.\"}");
+        return;
       }
     } else {
       if (memoryAccounts.containsKey(login)) {
@@ -220,39 +232,56 @@ public final class AuthService {
     String login = normalizeUsername(form.getOrDefault("loginUsername", form.getOrDefault("username", "")));
     String password = form.getOrDefault("password", "");
     if (jdbcEnabled) {
-      try (Connection c = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword)) {
-        ensureSchema(c);
-        try (PreparedStatement q =
-            c.prepareStatement(
-                "SELECT u.id, u.external_id, u.username, u.avatar, u.gold, u.games_played, u.games_won, a.password_hash "
-                    + "FROM users u JOIN auth_users a ON a.user_id=u.id WHERE a.username=? LIMIT 1")) {
-          q.setString(1, login);
-          try (ResultSet rs = q.executeQuery()) {
-            if (!rs.next()) {
-              json(ctx, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
-              return;
+      try {
+        try (Connection c = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword)) {
+          ensureSchema(c);
+          try (PreparedStatement q =
+              c.prepareStatement(
+                  "SELECT u.id, u.external_id, u.username, u.avatar, u.gold, u.games_played, u.games_won, a.password_hash "
+                      + "FROM users u JOIN auth_users a ON a.user_id=u.id WHERE a.username=? LIMIT 1")) {
+            q.setString(1, login);
+            try (ResultSet rs = q.executeQuery()) {
+              if (!rs.next()) {
+                json(ctx, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
+                return;
+              }
+              String ph = rs.getString("password_hash");
+              if (!PasswordHasher.verifyPasswordRecord(password, ph)) {
+                json(ctx, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
+                return;
+              }
+              long uid = rs.getLong("id");
+              String display = rs.getString("username");
+              String avatar = rs.getString("avatar");
+              long gold = rs.getLong("gold");
+              int gp = rs.getInt("games_played");
+              int gw = rs.getInt("games_won");
+              try (PreparedStatement up =
+                  c.prepareStatement("UPDATE auth_users SET last_login_at=? WHERE user_id=?")) {
+                up.setLong(1, System.currentTimeMillis());
+                up.setLong(2, uid);
+                up.executeUpdate();
+              }
+              UserProfile prof = new UserProfile(uid, login, display, avatar, gold, gp, gw);
+              startSession(ctx, prof);
             }
-            String ph = rs.getString("password_hash");
-            if (!PasswordHasher.verifyPasswordRecord(password, ph)) {
-              json(ctx, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
-              return;
-            }
-            long uid = rs.getLong("id");
-            String display = rs.getString("username");
-            String avatar = rs.getString("avatar");
-            long gold = rs.getLong("gold");
-            int gp = rs.getInt("games_played");
-            int gw = rs.getInt("games_won");
-            try (PreparedStatement up =
-                c.prepareStatement("UPDATE auth_users SET last_login_at=? WHERE user_id=?")) {
-              up.setLong(1, System.currentTimeMillis());
-              up.setLong(2, uid);
-              up.executeUpdate();
-            }
-            UserProfile prof = new UserProfile(uid, login, display, avatar, gold, gp, gw);
-            startSession(ctx, prof);
           }
         }
+      } catch (Exception e) {
+        if (password == null || password.isEmpty()) {
+          json(ctx, 400, "{\"ok\":false,\"message\":\"Password is required.\"}");
+          return;
+        }
+        if (login == null || login.isEmpty()) {
+          json(ctx, 400, "{\"ok\":false,\"message\":\"Username is required.\"}");
+          return;
+        }
+        if (e.getMessage() != null && e.getMessage().toLowerCase().contains("invalid username or password")) {
+          json(ctx, 401, "{\"ok\":false,\"message\":\"Invalid username or password.\"}");
+          return;
+        }
+        json(ctx, 503, "{\"ok\":false,\"message\":\"Auth database unavailable. Please try again shortly.\"}");
+        return;
       }
     } else {
       Account acc = memoryAccounts.get(login);

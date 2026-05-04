@@ -53,6 +53,7 @@ const INCOMING_TYPES = {
 
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
 const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
+const JAVA_CONTROL_EVENTS = new Set(["join_room", "take_seat", "toggle_ai", "kick_seat", "set_decor"]);
 
 function bytesFromJson(value) {
   const text = JSON.stringify(value ?? {});
@@ -342,6 +343,7 @@ export async function createProtoSocket(options = {}) {
   let reconnectDelay = 500;
   let hasConnectedOnce = false;
   const pendingFrames = [];
+  const pendingTextFrames = [];
   const stickyFrames = new Map();
 
   const api = {
@@ -357,6 +359,22 @@ export async function createProtoSocket(options = {}) {
       return api;
     },
     emit(eventName, payload = {}) {
+      if (JAVA_CONTROL_EVENTS.has(eventName)) {
+        const textFrame = JSON.stringify({
+          type: "control_event",
+          eventName,
+          payload: payload || {}
+        });
+        if (STICKY_RECONNECT_EVENTS.includes(eventName)) {
+          stickyFrames.set(eventName, textFrame);
+        }
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          pendingTextFrames.push(textFrame);
+          return;
+        }
+        ws.send(textFrame);
+        return;
+      }
       const typeName = OUTGOING_TYPES[eventName];
       const Type = getType(typeName);
       if (!Type) return;
@@ -411,6 +429,9 @@ export async function createProtoSocket(options = {}) {
       while (pendingFrames.length && ws?.readyState === WebSocket.OPEN) {
         ws.send(pendingFrames.shift());
       }
+      while (pendingTextFrames.length && ws?.readyState === WebSocket.OPEN) {
+        ws.send(pendingTextFrames.shift());
+      }
       if (isReconnect && ws?.readyState === WebSocket.OPEN) {
         for (const eventName of STICKY_RECONNECT_EVENTS) {
           if (stickyFrames.has(eventName) && ws?.readyState === WebSocket.OPEN) {
@@ -422,6 +443,13 @@ export async function createProtoSocket(options = {}) {
 
     ws.onmessage = (event) => {
       try {
+        if (typeof event.data === "string") {
+          const msg = JSON.parse(event.data);
+          const eventName = msg?.eventName || msg?.event || "";
+          const payload = msg?.payload ?? {};
+          if (eventName) dispatch(eventName, payload);
+          return;
+        }
         const bytes = new Uint8Array(event.data);
         const env = Envelope.decode(bytes);
         const typeName = INCOMING_TYPES[env.eventName];
