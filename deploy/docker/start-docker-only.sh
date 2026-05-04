@@ -100,7 +100,35 @@ unset NEBULA_ROOM_WORKER_HOST || true
 #region agent log
 dbg_log "H3" "before_up_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | grep ":${PORT} " | sed 's/"/\\"/g' | tr '\n' ';')\"}"
 #endregion
-if docker compose up -d --build; then
+
+# Build strategy:
+# - default: rebuild gateway only (fast, low-memory)
+# - set NEBULA_BUILD_SCOPE=all to rebuild room-worker + gateway
+# - set NEBULA_BUILD_SCOPE=none to skip rebuild and reuse local images
+BUILD_SCOPE="${NEBULA_BUILD_SCOPE:-gateway}"
+if [[ "${NEBULA_BUILD_ROOM_WORKER:-0}" == "1" ]]; then
+  BUILD_SCOPE="all"
+fi
+
+case "$BUILD_SCOPE" in
+  all)
+    echo "[nebula] build scope: all (room-worker + gateway)"
+    docker compose build room-worker gateway
+    ;;
+  gateway)
+    echo "[nebula] build scope: gateway (default, safer on low-memory CVM)"
+    docker compose build gateway
+    ;;
+  none)
+    echo "[nebula] build scope: none (reuse existing images)"
+    ;;
+  *)
+    echo "[nebula] invalid NEBULA_BUILD_SCOPE=${BUILD_SCOPE}, expected all|gateway|none"
+    exit 1
+    ;;
+esac
+
+if docker compose up -d; then
   #region agent log
   dbg_log "H4" "compose_up_success" "{\"status\":\"ok\"}"
   #endregion

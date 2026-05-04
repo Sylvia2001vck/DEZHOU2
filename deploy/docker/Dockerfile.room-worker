@@ -4,6 +4,7 @@
 
 FROM ubuntu:22.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
+ARG ROOM_WORKER_BUILD_JOBS=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config git ca-certificates \
     libboost-system-dev libboost-thread-dev \
@@ -15,7 +16,7 @@ WORKDIR /src
 COPY backend-cpp/ backend-cpp/
 RUN cmake -S backend-cpp -B build -DCMAKE_BUILD_TYPE=Release \
     -DNEBULA_ENABLE_MYSQL=ON -DNEBULA_ENABLE_REDIS=ON \
- && cmake --build build -j"$(nproc)"
+ && cmake --build build --parallel "${ROOM_WORKER_BUILD_JOBS}"
 
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive

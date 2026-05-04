@@ -20,6 +20,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.room-worker
+      args:
+        ROOM_WORKER_BUILD_JOBS: "${ROOM_WORKER_BUILD_JOBS:-1}"
     image: nebula-room-worker:latest
     restart: unless-stopped
     network_mode: host
