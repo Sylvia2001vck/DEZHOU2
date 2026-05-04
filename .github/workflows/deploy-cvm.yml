@@ -1,5 +1,5 @@
-# CI 成功后，SSH 登录腾讯云 CVM 执行部署。
-# 手动触发（workflow_dispatch）同样可用。
+# push 到 main/master 后，SSH 登录腾讯云 CVM 执行部署。
+# 手动触发（workflow_dispatch）同样可用；并发部署会自动互斥。
 #
 # 必需 Secrets（Settings → Secrets and variables → Actions）：
 #   CVM_HOST       服务器公网 IP 或域名
@@ -10,27 +10,16 @@ name: Deploy to CVM
 on:
   push:
     branches: [main, master]
-  workflow_run:
-    workflows: ["CI Java Gateway"]
-    types: [completed]
   workflow_dispatch:
 
 jobs:
   deploy:
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        github.event_name == 'push' ||
-        (
-          github.event.workflow_run.conclusion == 'success' &&
-          (
-            github.event.workflow_run.head_branch == 'main' ||
-            github.event.workflow_run.head_branch == 'master'
-          )
-        )
-      }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: deploy-cvm-main
+      cancel-in-progress: true
     steps:
       - name: SSH pull & docker compose
         uses: appleboy/ssh-action@v1.2.0
