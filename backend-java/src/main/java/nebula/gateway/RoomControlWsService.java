@@ -639,13 +639,22 @@ public final class RoomControlWsService {
   }
 
   private void settleStreetOrAdvanceTurn(Room room) {
-    List<Integer> contenders = contenders(room);
-    if (contenders.size() <= 1) {
-      finishHand(room, contenders);
-      return;
-    }
-    if (room.pendingToAct.isEmpty()) {
-      // end street
+    // Keep advancing streets automatically when nobody can act (e.g., multiple all-ins).
+    while (true) {
+      List<Integer> contenders = contenders(room);
+      if (contenders.size() <= 1) {
+        finishHand(room, contenders);
+        return;
+      }
+
+      if (!room.pendingToAct.isEmpty()) {
+        room.currentTurnSeatIdx = nextPendingSeat(room, room.currentTurnSeatIdx);
+        if (room.currentTurnSeatIdx >= 0) return;
+        // Defensive fallback: if pending seats exist but no next seat found, force street settle.
+        room.pendingToAct.clear();
+      }
+
+      // End street
       for (int seatIdx : activeSeatList(room)) {
         PlayerState p = room.players.get(seatIdx);
         if (p != null) p.currentBet = 0;
@@ -665,11 +674,12 @@ public final class RoomControlWsService {
         finishHand(room, contenders);
         return;
       }
+
       resetPendingForStreet(room);
       room.currentTurnSeatIdx = firstActionSeatForStreet(room);
-      return;
+      if (room.currentTurnSeatIdx >= 0) return;
+      // If still no actor, continue loop and auto-runout to showdown.
     }
-    room.currentTurnSeatIdx = nextPendingSeat(room, room.currentTurnSeatIdx);
   }
 
   private void finishHand(Room room, List<Integer> contenders) {
@@ -1087,20 +1097,28 @@ public final class RoomControlWsService {
 
   private long score(int cat, int... vals) {
     long s = cat;
-    for (int v : vals) s = s * 15 + v;
+    // Fixed-width base-15 encoding (category + exactly 5 tiebreak slots).
+    // This guarantees category priority is always dominant across hand types.
+    for (int i = 0; i < 5; i++) {
+      int v = (vals != null && i < vals.length) ? vals[i] : 0;
+      s = s * 15 + v;
+    }
     return s;
   }
 
   private long score(int cat, List<Integer> vals) {
-    long s = cat;
-    for (int v : vals) s = s * 15 + v;
-    return s;
+    int[] arr = new int[vals == null ? 0 : vals.size()];
+    if (vals != null) {
+      for (int i = 0; i < vals.size(); i++) arr[i] = vals.get(i);
+    }
+    return score(cat, arr);
   }
 
   private long score(int cat, int first, List<Integer> tails) {
-    long s = score(cat, first);
-    for (int v : tails) s = s * 15 + v;
-    return s;
+    List<Integer> all = new ArrayList<>();
+    all.add(first);
+    if (tails != null) all.addAll(tails);
+    return score(cat, all);
   }
 
   private boolean isSupportedActionType(String type) {

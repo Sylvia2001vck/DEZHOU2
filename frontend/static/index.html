@@ -676,6 +676,35 @@
             #history-panel.collapsed { width: 44px; max-height: none; padding: 8px; }
             #history-panel.collapsed h3 { display: none; }
             #history-panel.collapsed #history-collapse { width: 32px !important; height: 32px !important; }
+            /* Phone "one-dot" mode for collapsed sidebars */
+            #history-panel.collapsed.mobile-dot-panel,
+            #hud-panel.collapsed.mobile-dot-panel {
+                width: 24px !important;
+                min-width: 24px !important;
+                max-width: 24px !important;
+                padding: 0 !important;
+                border: none !important;
+                background: transparent !important;
+                box-shadow: none !important;
+                backdrop-filter: none !important;
+                overflow: visible !important;
+            }
+            #hud-panel.collapsed.mobile-dot-panel #hud-buttons .touch-btn:not(#hud-collapse) { display: none !important; }
+            #history-panel.collapsed.mobile-dot-panel #history-collapse,
+            #hud-panel.collapsed.mobile-dot-panel #hud-collapse {
+                width: 22px !important;
+                height: 22px !important;
+                min-width: 22px !important;
+                padding: 0 !important;
+                border-radius: 999px !important;
+                border: 1px solid rgba(255, 214, 234, 0.72) !important;
+                background: rgba(245, 176, 211, 0.52) !important;
+            }
+            #history-panel.collapsed.mobile-dot-panel #history-collapse::before,
+            #hud-panel.collapsed.mobile-dot-panel #hud-collapse::before {
+                font-size: 11px !important;
+                color: #fff5fb !important;
+            }
             
             /* Match-over / summary modal: fit phone screens */
             #summary-modal {
@@ -1179,6 +1208,11 @@
         let matchOverAcked = false;
         let opponentPlaceholderToken = 0;
         let lastOpponentPlaceholderHandNum = null;
+        const cardRaycaster = new THREE.Raycaster();
+        const cardPointerNdc = new THREE.Vector2();
+        let lastCardTapAt = 0;
+        let lastCardTapPos = { x: 0, y: 0 };
+        const cardZoomState = { hole: false, community: false };
         let UI_LANG = localStorage.getItem('nebula_lang') || 'en';
         const activityRaw = [];
         const seatDecor = Array(CONFIG.numPlayers).fill('none'); // offline decor per seat
@@ -1646,6 +1680,7 @@
             const hist = document.getElementById('history-panel');
             const histCollapsed = !!hist && hist.classList.contains('collapsed');
             const mobile = isMobile() || hudCollapsed || histCollapsed;
+            const collapseIcon = (isMobile() && (hudCollapsed || histCollapsed)) ? '•' : null;
             const setIconBtn = (id, icon, label) => {
                 const el = document.getElementById(id);
                 if (!el) return;
@@ -1703,7 +1738,7 @@
             setIconBtn('lang-toggle-lobby', (UI_LANG === 'zh') ? '中' : 'EN', t('lang_label_lobby'));
             setIconBtn('mic-toggle', '🎙', 'Mic');
             // HUD collapse control (arrow)
-            setIconBtn('hud-collapse', hudCollapsed ? '▸' : '▾', hudCollapsed ? t('hud_show') : t('hud_hide'));
+            setIconBtn('hud-collapse', collapseIcon || (hudCollapsed ? '▸' : '▾'), hudCollapsed ? t('hud_show') : t('hud_hide'));
 
             // In icon mode (mobile or collapsed), keep HUD buttons vertical to save width.
             try {
@@ -1725,8 +1760,9 @@
             try {
                 const hp = document.getElementById('history-panel');
                 const collapsed = !!hp && hp.classList.contains('collapsed');
-                setIconBtn('history-collapse', collapsed ? '▸' : '▾', collapsed ? t('history_show') : t('history_hide'));
+                setIconBtn('history-collapse', collapseIcon || (collapsed ? '▸' : '▾'), collapsed ? t('history_show') : t('history_hide'));
             } catch (_) {}
+            try { applyMobilePanelDotMode(); } catch (_) {}
         }
 
         function isPhoneLikeInput() {
@@ -1755,6 +1791,14 @@
                 try { controls.target.copy(DEFAULT_VIEW.target); } catch (_) {}
                 try { camera.lookAt(DEFAULT_VIEW.target); } catch (_) {}
             }
+        }
+
+        function applyMobilePanelDotMode() {
+            const mobile = isPhoneLikeInput();
+            const hud = document.getElementById('hud-panel');
+            const hist = document.getElementById('history-panel');
+            if (hud) hud.classList.toggle('mobile-dot-panel', !!mobile && hud.classList.contains('collapsed'));
+            if (hist) hist.classList.toggle('mobile-dot-panel', !!mobile && hist.classList.contains('collapsed'));
         }
 
         // --- SFX (WebAudio, no external assets required) ---
@@ -2785,6 +2829,7 @@
                 lastOpponentPlaceholderHandNum = null;
                 gameState.mpHandNum = null;
                 gameState.communityCards = [];
+                resetCardZoomState();
                 disposeGroupChildren(cardsGroup);
                 disposeGroupChildren(chipsGroup);
                 potChipFX = [];
@@ -3306,6 +3351,7 @@
                 if (gameState.mpHandNum !== s.handNum) {
                     gameState.mpHandNum = s.handNum;
                     lastHandOverNum = null;
+                    resetCardZoomState();
                     // Cancel in-flight async render from previous hand before cleanup.
                     opponentPlaceholderToken += 1;
                     privateHandRenderToken.forEach((token, seatIdx) => {
@@ -4816,6 +4862,8 @@
         async function dealCardAnim(card, player, faceUp) {
             try { SFX.deal(); } catch (_) {}
             const mesh = createCardMesh(card, faceUp);
+            mesh.userData.source = 'hole';
+            mesh.userData.ownerSeatIdx = Number(player?.id);
             mesh.position.set(0, 3, 0);
             cardsGroup.add(mesh);
             player.meshCards.push(mesh);
@@ -4916,6 +4964,85 @@
             mesh.add(label);
             // keep existing tilt; only add a tiny "reveal" nudge
             gsap.to(mesh.rotation, { x: mesh.rotation.x * 0.98, duration: 0.25 });
+        }
+
+        function setHoleCardsZoom(enabled) {
+            const me = gameState.players.find(p => p.id === mySeatIdx);
+            const targets = (me?.meshCards || []).filter(Boolean);
+            if (!targets.length) {
+                cardZoomState.hole = !!enabled;
+                return;
+            }
+            targets.forEach((m, idx) => {
+                if (!Number.isFinite(Number(m.userData?.baseY))) {
+                    m.userData.baseY = Number(m.position.y || 0);
+                }
+                const baseY = Number(m.userData.baseY || 0);
+                const toScale = enabled ? 1.68 : 1.0;
+                const toY = enabled ? (baseY + 0.22) : baseY;
+                gsap.to(m.scale, { x: toScale, y: toScale, z: toScale, duration: 0.22, overwrite: true, ease: "power2.out" });
+                gsap.to(m.position, { y: toY, duration: 0.22, overwrite: true, ease: "power2.out", delay: idx * 0.01 });
+            });
+            cardZoomState.hole = !!enabled;
+        }
+
+        function setCommunityCardsZoom(enabled) {
+            const targets = (cardsGroup?.children || []).filter((m) => m?.userData?.source === 'community');
+            if (!targets.length) {
+                cardZoomState.community = !!enabled;
+                return;
+            }
+            targets.forEach((m, idx) => {
+                const toScale = enabled ? 1.52 : 1.0;
+                const toY = enabled ? 0.34 : 0.18;
+                gsap.to(m.scale, { x: toScale, y: toScale, z: toScale, duration: 0.22, overwrite: true, ease: "power2.out" });
+                gsap.to(m.position, { y: toY, duration: 0.22, overwrite: true, ease: "power2.out", delay: idx * 0.01 });
+            });
+            cardZoomState.community = !!enabled;
+        }
+
+        function resetCardZoomState() {
+            if (cardZoomState.hole) setHoleCardsZoom(false);
+            if (cardZoomState.community) setCommunityCardsZoom(false);
+        }
+
+        function resolveCardRoot(intersectionObject) {
+            let node = intersectionObject || null;
+            while (node) {
+                if (node.userData && node.userData.card) return node;
+                node = node.parent || null;
+            }
+            return null;
+        }
+
+        function pickCardAtClientPoint(clientX, clientY) {
+            if (!renderer || !camera || !cardsGroup) return null;
+            const rect = renderer.domElement.getBoundingClientRect();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+            cardPointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+            cardPointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+            cardRaycaster.setFromCamera(cardPointerNdc, camera);
+            const hits = cardRaycaster.intersectObjects(cardsGroup.children, true);
+            if (!hits || !hits.length) return null;
+            return resolveCardRoot(hits[0].object);
+        }
+
+        function handleCardDoubleTap(clientX, clientY) {
+            const cardRoot = pickCardAtClientPoint(clientX, clientY);
+            if (!cardRoot) return;
+            const src = String(cardRoot?.userData?.source || '');
+            const ownerSeat = Number(cardRoot?.userData?.ownerSeatIdx);
+            if (src === 'community') {
+                const next = !cardZoomState.community;
+                if (cardZoomState.hole) setHoleCardsZoom(false);
+                setCommunityCardsZoom(next);
+                return;
+            }
+            if (src === 'hole' && Number.isInteger(ownerSeat) && ownerSeat === mySeatIdx) {
+                const next = !cardZoomState.hole;
+                if (cardZoomState.community) setCommunityCardsZoom(false);
+                setHoleCardsZoom(next);
+            }
         }
 
         function orientCardTowardViewer(mesh, viewerSeatIdx) {
@@ -5500,6 +5627,7 @@
                 const card = gameState.deck.pop();
                 gameState.communityCards.push(card);
                 const mesh = createCardMesh(card, false);
+                mesh.userData.source = 'community';
                 mesh.position.set(0, 5, 0);
                 mesh.rotation.order = 'YXZ';
                 mesh.rotation.set(0, 0, 0);
@@ -5765,7 +5893,27 @@
                     try { prev && prev(); } catch (_) {}
                     try { applyMobileIconButtons(); } catch (_) {}
                     try { applyMobileCameraLock(); } catch (_) {}
+                    try { applyMobilePanelDotMode(); } catch (_) {}
                 };
+            } catch (_) {}
+
+            // Phone UX: double-tap cards to zoom in/out (my hole cards or community cards).
+            try {
+                if (renderer?.domElement && !renderer.domElement.dataset.cardZoomBound) {
+                    renderer.domElement.dataset.cardZoomBound = '1';
+                    renderer.domElement.addEventListener('pointerdown', (ev) => {
+                        if (!isPhoneLikeInput()) return;
+                        if (ev.pointerType === 'mouse') return;
+                        const now = Date.now();
+                        const dx = Math.abs(Number(ev.clientX || 0) - Number(lastCardTapPos.x || 0));
+                        const dy = Math.abs(Number(ev.clientY || 0) - Number(lastCardTapPos.y || 0));
+                        const isDouble = (now - lastCardTapAt) <= 320 && dx <= 26 && dy <= 26;
+                        lastCardTapAt = now;
+                        lastCardTapPos = { x: Number(ev.clientX || 0), y: Number(ev.clientY || 0) };
+                        if (!isDouble) return;
+                        handleCardDoubleTap(Number(ev.clientX || 0), Number(ev.clientY || 0));
+                    }, { passive: true });
+                }
             } catch (_) {}
 
             // Decor picker (seat selection)
