@@ -61,6 +61,7 @@ public final class GatewayMain {
 
     AuthService auth = new AuthService(NebulaRedis.commands());
     MatchmakingService matchmaking = new MatchmakingService(auth, bridge, matchDao);
+    EngineService engine = new EngineService(auth, bridge);
 
     String bridgeSecret = env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me");
     MatchWorker matchWorker = null;
@@ -93,6 +94,10 @@ public final class GatewayMain {
           }
           if (path.startsWith("/api/matchmaking")) {
             matchmaking.handle(ctx);
+            return;
+          }
+          if (path.startsWith("/api/engine")) {
+            engine.handle(ctx);
             return;
           }
           proxyApi(ctx, bridge, auth);

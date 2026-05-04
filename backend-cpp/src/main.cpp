@@ -1556,6 +1556,135 @@ class PokerServer {
     reply.body = body;
   }
 
+  static std::optional<Card> card_from_json(const nlohmann::json& card_json) {
+    if (!card_json.is_object()) return std::nullopt;
+    const std::string s = card_json.value("s", "");
+    const std::string r = card_json.value("r", "");
+    const int v = card_json.value("v", 0);
+    if (s.empty() || r.empty() || v <= 0) return std::nullopt;
+    return Card{s, r, v};
+  }
+
+  static nlohmann::json hand_eval_to_json(const HandEval& eval) {
+    nlohmann::json j;
+    j["rank"] = eval.rank;
+    j["value"] = eval.value;
+    j["desc"] = eval.desc;
+    return j;
+  }
+
+  static bool parse_cards(
+      const nlohmann::json& cards_json,
+      int min_cards,
+      int max_cards,
+      std::vector<Card>& out,
+      std::string& error) {
+    if (!cards_json.is_array()) {
+      error = "cards must be array";
+      return false;
+    }
+    if (static_cast<int>(cards_json.size()) < min_cards || static_cast<int>(cards_json.size()) > max_cards) {
+      error = "cards size out of range";
+      return false;
+    }
+    out.clear();
+    out.reserve(cards_json.size());
+    for (const auto& item : cards_json) {
+      const auto card = card_from_json(item);
+      if (!card.has_value()) {
+        error = "invalid card object";
+        return false;
+      }
+      out.push_back(*card);
+    }
+    return true;
+  }
+
+  nlohmann::json compute_best_hand_json(const nlohmann::json& body_json) {
+    nlohmann::json out;
+    std::vector<Card> cards;
+    std::string error;
+    if (!parse_cards(body_json.value("cards", nlohmann::json::array()), 5, 7, cards, error)) {
+      out["ok"] = false;
+      out["message"] = error;
+      return out;
+    }
+    const HandEval eval = engine::best_hand(cards);
+    out["ok"] = true;
+    out["hand"] = hand_eval_to_json(eval);
+    return out;
+  }
+
+  nlohmann::json compute_showdown_json(const nlohmann::json& body_json) {
+    nlohmann::json out;
+    if (!body_json.contains("players") || !body_json["players"].is_array()) {
+      out["ok"] = false;
+      out["message"] = "players must be array";
+      return out;
+    }
+
+    std::vector<Card> community_cards;
+    std::string error;
+    if (!parse_cards(body_json.value("communityCards", nlohmann::json::array()), 0, 5, community_cards, error)) {
+      out["ok"] = false;
+      out["message"] = "invalid communityCards: " + error;
+      return out;
+    }
+
+    struct EvalRow {
+      int seat_idx = -1;
+      HandEval hand;
+    };
+    std::vector<EvalRow> rows;
+    nlohmann::json players_json = nlohmann::json::array();
+
+    for (const auto& player : body_json["players"]) {
+      if (!player.is_object()) continue;
+      const bool folded = player.value("folded", false);
+      const int seat_idx = player.value("seatIdx", -1);
+      if (folded || seat_idx < 0) continue;
+      std::vector<Card> hole_cards;
+      if (!parse_cards(player.value("holeCards", nlohmann::json::array()), 2, 2, hole_cards, error)) {
+        out["ok"] = false;
+        out["message"] = "invalid holeCards for one player: " + error;
+        return out;
+      }
+      std::vector<Card> all_cards = hole_cards;
+      all_cards.insert(all_cards.end(), community_cards.begin(), community_cards.end());
+      if (all_cards.size() < 5 || all_cards.size() > 7) {
+        out["ok"] = false;
+        out["message"] = "combined cards must be 5-7 per player";
+        return out;
+      }
+      const HandEval eval = engine::best_hand(all_cards);
+      rows.push_back(EvalRow{seat_idx, eval});
+      nlohmann::json item;
+      item["seatIdx"] = seat_idx;
+      item["hand"] = hand_eval_to_json(eval);
+      players_json.push_back(item);
+    }
+
+    out["players"] = players_json;
+    out["winners"] = nlohmann::json::array();
+    if (rows.empty()) {
+      out["ok"] = true;
+      out["message"] = "no eligible players";
+      return out;
+    }
+
+    const EvalRow* best = &rows[0];
+    for (const auto& row : rows) {
+      if (engine::compare_hands(row.hand, best->hand) > 0) best = &row;
+    }
+    for (const auto& row : rows) {
+      if (engine::compare_hands(row.hand, best->hand) == 0) {
+        out["winners"].push_back(row.seat_idx);
+      }
+    }
+    out["ok"] = true;
+    return out;
+  }
+
   std::string user_profile_json(const UserProfileData& profile) {
     std::ostringstream out;
     const int mmr = user_mmr_.count(profile.user_id) ? user_mmr_[profile.user_id] : 1000;
@@ -1958,6 +2087,28 @@ class PokerServer {
       reply.status = 200;
       reply.content_type = "application/json; charset=utf-8";
       reply.body = "{\"ok\":true}";
+      return;
+    }
+    if (clean_uri == "/api/engine/best-hand" && method == "POST") {
+      try {
+        const auto body_json = nlohmann::json::parse(body.empty() ? "{}" : body);
+        const nlohmann::json result = compute_best_hand_json(body_json);
+        const unsigned status = result.value("ok", false) ? 200 : 400;
+        send_json(reply, status, result.dump());
+      } catch (...) {
+        send_json(reply, 400, "{\"ok\":false,\"message\":\"Bad JSON\"}");
+      }
+      return;
+    }
+    if (clean_uri == "/api/engine/showdown" && method == "POST") {
+      try {
+        const auto body_json = nlohmann::json::parse(body.empty() ? "{}" : body);
+        const nlohmann::json result = compute_showdown_json(body_json);
+        const unsigned status = result.value("ok", false) ? 200 : 400;
+        send_json(reply, status, result.dump());
+      } catch (...) {
+        send_json(reply, 400, "{\"ok\":false,\"message\":\"Bad JSON\"}");
+      }
       return;
     }
     if (clean_uri == "/api/internal/match-notify" && method == "POST") {
