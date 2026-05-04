@@ -37,6 +37,17 @@ if [[ -f .env ]]; then
   fi
 fi
 
+WORKER_PORT=3101
+if [[ -f .env ]]; then
+  wline="$(grep -E '^NEBULA_ROOM_WORKER_PORT=' .env | tail -1 || true)"
+  if [[ -n "$wline" ]]; then
+    WORKER_PORT="${wline#*=}"
+    WORKER_PORT="${WORKER_PORT//\"/}"
+    WORKER_PORT="${WORKER_PORT//\'/}"
+    WORKER_PORT="${WORKER_PORT// /}"
+  fi
+fi
+
 #region agent log
 dbg_log "H1" "script_start" "{\"port\":\"${PORT}\",\"pwd\":\"$(pwd)\"}"
 #endregion
@@ -59,13 +70,14 @@ echo "[nebula] killing listeners on :${PORT} — java (host jar) and orphan dock
 
 kill_on_port_by_comm() {
   local match="$1"
+  local target_port="${2:-$PORT}"
   local p comm
   if command -v lsof >/dev/null 2>&1; then
-    for p in $(sudo lsof -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true); do
+    for p in $(sudo lsof -t -iTCP:"${target_port}" -sTCP:LISTEN 2>/dev/null || true); do
       [[ -z "$p" ]] && continue
       comm="$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ' || true)"
-      if [[ "$comm" == "$match" ]]; then
-        echo "  kill $match pid=$p"
+      if [[ "$comm" == "$match" ]] || [[ "$comm" == "$match"* ]]; then
+        echo "  kill $match pid=$p on :${target_port}"
         sudo kill "$p" 2>/dev/null || true
       fi
     done
@@ -78,7 +90,7 @@ kill_on_port_by_comm() {
       echo "  kill $match pid=$p (via ss)"
       sudo kill "$p" 2>/dev/null || true
     fi
-  done < <(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
+  done < <(sudo ss -tlnp "sport = :${target_port}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
 }
 
 kill_on_port_by_comm java
@@ -87,6 +99,11 @@ sleep 1
 kill_on_port_by_comm java
 kill_on_port_by_comm docker-proxy
 port_snapshot "after_kill"
+
+echo "[nebula] killing stale room-worker listeners on :${WORKER_PORT}..."
+kill_on_port_by_comm nebula-poker-server "${WORKER_PORT}"
+sleep 1
+kill_on_port_by_comm nebula-poker-server "${WORKER_PORT}"
 
 for p in $(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u); do
   [[ -z "$p" ]] && continue
