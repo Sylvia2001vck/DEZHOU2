@@ -1219,6 +1219,46 @@
             const children = [...group.children];
             children.forEach((child) => disposeObject3D(child, true));
         }
+        function normalizeCard(raw) {
+            const src = raw || {};
+            const suitRaw = String(src.s ?? src.suit ?? '').trim();
+            const suitKey = suitRaw.toUpperCase();
+            const suitMap = {
+                S: 'spades',
+                H: 'hearts',
+                D: 'diamonds',
+                C: 'clubs',
+                SPADES: 'spades',
+                HEARTS: 'hearts',
+                DIAMONDS: 'diamonds',
+                CLUBS: 'clubs'
+            };
+            const suit = suitMap[suitKey] || (['spades', 'hearts', 'diamonds', 'clubs'].includes(suitRaw.toLowerCase()) ? suitRaw.toLowerCase() : '');
+
+            const rankRaw = String(src.r ?? src.rank ?? '').trim().toUpperCase();
+            const rankMap = { '14': 'A', '13': 'K', '12': 'Q', '11': 'J', '10': 'T' };
+            let rank = rankRaw;
+            if (!rank) {
+                const vNum = Number(src.v);
+                if (Number.isFinite(vNum)) rank = rankMap[String(vNum)] || String(Math.trunc(vNum));
+            } else if (rankMap[rank]) {
+                rank = rankMap[rank];
+            }
+            if (rank === '1') rank = 'A';
+
+            const vNum = Number(src.v);
+            const v =
+                Number.isFinite(vNum)
+                    ? Math.trunc(vNum)
+                    : ({ A: 14, K: 13, Q: 12, J: 11, T: 10 }[rank] || Number(rank) || 0);
+
+            return { s: suit || 'spades', r: rank || '?', v };
+        }
+        function sameCard(a, b) {
+            const aa = normalizeCard(a);
+            const bb = normalizeCard(b);
+            return aa.s === bb.s && aa.r === bb.r && aa.v === bb.v;
+        }
         function t(key) {
             const dict = {
                 en: {
@@ -2712,10 +2752,34 @@
             if (mpWired) return;
             mpWired = true;
 
+            function resetMultiplayerVisualState() {
+                // Cancel in-flight async deal/reveal so stale animations cannot append old cards.
+                opponentPlaceholderToken += 1;
+                privateHandRenderToken.forEach((token, seatIdx) => {
+                    privateHandRenderToken.set(seatIdx, Number(token || 0) + 1);
+                });
+                pendingPrivateHands.clear();
+                lastOpponentPlaceholderHandNum = null;
+                gameState.mpHandNum = null;
+                gameState.communityCards = [];
+                disposeGroupChildren(cardsGroup);
+                disposeGroupChildren(chipsGroup);
+                potChipFX = [];
+                (gameState.players || []).forEach((p) => {
+                    (p.meshCards || []).forEach(m => disposeObject3D(m));
+                    p.meshCards = [];
+                    p.hand = [];
+                    p.currentBet = 0;
+                    p._foldFxPlayed = false;
+                });
+            }
+
             // voice: handle reconnects cleanly
             socket.on('connect', () => {
                 // on reconnect, socket.id changes; drop old peer state and rejoin
                 try { voiceLeaveAndCleanup(false); } catch(_) {}
+                // Hard-reset table visuals to avoid duplicate cards after reconnect.
+                try { resetMultiplayerVisualState(); } catch(_) {}
                 if (joinedRoomOnce && currentRoomId && currentUsername) {
                     try {
                         socket.emit('join_room', {
@@ -3219,6 +3283,13 @@
                 if (gameState.mpHandNum !== s.handNum) {
                     gameState.mpHandNum = s.handNum;
                     lastHandOverNum = null;
+                    // Cancel in-flight async render from previous hand before cleanup.
+                    opponentPlaceholderToken += 1;
+                    privateHandRenderToken.forEach((token, seatIdx) => {
+                        privateHandRenderToken.set(seatIdx, Number(token || 0) + 1);
+                    });
+                    pendingPrivateHands.clear();
+                    lastOpponentPlaceholderHandNum = null;
                     // 清空桌面牌与下注筹码
                     disposeGroupChildren(cardsGroup);
                     disposeGroupChildren(chipsGroup);
@@ -3240,14 +3311,25 @@
                     if (mySeatIdx !== -1) applyPrivateHandIfReady(mySeatIdx);
                 }
 
-                // 同步公共牌：只补差量（最多 5 张），逐张“翻出”动画（先背面落下 -> 翻正面）
+                // 同步公共牌：重连场景可能出现“本地牌数 > 服务端牌数”，此时必须先清再重建
                 const target = Array.isArray(s.communityCards) ? s.communityCards.slice(0, 5) : [];
-                while(gameState.communityCards.length < target.length) {
-                    const card = target[gameState.communityCards.length];
+                const normalizedTarget = target.map(normalizeCard);
+                const currentCommunityMeshes = (cardsGroup?.children || []).filter((m) => m?.userData?.source === 'community');
+                const needRebuildCommunity =
+                    gameState.communityCards.length !== normalizedTarget.length ||
+                    gameState.communityCards.some((c, idx) => !sameCard(c, normalizedTarget[idx])) ||
+                    currentCommunityMeshes.length !== normalizedTarget.length;
+                if (needRebuildCommunity) {
+                    currentCommunityMeshes.forEach((m) => disposeObject3D(m));
+                    gameState.communityCards = [];
+                }
+                while (gameState.communityCards.length < normalizedTarget.length) {
+                    const card = normalizedTarget[gameState.communityCards.length];
                     gameState.communityCards.push(card);
                     const finalX = (gameState.communityCards.length-3)*0.9;
                     // start facedown, then flip reveal
                     const mesh = createCardMesh(card, false);
+                    mesh.userData.source = 'community';
                     mesh.position.set(finalX, 5, 0);
                     cardsGroup.add(mesh);
                     // community cards: keep flat (no tilt toward player)
@@ -4828,10 +4910,11 @@
         }
 
         function drawCardFaceCanvas(canvas, card) {
+            const normalized = normalizeCard(card);
             const ctx = canvas.getContext('2d');
             const W = canvas.width, H = canvas.height;
-            const suitChar = ({hearts:'♥',diamonds:'♦',clubs:'♣',spades:'♠'}[card.s]) || '?';
-            const isRed = (card.s === 'hearts' || card.s === 'diamonds');
+            const suitChar = ({hearts:'♥',diamonds:'♦',clubs:'♣',spades:'♠'}[normalized.s]) || '?';
+            const isRed = (normalized.s === 'hearts' || normalized.s === 'diamonds');
             const ink = isRed ? '#c21807' : '#111111';
 
             // background
@@ -4850,7 +4933,7 @@
             ctx.textAlign = 'left';
             ctx.textBaseline = 'top';
             ctx.font = 'bold 54px Arial, sans-serif';
-            ctx.fillText(String(card.r), 22, 18);
+            ctx.fillText(String(normalized.r), 22, 18);
             ctx.font = 'bold 52px Arial, sans-serif';
             ctx.fillText(suitChar, 24, 76);
 
@@ -4862,7 +4945,7 @@
             ctx.textBaseline = 'top';
             ctx.fillStyle = ink;
             ctx.font = 'bold 54px Arial, sans-serif';
-            ctx.fillText(String(card.r), 22, 18);
+            ctx.fillText(String(normalized.r), 22, 18);
             ctx.font = 'bold 52px Arial, sans-serif';
             ctx.fillText(suitChar, 24, 76);
             ctx.restore();

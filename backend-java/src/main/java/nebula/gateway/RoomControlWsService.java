@@ -26,6 +26,7 @@ public final class RoomControlWsService {
   private static final int SMALL_BLIND = 50;
   private static final int BIG_BLIND = 100;
   private static final int MIN_PLAYERS_TO_START = 2;
+  private static final long RECONNECT_GRACE_MS = 120_000L;
 
   private final AuthService auth;
   private final Gson gson = new Gson();
@@ -57,17 +58,20 @@ public final class RoomControlWsService {
     Room room = rooms.get(c.roomId);
     if (room == null) return;
     synchronized (room) {
+      long now = System.currentTimeMillis();
       room.socketIds.remove(socketId);
       for (int i = 0; i < MAX_SEATS; i++) {
         Seat s = room.seats.get(i);
         if (s != null && "player".equals(s.type) && socketId.equals(s.socketId)) {
-          room.seats.set(i, null);
+          s.socketId = "";
+          s.disconnectedAt = now;
         }
       }
       if (room.hostSocketId != null && room.hostSocketId.equals(socketId)) {
         room.hostSocketId = room.socketIds.isEmpty() ? "" : room.socketIds.iterator().next();
       }
-      if (room.socketIds.isEmpty()) {
+      pruneExpiredDisconnectedSeats(room, now);
+      if (room.socketIds.isEmpty() && !hasRecoverableDisconnectedSeat(room, now)) {
         rooms.remove(room.roomId);
       } else {
         broadcastRoomState(room);
@@ -116,9 +120,13 @@ public final class RoomControlWsService {
 
     c.displayName = safe(payload.has("name") ? payload.get("name").getAsString() : c.displayName);
     c.clientId = safe(payload.has("clientId") ? payload.get("clientId").getAsString() : c.clientId);
+    c.reconnectToken = safe(payload.has("reconnectToken") ? payload.get("reconnectToken").getAsString() : c.reconnectToken);
+    c.sessionId = safe(payload.has("sessionId") ? payload.get("sessionId").getAsString() : c.sessionId);
 
     Room room = rooms.computeIfAbsent(roomId, Room::new);
     synchronized (room) {
+      long now = System.currentTimeMillis();
+      pruneExpiredDisconnectedSeats(room, now);
       if (c.roomId != null && !c.roomId.isEmpty() && !roomId.equals(c.roomId)) {
         Room prev = rooms.get(c.roomId);
         if (prev != null) {
@@ -138,6 +146,7 @@ public final class RoomControlWsService {
       }
       c.roomId = roomId;
       room.socketIds.add(c.socketId);
+      reattachSeatIfMatched(c, room, now);
       if (room.hostSocketId == null || room.hostSocketId.isEmpty() || !room.socketIds.contains(room.hostSocketId)) {
         room.hostSocketId = c.socketId;
       }
@@ -158,11 +167,22 @@ public final class RoomControlWsService {
     }
     int seatIdx = payload.has("seatIdx") ? payload.get("seatIdx").getAsInt() : -1;
     synchronized (room) {
+      long now = System.currentTimeMillis();
+      pruneExpiredDisconnectedSeats(room, now);
       if (seatIdx < 0 || seatIdx >= MAX_SEATS) {
         sendEvent(c, "error_msg", mapOf("msg", "Cannot take seat: invalid seat index."));
         return;
       }
       Seat occupied = room.seats.get(seatIdx);
+      if (occupied != null
+          && "player".equals(occupied.type)
+          && (occupied.socketId == null || occupied.socketId.isEmpty())
+          && occupied.disconnectedAt > 0
+          && now - occupied.disconnectedAt >= RECONNECT_GRACE_MS) {
+        room.seats.set(seatIdx, null);
+        room.players.remove(seatIdx);
+        occupied = null;
+      }
       if (occupied != null && !"player".equals(occupied.type)) {
         sendEvent(c, "error_msg", mapOf("msg", "Cannot take seat: seat occupied by AI."));
         return;
@@ -181,6 +201,9 @@ public final class RoomControlWsService {
       s.socketId = c.socketId;
       s.clientId = nullToEmpty(c.clientId);
       s.decor = "none";
+      s.sessionId = nullToEmpty(c.sessionId);
+      s.reconnectToken = nullToEmpty(c.reconnectToken);
+      s.disconnectedAt = 0L;
       room.seats.set(seatIdx, s);
       c.seatIdx = seatIdx;
       if (!room.players.containsKey(seatIdx)) {
@@ -194,6 +217,8 @@ public final class RoomControlWsService {
       }
       c.sessionId = c.sessionId == null || c.sessionId.isEmpty() ? randomToken() : c.sessionId;
       c.reconnectToken = randomToken();
+      s.sessionId = c.sessionId;
+      s.reconnectToken = c.reconnectToken;
       sendEvent(c, "seat_taken", mapOf("seatIdx", seatIdx));
       sendEvent(
           c,
@@ -382,7 +407,7 @@ public final class RoomControlWsService {
       one.put("socketId", nullToEmpty(s.socketId));
       one.put("clientId", nullToEmpty(s.clientId));
       one.put("aiManaged", false);
-      one.put("disconnectedAt", 0);
+      one.put("disconnectedAt", s.disconnectedAt);
       seats.add(one);
     }
     Map<String, Object> settings = new HashMap<>();
@@ -1122,6 +1147,56 @@ public final class RoomControlWsService {
     return s == null ? "" : s;
   }
 
+  private void reattachSeatIfMatched(Client c, Room room, long now) {
+    if (c == null || room == null) return;
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null || !"player".equals(s.type)) continue;
+      if (s.socketId != null && !s.socketId.isEmpty()) continue;
+      if (s.disconnectedAt <= 0 || now - s.disconnectedAt > RECONNECT_GRACE_MS) continue;
+      boolean tokenMatch = !nullToEmpty(c.reconnectToken).isEmpty() && c.reconnectToken.equals(s.reconnectToken);
+      boolean sessionMatch =
+          !nullToEmpty(c.sessionId).isEmpty()
+              && c.sessionId.equals(s.sessionId)
+              && !nullToEmpty(c.clientId).isEmpty()
+              && c.clientId.equals(s.clientId);
+      if (!tokenMatch && !sessionMatch) continue;
+      s.socketId = c.socketId;
+      s.disconnectedAt = 0L;
+      c.seatIdx = i;
+      c.sessionId = s.sessionId;
+      c.reconnectToken = s.reconnectToken;
+      if (room.hostSocketId == null || room.hostSocketId.isEmpty()) {
+        room.hostSocketId = c.socketId;
+      }
+      return;
+    }
+  }
+
+  private boolean hasRecoverableDisconnectedSeat(Room room, long now) {
+    if (room == null) return false;
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null || !"player".equals(s.type)) continue;
+      if (s.socketId != null && !s.socketId.isEmpty()) continue;
+      if (s.disconnectedAt > 0 && now - s.disconnectedAt < RECONNECT_GRACE_MS) return true;
+    }
+    return false;
+  }
+
+  private void pruneExpiredDisconnectedSeats(Room room, long now) {
+    if (room == null) return;
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null || !"player".equals(s.type)) continue;
+      if (s.socketId != null && !s.socketId.isEmpty()) continue;
+      if (s.disconnectedAt <= 0) continue;
+      if (now - s.disconnectedAt < RECONNECT_GRACE_MS) continue;
+      room.seats.set(i, null);
+      room.players.remove(i);
+    }
+  }
+
   private static Map<String, Object> mapOf(Object... kv) {
     Map<String, Object> m = new HashMap<>();
     for (int i = 0; i + 1 < kv.length; i += 2) {
@@ -1149,6 +1224,9 @@ public final class RoomControlWsService {
     String socketId = "";
     String clientId = "";
     String decor = "none";
+    String reconnectToken = "";
+    String sessionId = "";
+    long disconnectedAt = 0L;
   }
 
   private static final class PlayerState {
