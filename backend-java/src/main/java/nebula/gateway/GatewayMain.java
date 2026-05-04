@@ -62,7 +62,6 @@ public final class GatewayMain {
     AuthService auth = new AuthService(NebulaRedis.commands());
     MatchmakingService matchmaking = new MatchmakingService(auth, bridge, matchDao);
     EngineService engine = new EngineService(auth, bridge);
-    RoomControlWsService roomControl = new RoomControlWsService(auth);
 
     String bridgeSecret = env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me");
     MatchWorker matchWorker = null;
@@ -120,7 +119,6 @@ public final class GatewayMain {
               ctx -> {
                 String sid = "ws-" + UUID.randomUUID().toString().replace("-", "");
                 ctx.attribute("nebulaSid", sid);
-                roomControl.onConnect(sid, ctx);
                 String cookie = ctx.header("Cookie");
                 Optional<GatewayIdentity> gid = auth.resolveFromCookie(cookie == null ? "" : cookie);
                 try {
@@ -129,16 +127,6 @@ public final class GatewayMain {
                   System.err.println("[ws] register failed: " + e.getMessage());
                   ctx.attribute("nebulaSid", null);
                   ctx.closeSession(1011, "room worker offline");
-                }
-              });
-          ws.onMessage(
-              ctx -> {
-                String sid = (String) ctx.attribute("nebulaSid");
-                if (sid == null) return;
-                try {
-                  roomControl.onTextMessage(sid, ctx.message());
-                } catch (Exception e) {
-                  System.err.println("[ws] text control: " + e.getMessage());
                 }
               });
           ws.onBinaryMessage(
@@ -163,7 +151,6 @@ public final class GatewayMain {
                   bridge.unregisterClient(sid);
                 } catch (Exception ignored) {
                 }
-                roomControl.onClose(sid);
               });
         });
 
