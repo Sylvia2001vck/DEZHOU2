@@ -67,10 +67,8 @@ public final class RoomControlWsService {
           s.disconnectedAt = now;
         }
       }
-      if (room.hostSocketId != null && room.hostSocketId.equals(socketId)) {
-        room.hostSocketId = room.socketIds.isEmpty() ? "" : room.socketIds.iterator().next();
-      }
       pruneExpiredDisconnectedSeats(room, now);
+      normalizeHostOwnership(room);
       if (room.socketIds.isEmpty() && !hasRecoverableDisconnectedSeat(room, now)) {
         rooms.remove(room.roomId);
       } else {
@@ -136,9 +134,7 @@ public final class RoomControlWsService {
               Seat s = prev.seats.get(i);
               if (s != null && "player".equals(s.type) && c.socketId.equals(s.socketId)) prev.seats.set(i, null);
             }
-            if (prev.hostSocketId != null && prev.hostSocketId.equals(c.socketId)) {
-              prev.hostSocketId = prev.socketIds.isEmpty() ? "" : prev.socketIds.iterator().next();
-            }
+            normalizeHostOwnership(prev);
             if (prev.socketIds.isEmpty()) rooms.remove(prev.roomId);
             else broadcastRoomState(prev);
           }
@@ -147,9 +143,7 @@ public final class RoomControlWsService {
       c.roomId = roomId;
       room.socketIds.add(c.socketId);
       reattachSeatIfMatched(c, room, now);
-      if (room.hostSocketId == null || room.hostSocketId.isEmpty() || !room.socketIds.contains(room.hostSocketId)) {
-        room.hostSocketId = c.socketId;
-      }
+      normalizeHostOwnership(room);
       sendEvent(c, "you_state", mapOf("roomId", room.roomId, "seatIdx", c.seatIdx, "isHost", room.hostSocketId.equals(c.socketId)));
       sendPrivateHandIfAvailable(c, room);
       broadcastRoomState(room);
@@ -169,6 +163,8 @@ public final class RoomControlWsService {
     int seatIdx = payload.has("seatIdx") ? payload.get("seatIdx").getAsInt() : -1;
     synchronized (room) {
       long now = System.currentTimeMillis();
+      int prevSeatIdx = c.seatIdx;
+      boolean actorWasHost = c.socketId.equals(room.hostSocketId) || (prevSeatIdx >= 0 && prevSeatIdx == room.hostSeatIdx);
       pruneExpiredDisconnectedSeats(room, now);
       if (seatIdx < 0 || seatIdx >= MAX_SEATS) {
         sendEvent(c, "error_msg", mapOf("msg", "Cannot take seat: invalid seat index."));
@@ -192,34 +188,57 @@ public final class RoomControlWsService {
         sendEvent(c, "error_msg", mapOf("msg", "Cannot take seat: seat already occupied."));
         return;
       }
+      int oldSeatIdx = -1;
       for (int i = 0; i < MAX_SEATS; i++) {
         Seat s = room.seats.get(i);
-        if (s != null && "player".equals(s.type) && c.socketId.equals(s.socketId)) room.seats.set(i, null);
+        if (s != null && "player".equals(s.type) && c.socketId.equals(s.socketId)) {
+          oldSeatIdx = i;
+          room.seats.set(i, null);
+          break;
+        }
       }
       Seat s = new Seat();
       s.type = "player";
       s.name = c.displayName == null || c.displayName.isEmpty() ? "Player" : c.displayName;
       s.socketId = c.socketId;
       s.clientId = nullToEmpty(c.clientId);
+      s.userId = c.userId;
       s.decor = "none";
       s.sessionId = nullToEmpty(c.sessionId);
       s.reconnectToken = nullToEmpty(c.reconnectToken);
       s.disconnectedAt = 0L;
       room.seats.set(seatIdx, s);
       c.seatIdx = seatIdx;
+      // Preserve bankroll/state when the same user changes seat.
+      if (oldSeatIdx >= 0 && oldSeatIdx != seatIdx) {
+        PlayerState moved = room.players.remove(oldSeatIdx);
+        if (moved != null) {
+          moved.seatIdx = seatIdx;
+          moved.type = "player";
+          moved.name = s.name;
+          room.players.put(seatIdx, moved);
+        }
+      }
       if (!room.players.containsKey(seatIdx)) {
         PlayerState p = new PlayerState();
         p.seatIdx = seatIdx;
         p.type = "player";
         p.name = s.name;
-        p.chips = room.initialChips;
-        p.totalBuyIn = room.initialChips;
+        if (c.userId > 0 && room.bankrollByUser.containsKey(c.userId)) {
+          p.chips = Math.max(0, room.bankrollByUser.getOrDefault(c.userId, room.initialChips));
+          p.totalBuyIn = Math.max(room.initialChips, room.totalBuyInByUser.getOrDefault(c.userId, room.initialChips));
+        } else {
+          p.chips = room.initialChips;
+          p.totalBuyIn = room.initialChips;
+        }
         room.players.put(seatIdx, p);
       }
       c.sessionId = c.sessionId == null || c.sessionId.isEmpty() ? randomToken() : c.sessionId;
       c.reconnectToken = randomToken();
       s.sessionId = c.sessionId;
       s.reconnectToken = c.reconnectToken;
+      if (room.hostSeatIdx < 0 || actorWasHost) room.hostSeatIdx = seatIdx;
+      normalizeHostOwnership(room);
       sendEvent(c, "seat_taken", mapOf("seatIdx", seatIdx));
       sendEvent(
           c,
@@ -278,6 +297,7 @@ public final class RoomControlWsService {
         }
         room.players.put(seatIdx, p);
       }
+      normalizeHostOwnership(room);
       broadcastRoomState(room);
     }
   }
@@ -362,12 +382,28 @@ public final class RoomControlWsService {
 
   private void handleNextHand(Client c) {
     Room room = roomFor(c);
-    if (room == null) return;
+    if (room == null) {
+      sendEvent(c, "error_msg", mapOf("msg", "Cannot start next hand: room not found."));
+      return;
+    }
     synchronized (room) {
-      if (!room.started) return;
-      if (!c.socketId.equals(room.hostSocketId)) return;
-      if (!"HAND_OVER".equals(room.round) && !"WAITING".equals(room.round)) return;
-      if (room.handNum >= room.totalHands) return;
+      if (!room.started) {
+        sendEvent(c, "error_msg", mapOf("msg", "Cannot start next hand: match is not active."));
+        return;
+      }
+      if (!c.socketId.equals(room.hostSocketId)) {
+        sendEvent(c, "error_msg", mapOf("msg", "Only host can start next hand."));
+        return;
+      }
+      if (!"HAND_OVER".equals(room.round) && !"WAITING".equals(room.round)) {
+        sendEvent(c, "error_msg", mapOf("msg", "Cannot start next hand during " + room.round + "."));
+        return;
+      }
+      if (room.handNum >= room.totalHands) {
+        sendEvent(c, "error_msg", mapOf("msg", "Scheduled hands already finished."));
+        return;
+      }
+      sendEvent(c, "next_hand_ack", mapOf("ok", true, "fromHandNum", room.handNum));
       startNewHandLocked(room);
       broadcastGameState(room);
       broadcastRoomState(room);
@@ -434,6 +470,10 @@ public final class RoomControlWsService {
   }
 
   private int findHostSeatIdx(Room room) {
+    if (room.hostSeatIdx >= 0 && room.hostSeatIdx < MAX_SEATS) {
+      Seat hs = room.seats.get(room.hostSeatIdx);
+      if (hs != null && "player".equals(hs.type)) return room.hostSeatIdx;
+    }
     if (room.hostSocketId == null || room.hostSocketId.isEmpty()) return -1;
     for (int i = 0; i < MAX_SEATS; i++) {
       Seat s = room.seats.get(i);
@@ -1196,9 +1236,6 @@ public final class RoomControlWsService {
       c.seatIdx = i;
       c.sessionId = s.sessionId;
       c.reconnectToken = s.reconnectToken;
-      if (room.hostSocketId == null || room.hostSocketId.isEmpty()) {
-        room.hostSocketId = c.socketId;
-      }
       return;
     }
   }
@@ -1222,8 +1259,41 @@ public final class RoomControlWsService {
       if (s.socketId != null && !s.socketId.isEmpty()) continue;
       if (s.disconnectedAt <= 0) continue;
       if (now - s.disconnectedAt < RECONNECT_GRACE_MS) continue;
+      snapshotBankroll(room, i, s);
       room.seats.set(i, null);
       room.players.remove(i);
+    }
+    normalizeHostOwnership(room);
+  }
+
+  private void snapshotBankroll(Room room, int seatIdx, Seat seat) {
+    if (room == null || seat == null || seat.userId <= 0) return;
+    PlayerState p = room.players.get(seatIdx);
+    if (p == null) return;
+    room.bankrollByUser.put(seat.userId, Math.max(0, p.chips));
+    room.totalBuyInByUser.put(seat.userId, Math.max(room.initialChips, p.totalBuyIn));
+  }
+
+  private void normalizeHostOwnership(Room room) {
+    if (room == null) return;
+    // Keep host bound to a stable player seat first, not to random connected sockets.
+    if (room.hostSeatIdx >= 0 && room.hostSeatIdx < MAX_SEATS) {
+      Seat hs = room.seats.get(room.hostSeatIdx);
+      if (hs != null && "player".equals(hs.type)) {
+        String sid = nullToEmpty(hs.socketId);
+        room.hostSocketId = (!sid.isEmpty() && room.socketIds.contains(sid)) ? sid : "";
+        return;
+      }
+    }
+    room.hostSeatIdx = -1;
+    room.hostSocketId = "";
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null || !"player".equals(s.type)) continue;
+      room.hostSeatIdx = i;
+      String sid = nullToEmpty(s.socketId);
+      room.hostSocketId = (!sid.isEmpty() && room.socketIds.contains(sid)) ? sid : "";
+      return;
     }
   }
 
@@ -1253,6 +1323,7 @@ public final class RoomControlWsService {
     String name = "Player";
     String socketId = "";
     String clientId = "";
+    long userId = 0;
     String decor = "none";
     String reconnectToken = "";
     String sessionId = "";
@@ -1287,6 +1358,7 @@ public final class RoomControlWsService {
     final List<Seat> seats = new ArrayList<>();
     final Set<String> socketIds = new HashSet<>();
     String hostSocketId = "";
+    int hostSeatIdx = -1;
     boolean started = false;
     int totalHands = 5;
     int initialChips = 1000;
@@ -1299,6 +1371,8 @@ public final class RoomControlWsService {
     int minRaise = 50;
     String round = "WAITING";
     Map<Integer, PlayerState> players = new HashMap<>();
+    Map<Long, Integer> bankrollByUser = new HashMap<>();
+    Map<Long, Integer> totalBuyInByUser = new HashMap<>();
     List<Card> deck = new ArrayList<>();
     List<Card> communityCards = new ArrayList<>();
     Set<Integer> pendingToAct = new LinkedHashSet<>();

@@ -1208,6 +1208,8 @@
         let matchOverAcked = false;
         let opponentPlaceholderToken = 0;
         let lastOpponentPlaceholderHandNum = null;
+        let authBusy = false;
+        let nextHandPending = false;
         const cardRaycaster = new THREE.Raycaster();
         const cardPointerNdc = new THREE.Vector2();
         let lastCardTapAt = 0;
@@ -2291,6 +2293,47 @@
             if (lobbyHome) lobbyHome.style.display = mode === 'home' ? 'block' : 'none';
         }
 
+        function setAuthBusy(busy) {
+            authBusy = !!busy;
+            try {
+                const loginBtn = document.getElementById('auth-login-btn');
+                const registerBtn = document.getElementById('auth-register-btn');
+                if (loginBtn) loginBtn.disabled = authBusy;
+                if (registerBtn) registerBtn.disabled = authBusy;
+            } catch (_) {}
+        }
+
+        function applyAuthenticatedLobby(user, feedbackText = '') {
+            updateLobbyAccountCard(user);
+            setLobbyMode('home');
+            if (feedbackText) setLobbyFeedback(feedbackText);
+        }
+
+        async function syncAuthFromServer(options = {}) {
+            const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : 2;
+            const allowDowngrade = options.allowDowngrade !== false;
+            let lastErr = null;
+            for (let i = 0; i <= retries; i++) {
+                try {
+                    const data = await apiGet('/api/auth/me');
+                    if (data?.ok && data?.user) return data.user;
+                } catch (e) {
+                    lastErr = e;
+                }
+                if (i < retries) {
+                    // Cookies/session propagation can be slightly delayed on some browsers.
+                    await new Promise((r) => setTimeout(r, 220 + i * 280));
+                }
+            }
+            if (allowDowngrade) {
+                updateLobbyAccountCard(null);
+                setLobbyMode('login');
+                setLobbyFeedback('Log in to create rooms or quick match.');
+            }
+            if (lastErr) throw lastErr;
+            return null;
+        }
+
         function updateLobbyAccountCard(user) {
             currentAuthUser = user || null;
             const displayName = user?.displayName || user?.username || '';
@@ -2746,18 +2789,13 @@
                 return;
             }
             try {
-                const data = await apiGet('/api/auth/me');
-                if (data?.ok && data?.user) {
-                    updateLobbyAccountCard(data.user);
-                    setLobbyMode('home');
-                    setLobbyFeedback('Signed in and ready.');
+                const user = await syncAuthFromServer({ retries: 2, allowDowngrade: true });
+                if (user) {
+                    applyAuthenticatedLobby(user, 'Signed in and ready.');
                     await loadLobbyOverview();
                     return;
                 }
             } catch (_) {}
-            updateLobbyAccountCard(null);
-            setLobbyMode('login');
-            setLobbyFeedback('Log in to create rooms or quick match.');
         }
 
         function ensureOnlineSession(actionLabel = 'continue') {
@@ -2863,8 +2901,7 @@
             });
             socket.on('auth_state', ({ authenticated, profile }) => {
                 if (authenticated && profile) {
-                    updateLobbyAccountCard(profile);
-                    setLobbyMode('home');
+                    applyAuthenticatedLobby(profile);
                     loadLobbyOverview().catch(() => {});
                 }
             });
@@ -2971,6 +3008,14 @@
             });
             socket.on('error_msg', ({msg}) => {
                 try { console.warn('[ws error_msg]', msg); } catch (_) {}
+                nextHandPending = false;
+                try {
+                    const btn = document.getElementById('btn-next');
+                    if (btn && btn.style.display !== 'none') {
+                        btn.disabled = !isHost;
+                        btn.innerText = isHost ? t('next_round') : t('waiting_host');
+                    }
+                } catch (_) {}
                 alert(msg);
                 // If we failed to join (e.g. room already started), return to lobby instead of getting stuck on seat screen.
                 if (pendingJoin && !joinedRoomOnce) {
@@ -3424,6 +3469,18 @@
             socket.on('turn', ({ activeSeatIdx }) => {
                 // 轮到我则开按钮，否则关
                 toggleButtons(activeSeatIdx === mySeatIdx);
+            });
+            socket.on('next_hand_ack', ({ ok }) => {
+                nextHandPending = false;
+                const btn = document.getElementById('btn-next');
+                if (!btn) return;
+                if (ok) {
+                    btn.innerText = UI_LANG === 'zh' ? '开始中…' : 'Starting...';
+                    btn.disabled = true;
+                } else {
+                    btn.innerText = isHost ? t('next_round') : t('waiting_host');
+                    btn.disabled = !isHost;
+                }
             });
         }
 
@@ -5867,7 +5924,7 @@
             const raw = String(msg || '');
             // store newest-first so rerender preserves visual order
             activityRaw.unshift(raw);
-            if (activityRaw.length > 220) activityRaw.pop();
+            if (activityRaw.length > 1000) activityRaw.pop();
             const list = document.getElementById('history-list');
             if (!list) return;
             const div = document.createElement('div');
@@ -6409,16 +6466,25 @@
             const authLoginBtn = document.getElementById('auth-login-btn');
             if (authLoginBtn) {
                 authLoginBtn.onclick = async () => {
+                    if (authBusy) return;
                     try {
+                        setAuthBusy(true);
                         const loginUsername = document.getElementById('auth-login-username').value.trim();
                         const password = document.getElementById('auth-login-password').value;
+                        if (!loginUsername || !password) {
+                            setLobbyFeedback('Please enter username and password.', true);
+                            return;
+                        }
                         const data = await apiPost('/api/auth/login', { loginUsername, password });
-                        updateLobbyAccountCard(data.user);
-                        setLobbyMode('home');
-                        setLobbyFeedback('Login successful.');
-                        location.reload();
+                        applyAuthenticatedLobby(data?.user, 'Login successful.');
+                        // verify with retry; do not force reload (avoids login flicker).
+                        const user = await syncAuthFromServer({ retries: 3, allowDowngrade: false });
+                        if (user) applyAuthenticatedLobby(user, 'Login successful.');
+                        await loadLobbyOverview().catch(() => {});
                     } catch (e) {
                         setLobbyFeedback(e?.message || 'Login failed.', true);
+                    } finally {
+                        setAuthBusy(false);
                     }
                 };
             }
@@ -6426,7 +6492,7 @@
             if (authRegisterBtn) {
                 const registerDefaultLabel = authRegisterBtn.textContent;
                 authRegisterBtn.onclick = async () => {
-                    if (authRegisterBtn.disabled) return;
+                    if (authBusy || authRegisterBtn.disabled) return;
                     const loginUsername = document.getElementById('auth-register-username').value.trim();
                     const displayName = document.getElementById('auth-register-display-name').value.trim();
                     const password = document.getElementById('auth-register-password').value;
@@ -6434,17 +6500,19 @@
                         setLobbyFeedback('Please fill in username, display name, and password.', true);
                         return;
                     }
+                    setAuthBusy(true);
                     authRegisterBtn.disabled = true;
                     authRegisterBtn.textContent = 'Registering…';
                     try {
                         const data = await apiPost('/api/auth/register', { loginUsername, displayName, password });
-                        updateLobbyAccountCard(data.user);
-                        setLobbyMode('home');
-                        setLobbyFeedback('Registration successful.');
-                        location.reload();
+                        applyAuthenticatedLobby(data?.user, 'Registration successful.');
+                        const user = await syncAuthFromServer({ retries: 3, allowDowngrade: false });
+                        if (user) applyAuthenticatedLobby(user, 'Registration successful.');
+                        await loadLobbyOverview().catch(() => {});
                     } catch (e) {
                         setLobbyFeedback(e?.message || 'Registration failed.', true);
                     } finally {
+                        setAuthBusy(false);
                         authRegisterBtn.disabled = false;
                         authRegisterBtn.textContent = registerDefaultLabel;
                     }
@@ -6873,7 +6941,25 @@
             };
             document.getElementById('btn-next').onclick = () => {
                 if (IS_MULTIPLAYER) {
+                    if (!isHost) return;
+                    if (nextHandPending) return;
+                    nextHandPending = true;
+                    const btn = document.getElementById('btn-next');
+                    if (btn) {
+                        btn.disabled = true;
+                        btn.innerText = UI_LANG === 'zh' ? '请求中…' : 'Starting...';
+                    }
                     socket.emit('next_hand');
+                    // Safety: if ack is delayed/lost, restore button so host can retry.
+                    setTimeout(() => {
+                        if (!nextHandPending) return;
+                        nextHandPending = false;
+                        const b = document.getElementById('btn-next');
+                        if (b) {
+                            b.disabled = !isHost;
+                            b.innerText = isHost ? t('next_round') : t('waiting_host');
+                        }
+                    }, 3500);
                 } else {
                 gameState.dealerIdx = (gameState.dealerIdx + 1) % CONFIG.numPlayers;
                 startNewHand();
