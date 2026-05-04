@@ -63,6 +63,7 @@ public final class GatewayMain {
     MatchmakingService matchmaking = new MatchmakingService(auth, bridge, matchDao);
     EngineService engine = new EngineService(auth, bridge);
     BridgeHealthService bridgeHealth = new BridgeHealthService(bridge);
+    RoomControlWsService roomControl = new RoomControlWsService(auth);
 
     String bridgeSecret = env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me");
     MatchWorker matchWorker = null;
@@ -124,38 +125,23 @@ public final class GatewayMain {
               ctx -> {
                 String sid = "ws-" + UUID.randomUUID().toString().replace("-", "");
                 ctx.attribute("nebulaSid", sid);
-                String cookie = ctx.header("Cookie");
-                Optional<GatewayIdentity> gid = auth.resolveFromCookie(cookie == null ? "" : cookie);
-                try {
-                  bridge.registerClient(sid, cookie == null ? "" : cookie, gid.orElse(null), new BridgeSink(ctx));
-                } catch (Exception e) {
-                  System.err.println("[ws] register failed: " + e.getMessage());
-                  ctx.attribute("nebulaSid", null);
-                  ctx.closeSession(1011, "room worker offline");
-                }
+                roomControl.onConnect(sid, ctx);
               });
-          ws.onBinaryMessage(
+          ws.onMessage(
               ctx -> {
                 String sid = (String) ctx.attribute("nebulaSid");
                 if (sid == null) return;
                 try {
-                  byte[] raw = ctx.data();
-                  byte[] bin =
-                      Arrays.copyOfRange(raw, ctx.offset(), ctx.offset() + ctx.length());
-                  bridge.sendClientEnvelope(sid, bin);
+                  roomControl.onTextMessage(sid, ctx.message());
                 } catch (Exception e) {
-                  System.err.println("[ws] envelope: " + e.getMessage());
-                  ctx.closeSession(1011, "room worker error");
+                  System.err.println("[ws] control message: " + e.getMessage());
                 }
               });
           ws.onClose(
               ctx -> {
                 String sid = (String) ctx.attribute("nebulaSid");
                 if (sid == null) return;
-                try {
-                  bridge.unregisterClient(sid);
-                } catch (Exception ignored) {
-                }
+                roomControl.onClose(sid);
               });
         });
 
@@ -198,15 +184,4 @@ public final class GatewayMain {
     return v == null || v.isEmpty() ? dflt : v;
   }
 
-  private record BridgeSink(io.javalin.websocket.WsContext ctx) implements RoomWorkerBridge.ClientSink {
-    @Override
-    public void sendBinary(byte[] data) {
-      ctx.send(data);
-    }
-
-    @Override
-    public void close(int code) {
-      ctx.closeSession(code, "closed by room worker");
-    }
-  }
 }

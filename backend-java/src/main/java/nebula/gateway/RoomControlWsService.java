@@ -79,6 +79,10 @@ public final class RoomControlWsService {
         case "join_room" -> handleJoinRoom(c, payload);
         case "take_seat" -> handleTakeSeat(c, payload);
         case "toggle_ai" -> handleToggleAi(c, payload);
+        case "set_decor" -> handleSetDecor(c, payload);
+        case "start_game" -> handleStartGame(c, payload);
+        case "action" -> handleAction(c, payload);
+        case "next_hand" -> handleNextHand(c);
         default -> {
           // Ignore unknown control events in this phase.
         }
@@ -220,6 +224,102 @@ public final class RoomControlWsService {
     }
   }
 
+  private void handleSetDecor(Client c, JsonObject payload) {
+    Room room = roomFor(c);
+    if (room == null) {
+      sendEvent(c, "error_msg", mapOf("msg", "Cannot set decor: room not found."));
+      return;
+    }
+    if (c.seatIdx < 0 || c.seatIdx >= MAX_SEATS) {
+      sendEvent(c, "error_msg", mapOf("msg", "Take a seat before setting decor."));
+      return;
+    }
+    String decor = safe(payload.has("decor") ? payload.get("decor").getAsString() : "none");
+    if (!"none".equals(decor) && !"cola".equals(decor) && !"coffee".equals(decor) && !"wine".equals(decor) && !"cigar".equals(decor)) {
+      decor = "none";
+    }
+    synchronized (room) {
+      Seat seat = room.seats.get(c.seatIdx);
+      if (seat == null || !"player".equals(seat.type) || !c.socketId.equals(seat.socketId)) {
+        sendEvent(c, "error_msg", mapOf("msg", "Cannot set decor: seat ownership mismatch."));
+        return;
+      }
+      seat.decor = decor;
+      broadcastRoomState(room);
+    }
+  }
+
+  private void handleStartGame(Client c, JsonObject payload) {
+    Room room = roomFor(c);
+    if (room == null) {
+      sendEvent(c, "error_msg", mapOf("msg", "Cannot start game: room not found."));
+      return;
+    }
+    synchronized (room) {
+      if (!c.socketId.equals(room.hostSocketId)) {
+        sendEvent(c, "error_msg", mapOf("msg", "Only host can start game."));
+        return;
+      }
+      int occupied = 0;
+      for (int i = 0; i < MAX_SEATS; i++) {
+        if (room.seats.get(i) != null) occupied++;
+      }
+      if (occupied < 2) {
+        sendEvent(c, "error_msg", mapOf("msg", "At least 2 players (or AI) are required."));
+        return;
+      }
+      room.totalHands = payload.has("totalHands") ? Math.max(1, payload.get("totalHands").getAsInt()) : room.totalHands;
+      room.initialChips = payload.has("initialChips") ? Math.max(1000, payload.get("initialChips").getAsInt()) : room.initialChips;
+      room.started = true;
+      room.handNum = 1;
+      room.round = "PRE_FLOP";
+      room.pot = 0;
+      room.currentMaxBet = 0;
+      room.minRaise = 50;
+      room.currentTurnSeatIdx = firstPlayerSeat(room);
+      room.dealerSeatIdx = room.currentTurnSeatIdx;
+      broadcastRoomState(room);
+      broadcastGameState(room);
+      if (room.currentTurnSeatIdx >= 0) {
+        broadcastTurn(room, room.currentTurnSeatIdx);
+      }
+    }
+  }
+
+  private void handleAction(Client c, JsonObject payload) {
+    Room room = roomFor(c);
+    if (room == null || !room.started) return;
+    synchronized (room) {
+      if (c.seatIdx < 0 || c.seatIdx != room.currentTurnSeatIdx) {
+        sendEvent(c, "error_msg", mapOf("msg", "Not your turn."));
+        return;
+      }
+      String type = safe(payload.has("type") ? payload.get("type").getAsString() : "").toUpperCase();
+      if (type.isEmpty()) type = "CHECK";
+      broadcastPlayerAction(room, c.seatIdx, type);
+      int next = nextPlayerSeat(room, c.seatIdx);
+      room.currentTurnSeatIdx = next;
+      if (next >= 0) {
+        broadcastTurn(room, next);
+      }
+      broadcastGameState(room);
+    }
+  }
+
+  private void handleNextHand(Client c) {
+    Room room = roomFor(c);
+    if (room == null) return;
+    synchronized (room) {
+      if (!room.started) return;
+      if (!c.socketId.equals(room.hostSocketId)) return;
+      room.handNum += 1;
+      room.round = "PRE_FLOP";
+      room.currentTurnSeatIdx = firstPlayerSeat(room);
+      broadcastGameState(room);
+      if (room.currentTurnSeatIdx >= 0) broadcastTurn(room, room.currentTurnSeatIdx);
+    }
+  }
+
   private Room roomFor(Client c) {
     if (c.roomId == null || c.roomId.isEmpty()) return null;
     return rooms.get(c.roomId);
@@ -295,6 +395,84 @@ public final class RoomControlWsService {
     }
   }
 
+  private void broadcastPlayerAction(Room room, int seatIdx, String text) {
+    for (String sid : room.socketIds) {
+      Client cc = clients.get(sid);
+      if (cc == null) continue;
+      sendEvent(cc, "player_action", mapOf("seatIdx", seatIdx, "text", text));
+    }
+  }
+
+  private void broadcastTurn(Room room, int activeSeatIdx) {
+    room.turnNonce += 1;
+    for (String sid : room.socketIds) {
+      Client cc = clients.get(sid);
+      if (cc == null) continue;
+      sendEvent(cc, "turn", mapOf("activeSeatIdx", activeSeatIdx, "turnNonce", room.turnNonce));
+    }
+  }
+
+  private void broadcastGameState(Room room) {
+    List<Map<String, Object>> players = new ArrayList<>();
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null) continue;
+      players.add(
+          mapOf(
+              "seatIdx", i,
+              "name", s.name,
+              "type", s.type,
+              "chips", room.initialChips,
+              "currentBet", 0,
+              "isFolded", false,
+              "isBankrupt", false,
+              "totalBuyIn", room.initialChips));
+    }
+    Map<String, Object> settings =
+        mapOf("totalHands", room.totalHands, "initialChips", room.initialChips, "smallBlind", 50, "bigBlind", 100);
+    Map<String, Object> game =
+        mapOf(
+            "roomId", room.roomId,
+            "started", room.started,
+            "settings", settings,
+            "handNum", room.handNum,
+            "dealerSeatIdx", room.dealerSeatIdx,
+            "sbSeatIdx", -1,
+            "bbSeatIdx", -1,
+            "activeSeatIdx", room.currentTurnSeatIdx,
+            "pot", room.pot,
+            "round", room.round,
+            "communityCards", new ArrayList<>(),
+            "currentMaxBet", room.currentMaxBet,
+            "minRaise", room.minRaise,
+            "players", players);
+    for (String sid : room.socketIds) {
+      Client cc = clients.get(sid);
+      if (cc == null) continue;
+      sendEvent(cc, "game_state", game);
+    }
+  }
+
+  private int firstPlayerSeat(Room room) {
+    for (int i = 0; i < MAX_SEATS; i++) {
+      Seat s = room.seats.get(i);
+      if (s == null) continue;
+      if ("player".equals(s.type) || "ai".equals(s.type)) return i;
+    }
+    return -1;
+  }
+
+  private int nextPlayerSeat(Room room, int current) {
+    if (current < 0) return firstPlayerSeat(room);
+    for (int step = 1; step <= MAX_SEATS; step++) {
+      int idx = (current + step) % MAX_SEATS;
+      Seat s = room.seats.get(idx);
+      if (s == null) continue;
+      if ("player".equals(s.type) || "ai".equals(s.type)) return idx;
+    }
+    return -1;
+  }
+
   private static String randomToken() {
     return UUID.randomUUID().toString().replace("-", "");
   }
@@ -344,6 +522,14 @@ public final class RoomControlWsService {
     boolean started = false;
     int totalHands = 5;
     int initialChips = 1000;
+    int handNum = 0;
+    int dealerSeatIdx = -1;
+    int currentTurnSeatIdx = -1;
+    int turnNonce = 0;
+    int pot = 0;
+    int currentMaxBet = 0;
+    int minRaise = 50;
+    String round = "WAITING";
 
     Room(String roomId) {
       this.roomId = roomId;

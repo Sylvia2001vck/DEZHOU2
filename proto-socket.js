@@ -53,6 +53,7 @@ const INCOMING_TYPES = {
 
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
 const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
+const USE_TEXT_CONTROL_WS = true;
 
 function bytesFromJson(value) {
   const text = JSON.stringify(value ?? {});
@@ -329,15 +330,14 @@ export async function createProtoSocket(options = {}) {
     } catch (_) {}
   }
 
-  if (!window.protobuf) {
+  if (!USE_TEXT_CONTROL_WS && !window.protobuf) {
     throw new Error("protobuf.js is required before createProtoSocket()");
   }
-
-  const root = await window.protobuf.load(protoUrl);
-  const Envelope = root.lookupType("nebula.poker.Envelope");
+  const root = USE_TEXT_CONTROL_WS ? null : await window.protobuf.load(protoUrl);
+  const Envelope = USE_TEXT_CONTROL_WS ? null : root.lookupType("nebula.poker.Envelope");
   const typeCache = new Map();
   const getType = (name) => {
-    if (!name) return null;
+    if (!name || USE_TEXT_CONTROL_WS) return null;
     if (!typeCache.has(name)) {
       typeCache.set(name, root.lookupType(`nebula.poker.${name}`));
     }
@@ -366,6 +366,16 @@ export async function createProtoSocket(options = {}) {
       return api;
     },
     emit(eventName, payload = {}) {
+      if (USE_TEXT_CONTROL_WS) {
+        const text = JSON.stringify({ type: "control_event", eventName, payload: payload || {} });
+        if (STICKY_RECONNECT_EVENTS.includes(eventName)) stickyFrames.set(eventName, text);
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          pendingFrames.push(text);
+          return;
+        }
+        ws.send(text);
+        return;
+      }
       const typeName = OUTGOING_TYPES[eventName];
       const Type = getType(typeName);
       if (!Type) return;
@@ -416,6 +426,7 @@ export async function createProtoSocket(options = {}) {
       const isReconnect = hasConnectedOnce;
       hasConnectedOnce = true;
       api.connected = true;
+      dispatch("connect");
       reconnectDelay = 500;
       while (pendingFrames.length && ws?.readyState === WebSocket.OPEN) {
         ws.send(pendingFrames.shift());
@@ -431,6 +442,14 @@ export async function createProtoSocket(options = {}) {
 
     ws.onmessage = (event) => {
       try {
+        if (typeof event.data === "string") {
+          const msg = JSON.parse(event.data);
+          const eventName = msg?.eventName || msg?.event || "";
+          const payload = msg?.payload ?? {};
+          if (eventName) dispatch(eventName, payload);
+          return;
+        }
+        if (USE_TEXT_CONTROL_WS) return;
         const bytes = new Uint8Array(event.data);
         const env = Envelope.decode(bytes);
         const typeName = INCOMING_TYPES[env.eventName];
