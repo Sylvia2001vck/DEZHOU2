@@ -1098,7 +1098,7 @@
         let socket = null;
         if (IS_MULTIPLAYER) {
             try {
-                const { createProtoSocket } = await import('./proto-socket.js');
+                const { createProtoSocket } = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
                 socket = await createProtoSocket({ protoUrl: '/proto/poker.proto' });
             } catch (e) {
                 console.warn('[bootstrap] multiplayer init failed; fallback to offline mode', e);
