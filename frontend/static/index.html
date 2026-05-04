@@ -97,7 +97,7 @@
             background:
                 linear-gradient(115deg, rgba(255, 214, 232, 0.10), rgba(255, 205, 228, 0.02) 35%, rgba(255, 184, 214, 0.12) 72%, rgba(255, 243, 248, 0.10)),
                 radial-gradient(circle at 50% 24%, rgba(255, 248, 226, 0.48), rgba(255, 208, 226, 0.14) 36%, rgba(18, 7, 16, 0.04) 64%),
-                url("assets/lobby-romance-reference.png") center center / cover no-repeat;
+                none;
             filter: brightness(0.95);
             transform-origin: center center;
             animation: lobbyHeroFloat 18s ease-in-out infinite alternate;
@@ -420,7 +420,7 @@
             background:
                 linear-gradient(180deg, rgba(255, 226, 239, 0.08), rgba(255,255,255,0) 40%),
                 radial-gradient(circle at 50% 18%, rgba(255, 246, 210, 0.28), rgba(255, 193, 219, 0.12) 30%, rgba(0,0,0,0) 58%),
-                url("assets/lobby-romance-reference.png") center center / cover no-repeat;
+                none;
             filter: brightness(0.55);
             z-index: -2;
         }
@@ -1016,7 +1016,7 @@
         </div>
     </div>
 
-    <audio id="bgm" src="assets/ifcan.mp3" loop preload="none" playsinline></audio>
+    <audio id="bgm" data-src="assets/ifcan.mp3" loop preload="none" playsinline></audio>
 
     <div id="history-panel" class="panel">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -5725,12 +5725,16 @@
                 let bgmFadeTimer = null;
                 /** True after error event (missing file, 404, decode error) — do not auto-play or retry forever */
                 let bgmAssetMissing = false;
-                // Default ON (用户可手动关闭). Browsers may block audible autoplay, so we:
+                // Default OFF during infra debugging. Browsers may block audible autoplay, so we:
                 // 1) try normal play; 2) fallback to muted autoplay; 3) unmute on first user gesture.
-                const saved = localStorage.getItem('nebula_bgm') || 'on';
+                const saved = localStorage.getItem('nebula_bgm') || 'off';
                 const setLabel = (on) => { if (bgmBtn) bgmBtn.innerText = on ? 'BGM: On' : 'BGM: Off'; };
                 setLabel(saved === 'on');
                 if (bgm) {
+                    const bgmSrc = String(bgm.dataset?.src || '').trim();
+                    if (saved === 'on' && bgmSrc) {
+                        bgm.src = bgmSrc;
+                    }
                     bgm.volume = 0;
                     bgm.muted = false;
                     bgm.addEventListener('error', () => {
@@ -5743,7 +5747,8 @@
                 }
                 window.__nebulaResumeBgm = () => {
                     if (!bgm || bgmAssetMissing) return;
-                    if ((localStorage.getItem('nebula_bgm') || 'on') !== 'on') return;
+                    if ((localStorage.getItem('nebula_bgm') || 'off') !== 'on') return;
+                    if (!bgm.src && (bgm.dataset?.src || '')) bgm.src = bgm.dataset.src;
                     if (bgm.paused) {
                         bgm.play().catch(() => {});
                     }
@@ -5814,7 +5819,8 @@
                 const tryAutoPlay = () => {
                     runBgmExclusive(async () => {
                         if (!bgm || bgmAssetMissing) return;
-                        if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
+                        if ((localStorage.getItem('nebula_bgm') || 'off') !== 'on') return;
+                        if (!bgm.src && (bgm.dataset?.src || '')) bgm.src = bgm.dataset.src;
                         try {
                             bgm.muted = false;
                             bgm.volume = 0;
@@ -5839,7 +5845,8 @@
                     await runBgmExclusive(async () => {
                         try {
                             if (!bgm || bgmAssetMissing) return;
-                            if (!(localStorage.getItem('nebula_bgm') === 'on' || !localStorage.getItem('nebula_bgm'))) return;
+                            if ((localStorage.getItem('nebula_bgm') || 'off') !== 'on') return;
+                            if (!bgm.src && (bgm.dataset?.src || '')) bgm.src = bgm.dataset.src;
                             if (bgm.paused) {
                                 bgm.muted = false;
                                 bgm.volume = 0;
@@ -5869,6 +5876,7 @@
                         await runBgmExclusive(async () => {
                             try {
                                 if (wantOn) {
+                                    if (!bgm.src && (bgm.dataset?.src || '')) bgm.src = bgm.dataset.src;
                                     bgm.muted = false;
                                     bgm.volume = 0;
                                     await playWithTimeout(bgm, 8000);
