@@ -3288,7 +3288,6 @@
                     privateHandRenderToken.forEach((token, seatIdx) => {
                         privateHandRenderToken.set(seatIdx, Number(token || 0) + 1);
                     });
-                    pendingPrivateHands.clear();
                     lastOpponentPlaceholderHandNum = null;
                     // 清空桌面牌与下注筹码
                     disposeGroupChildren(cardsGroup);

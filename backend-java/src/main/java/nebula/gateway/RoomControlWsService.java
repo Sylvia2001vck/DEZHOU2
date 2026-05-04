@@ -151,6 +151,7 @@ public final class RoomControlWsService {
         room.hostSocketId = c.socketId;
       }
       sendEvent(c, "you_state", mapOf("roomId", room.roomId, "seatIdx", c.seatIdx, "isHost", room.hostSocketId.equals(c.socketId)));
+      sendPrivateHandIfAvailable(c, room);
       broadcastRoomState(room);
     }
   }
@@ -819,6 +820,17 @@ public final class RoomControlWsService {
       if (cc == null) continue;
       sendEvent(cc, "private_hand", mapOf("seatIdx", seatIdx, "hand", toCardMaps(p.holeCards)));
     }
+  }
+
+  private void sendPrivateHandIfAvailable(Client c, Room room) {
+    if (c == null || room == null) return;
+    if (c.seatIdx < 0 || c.seatIdx >= MAX_SEATS) return;
+    Seat seat = room.seats.get(c.seatIdx);
+    if (seat == null || !"player".equals(seat.type)) return;
+    if (!c.socketId.equals(seat.socketId)) return;
+    PlayerState p = room.players.get(c.seatIdx);
+    if (p == null || p.holeCards == null || p.holeCards.size() < 2) return;
+    sendEvent(c, "private_hand", mapOf("seatIdx", c.seatIdx, "hand", toCardMaps(p.holeCards)));
   }
 
   private void processAiTurns(Room room) {
