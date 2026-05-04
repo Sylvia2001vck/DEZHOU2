@@ -1640,12 +1640,7 @@
 
         function applyMobileIconButtons() {
             // "Phone UI" detection: include landscape phones / coarse-pointer devices
-            const isMobile = () => {
-                try {
-                    if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
-                } catch (_) {}
-                return window.innerWidth <= 900;
-            };
+            const isMobile = () => isPhoneLikeInput();
             const hud = document.getElementById('hud-panel');
             const hudCollapsed = !!hud && hud.classList.contains('collapsed');
             const hist = document.getElementById('history-panel');
@@ -1732,6 +1727,34 @@
                 const collapsed = !!hp && hp.classList.contains('collapsed');
                 setIconBtn('history-collapse', collapsed ? '▸' : '▾', collapsed ? t('history_show') : t('history_hide'));
             } catch (_) {}
+        }
+
+        function isPhoneLikeInput() {
+            try {
+                if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
+            } catch (_) {}
+            return window.innerWidth <= 900;
+        }
+
+        function applyMobileCameraLock() {
+            if (!controls || !camera) return;
+            const lock = isPhoneLikeInput();
+            controls.enableRotate = !lock;
+            controls.enableZoom = !lock;
+            controls.enablePan = !lock;
+            controls.enableDamping = !lock;
+            controls.enabled = !lock;
+            try {
+                if (renderer && renderer.domElement) {
+                    renderer.domElement.style.touchAction = lock ? 'none' : 'auto';
+                }
+            } catch (_) {}
+            if (lock) {
+                // Stable fixed view on phones: avoids accidental rotate/zoom hurting gameplay UX.
+                try { camera.position.copy(DEFAULT_VIEW.cameraPos); } catch (_) {}
+                try { controls.target.copy(DEFAULT_VIEW.target); } catch (_) {}
+                try { camera.lookAt(DEFAULT_VIEW.target); } catch (_) {}
+            }
         }
 
         // --- SFX (WebAudio, no external assets required) ---
@@ -3310,15 +3333,19 @@
                     if (mySeatIdx !== -1) applyPrivateHandIfReady(mySeatIdx);
                 }
 
-                // 同步公共牌：重连场景可能出现“本地牌数 > 服务端牌数”，此时必须先清再重建
+                // 同步公共牌：只做增量追加，避免每次 action 触发整排重建闪烁
                 const target = Array.isArray(s.communityCards) ? s.communityCards.slice(0, 5) : [];
                 const normalizedTarget = target.map(normalizeCard);
-                const currentCommunityMeshes = (cardsGroup?.children || []).filter((m) => m?.userData?.source === 'community');
-                const needRebuildCommunity =
-                    gameState.communityCards.length !== normalizedTarget.length ||
-                    gameState.communityCards.some((c, idx) => !sameCard(c, normalizedTarget[idx])) ||
-                    currentCommunityMeshes.length !== normalizedTarget.length;
-                if (needRebuildCommunity) {
+                const curLen = gameState.communityCards.length;
+                const targetLen = normalizedTarget.length;
+                const isPrefixMatch = gameState.communityCards.every((c, idx) => sameCard(c, normalizedTarget[idx]));
+                if (targetLen < curLen) {
+                    // Ignore stale/out-of-order snapshots that would "shrink" the board.
+                    return;
+                }
+                if (!isPrefixMatch) {
+                    // If sequence diverges (reconnect/resync), do a one-time hard rebuild.
+                    const currentCommunityMeshes = (cardsGroup?.children || []).filter((m) => m?.userData?.source === 'community');
                     currentCommunityMeshes.forEach((m) => disposeObject3D(m));
                     gameState.communityCards = [];
                 }
@@ -3596,6 +3623,7 @@
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             try { controls.target.copy(DEFAULT_VIEW.target); } catch (_) {}
+            try { applyMobileCameraLock(); } catch (_) {}
             cardsGroup = new THREE.Group();
             chipsGroup = new THREE.Group();
             tableGroup = new THREE.Group();
@@ -5729,12 +5757,14 @@
                 camera.aspect = window.innerWidth / window.innerHeight;
                 camera.updateProjectionMatrix();
                 renderer.setSize(window.innerWidth, window.innerHeight);
+                try { applyMobileCameraLock(); } catch (_) {}
             };
             try {
                 const prev = window.onresize;
                 window.onresize = () => {
                     try { prev && prev(); } catch (_) {}
                     try { applyMobileIconButtons(); } catch (_) {}
+                    try { applyMobileCameraLock(); } catch (_) {}
                 };
             } catch (_) {}
 
