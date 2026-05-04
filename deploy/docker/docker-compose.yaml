@@ -24,7 +24,8 @@ services:
         ROOM_WORKER_BUILD_JOBS: "${ROOM_WORKER_BUILD_JOBS:-1}"
     image: nebula-room-worker:latest
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - nebula
     env_file:
       - .env
     environment:
@@ -56,10 +57,8 @@ services:
     environment:
       NEBULA_REPO_ROOT: /app
       PORT: "8080"
-      NEBULA_ROOM_WORKER_HOST: host.docker.internal
+      NEBULA_ROOM_WORKER_HOST: room-worker
       NEBULA_ROOM_WORKER_PORT: "3101"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
       interval: 30s
