@@ -57,8 +57,15 @@ jobs:
             echo "[deploy] compose services:"
             docker compose config --services
 
-            export NEBULA_BUILD_SCOPE="${NEBULA_BUILD_SCOPE:-gateway}"
-            bash start-docker-only.sh
+            # Low-memory safe deploy:
+            # - never rebuild room-worker (C++)
+            # - only rebuild and restart gateway container
+            echo "[deploy] ensure room-worker is up (no build)"
+            docker compose up -d --no-build room-worker
+            echo "[deploy] build gateway only (no C++ rebuild)"
+            docker compose build gateway
+            echo "[deploy] restart gateway only"
+            docker compose up -d --no-deps gateway
 
             echo "[deploy] compose status:"
             docker compose ps
