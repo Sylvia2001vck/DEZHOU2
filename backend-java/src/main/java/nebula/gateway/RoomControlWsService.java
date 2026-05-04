@@ -241,6 +241,7 @@ public final class RoomControlWsService {
         p.seatIdx = seatIdx;
         p.type = "ai";
         p.name = ai.name;
+        p.aiStyle = aiStyleForSeat(seatIdx);
         if (p.totalBuyIn <= 0) {
           p.totalBuyIn = room.initialChips;
           p.chips = room.initialChips;
@@ -493,7 +494,16 @@ public final class RoomControlWsService {
   private void applyActionLocked(Room room, int seatIdx, JsonObject payload) {
     PlayerState actor = room.players.get(seatIdx);
     if (actor == null || actor.folded || actor.chips <= 0) return;
+    if ("HAND_OVER".equals(room.round) || "WAITING".equals(room.round)) {
+      sendActionError(room, seatIdx, "No active hand right now.");
+      return;
+    }
     String type = safe(payload.has("type") ? payload.get("type").getAsString() : "").toLowerCase();
+    if (type.isEmpty()) type = "check";
+    if (!isSupportedActionType(type)) {
+      sendActionError(room, seatIdx, "Unsupported action type.");
+      return;
+    }
     int callNeed = Math.max(0, room.currentMaxBet - actor.currentBet);
     int paid = 0;
     String actionText;
@@ -504,6 +514,10 @@ public final class RoomControlWsService {
         actionText = "FOLD";
       }
       case "allin" -> {
+        if (actor.chips <= 0) {
+          sendActionError(room, seatIdx, "No chips left for all-in.");
+          return;
+        }
         paid = actor.chips;
         actor.chips = 0;
         actor.currentBet += paid;
@@ -520,7 +534,15 @@ public final class RoomControlWsService {
         room.pot += paid;
       }
       case "raise" -> {
+        if (actor.chips <= callNeed) {
+          sendActionError(room, seatIdx, "Insufficient chips to raise (all-in only).");
+          return;
+        }
         int raiseBy = payload.has("raiseBy") ? Math.max(1, payload.get("raiseBy").getAsInt()) : room.minRaise;
+        if (raiseBy < room.minRaise) {
+          sendActionError(room, seatIdx, "Raise must be at least $" + room.minRaise + ".");
+          return;
+        }
         int target = room.currentMaxBet + Math.max(room.minRaise, raiseBy);
         int need = Math.max(0, target - actor.currentBet);
         if (need >= actor.chips) {
@@ -553,7 +575,13 @@ public final class RoomControlWsService {
       }
       default -> {
         // call/check
-        if (callNeed <= 0) {
+        if ("check".equals(type) && callNeed > 0) {
+          sendActionError(room, seatIdx, "Cannot check while facing a bet.");
+          return;
+        }
+        if ("call".equals(type) && callNeed <= 0) {
+          actionText = "CHECK";
+        } else if (callNeed <= 0) {
           actionText = "CHECK";
         } else {
           paid = Math.min(callNeed, actor.chips);
@@ -773,17 +801,35 @@ public final class RoomControlWsService {
       PlayerState p = room.players.get(room.currentTurnSeatIdx);
       if (p == null) return;
       int callNeed = Math.max(0, room.currentMaxBet - p.currentBet);
+      double handStrength = estimateHandStrength(room, p);
+      String style = p.aiStyle == null ? "balanced" : p.aiStyle;
+      // style thresholds: conservative folds more, aggressive raises more
+      double foldBias = "conservative".equals(style) ? 0.25 : ("aggressive".equals(style) ? -0.12 : 0.0);
+      double raiseBias = "conservative".equals(style) ? -0.10 : ("aggressive".equals(style) ? 0.20 : 0.05);
+      double pressure = p.chips <= 0 ? 1.0 : Math.min(1.0, callNeed / (double) Math.max(1, p.chips));
+
       if (callNeed == 0) {
-        if (p.chips > room.minRaise && random.nextDouble() < 0.2) {
+        if (p.chips > room.minRaise && handStrength + raiseBias > 0.58 && random.nextDouble() < (0.45 + raiseBias)) {
+          int raiseBy = Math.max(room.minRaise, room.minRaise + (int) (p.chips * Math.max(0.04, handStrength * 0.08)));
           aiAction.addProperty("type", "raise");
-          aiAction.addProperty("raiseBy", room.minRaise);
+          aiAction.addProperty("raiseBy", raiseBy);
         } else {
           aiAction.addProperty("type", "check");
         }
       } else {
-        if (callNeed >= p.chips) aiAction.addProperty("type", "allin");
-        else if (callNeed > p.chips / 2 && random.nextDouble() < 0.35) aiAction.addProperty("type", "fold");
-        else aiAction.addProperty("type", "call");
+        double foldScore = pressure * 0.9 - handStrength + foldBias;
+        if (callNeed >= p.chips) {
+          if (handStrength + raiseBias > 0.62) aiAction.addProperty("type", "allin");
+          else aiAction.addProperty("type", "fold");
+        } else if (foldScore > 0.48 && random.nextDouble() < Math.min(0.85, foldScore + 0.2)) {
+          aiAction.addProperty("type", "fold");
+        } else if (handStrength + raiseBias > 0.72 && p.chips > callNeed + room.minRaise && random.nextDouble() < 0.35) {
+          int raiseBy = Math.max(room.minRaise, (int) Math.round(Math.min(p.chips - callNeed, room.minRaise * (1.0 + handStrength))));
+          aiAction.addProperty("type", "raise");
+          aiAction.addProperty("raiseBy", raiseBy);
+        } else {
+          aiAction.addProperty("type", "call");
+        }
       }
       applyActionLocked(room, room.currentTurnSeatIdx, aiAction);
     }
@@ -1009,6 +1055,50 @@ public final class RoomControlWsService {
     return s;
   }
 
+  private boolean isSupportedActionType(String type) {
+    return "fold".equals(type)
+        || "check".equals(type)
+        || "call".equals(type)
+        || "raise".equals(type)
+        || "allin".equals(type);
+  }
+
+  private void sendActionError(Room room, int seatIdx, String msg) {
+    Seat s = room.seats.get(seatIdx);
+    if (s == null || s.socketId == null || s.socketId.isEmpty()) return;
+    Client c = clients.get(s.socketId);
+    if (c == null) return;
+    sendEvent(c, "error_msg", mapOf("msg", "Action rejected: " + msg));
+  }
+
+  private String aiStyleForSeat(int seatIdx) {
+    int mod = Math.floorMod(seatIdx, 3);
+    if (mod == 0) return "conservative";
+    if (mod == 1) return "balanced";
+    return "aggressive";
+  }
+
+  private double estimateHandStrength(Room room, PlayerState p) {
+    if (p == null || p.holeCards == null || p.holeCards.size() < 2) return 0.35;
+    Card c1 = p.holeCards.get(0);
+    Card c2 = p.holeCards.get(1);
+    double base = (c1.v + c2.v) / 28.0;
+    boolean pair = c1.v == c2.v;
+    boolean suited = Objects.equals(c1.s, c2.s);
+    int gap = Math.abs(c1.v - c2.v);
+    if (pair) base += 0.28;
+    if (suited) base += 0.08;
+    if (gap <= 1) base += 0.06;
+    if (c1.v >= 12 || c2.v >= 12) base += 0.05;
+    if (!room.communityCards.isEmpty()) {
+      List<Card> all = new ArrayList<>(p.holeCards);
+      all.addAll(room.communityCards);
+      HandRank hr = bestHand(all);
+      base += Math.min(0.35, hr.score / 1_000_000_000.0);
+    }
+    return Math.max(0.02, Math.min(0.98, base));
+  }
+
   private static String randomToken() {
     return UUID.randomUUID().toString().replace("-", "");
   }
@@ -1059,6 +1149,7 @@ public final class RoomControlWsService {
     int totalBuyIn = 0;
     boolean folded = false;
     boolean allIn = false;
+    String aiStyle = "balanced";
     List<Card> holeCards = new ArrayList<>();
   }
 
