@@ -795,7 +795,8 @@ public final class RoomControlWsService {
   }
 
   private void maybeFinishMatch(Room room) {
-    if (room.handNum < room.totalHands) return;
+    // Finish either by scheduled hand count, or early when only one bankroll remains.
+    if (room.handNum < room.totalHands && countPlayersWithChips(room) > 1) return;
     persistMatchProgress(room);
     room.started = false;
     room.round = "WAITING";
@@ -1048,12 +1049,22 @@ public final class RoomControlWsService {
   private int firstActionSeatForStreet(Room room) {
     List<Integer> seats = activeSeatList(room);
     if (seats.isEmpty()) return -1;
-    if ("PRE_FLOP".equals(room.round)) return room.currentTurnSeatIdx;
-    // post-flop action starts from seat after dealer
-    int seat = nextSeatFrom(room, room.dealerSeatIdx, seats);
+    // Pre-flop starts from the seat after BB (already assigned to currentTurnSeatIdx).
+    // Post-flop starts from seat after dealer.
+    int seat = "PRE_FLOP".equals(room.round) ? room.currentTurnSeatIdx : nextSeatFrom(room, room.dealerSeatIdx, seats);
     if (!room.pendingToAct.contains(seat)) return nextPendingSeat(room, seat);
     room.pendingToAct.remove(seat);
     return seat;
+  }
+
+  private int countPlayersWithChips(Room room) {
+    int alive = 0;
+    for (int seatIdx : activeSeatList(room)) {
+      PlayerState p = room.players.get(seatIdx);
+      if (p == null || p.chips <= 0) continue;
+      alive++;
+    }
+    return alive;
   }
 
   private int nextPendingSeat(Room room, int current) {

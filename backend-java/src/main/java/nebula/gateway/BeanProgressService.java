@@ -22,6 +22,7 @@ public final class BeanProgressService {
   private final Gson gson = new Gson();
   private final Map<Long, ClaimState> memoryClaimState = new ConcurrentHashMap<>();
   private final Map<Long, Integer> memoryMmr = new ConcurrentHashMap<>();
+  private final Map<Long, Long> memoryGold = new ConcurrentHashMap<>();
 
   public BeanProgressService(AuthService auth) {
     this.auth = auth;
@@ -84,11 +85,7 @@ public final class BeanProgressService {
           json(ctx, 409, "{\"ok\":false,\"message\":\"Daily beans already claimed.\"}");
           return;
         }
-        try (PreparedStatement up = c.prepareStatement("UPDATE users SET gold=gold+? WHERE id=?")) {
-          up.setInt(1, DAILY_REWARD);
-          up.setLong(2, snap.userId());
-          up.executeUpdate();
-        }
+        creditUserGold(c, snap, DAILY_REWARD);
         st.dailyClaimDay = day;
         st.updatedAtMs = System.currentTimeMillis();
         saveClaimState(c, snap.userId(), st);
@@ -105,7 +102,9 @@ public final class BeanProgressService {
     }
     st.dailyClaimDay = day;
     st.updatedAtMs = System.currentTimeMillis();
-    UserRow row = new UserRow(snap.userId(), snap.loginUsername(), snap.displayName(), snap.avatar(), snap.gold() + DAILY_REWARD, snap.gamesPlayed(), snap.gamesWon());
+    long newGold = baseGoldFromMemoryOrSnapshot(snap.userId(), snap.gold()) + DAILY_REWARD;
+    memoryGold.put(snap.userId(), newGold);
+    UserRow row = new UserRow(snap.userId(), snap.loginUsername(), snap.displayName(), snap.avatar(), newGold, snap.gamesPlayed(), snap.gamesWon());
     BeanProfile bean = resolveBeanProfile(row.userId, row.gold);
     json(ctx, 200, "{\"ok\":true,\"rewardBeans\":" + DAILY_REWARD + ",\"beanProfile\":" + gson.toJson(bean.toMap()) + "}");
   }
@@ -126,11 +125,7 @@ public final class BeanProgressService {
           json(ctx, 409, "{\"ok\":false,\"message\":\"No ad rewards remaining today.\"}");
           return;
         }
-        try (PreparedStatement up = c.prepareStatement("UPDATE users SET gold=gold+? WHERE id=?")) {
-          up.setInt(1, AD_REWARD);
-          up.setLong(2, snap.userId());
-          up.executeUpdate();
-        }
+        creditUserGold(c, snap, AD_REWARD);
         st.adRewardCount += 1;
         st.updatedAtMs = System.currentTimeMillis();
         saveClaimState(c, snap.userId(), st);
@@ -161,13 +156,15 @@ public final class BeanProgressService {
     }
     st.adRewardCount += 1;
     st.updatedAtMs = System.currentTimeMillis();
+    long newGold = baseGoldFromMemoryOrSnapshot(snap.userId(), snap.gold()) + AD_REWARD;
+    memoryGold.put(snap.userId(), newGold);
     UserRow row =
         new UserRow(
             snap.userId(),
             snap.loginUsername(),
             snap.displayName(),
             snap.avatar(),
-            snap.gold() + AD_REWARD,
+            newGold,
             snap.gamesPlayed(),
             snap.gamesWon());
     BeanProfile bean = resolveBeanProfile(row.userId, row.gold);
@@ -185,12 +182,13 @@ public final class BeanProgressService {
 
   private UserRow resolveUserRow(long userId, AuthService.UserProfileSnapshot fallback) throws Exception {
     if (!JdbcEnv.enabled()) {
+      long gold = baseGoldFromMemoryOrSnapshot(fallback.userId(), fallback.gold());
       return new UserRow(
           fallback.userId(),
           fallback.loginUsername(),
           fallback.displayName(),
           fallback.avatar(),
-          fallback.gold(),
+          gold,
           fallback.gamesPlayed(),
           fallback.gamesWon());
     }
@@ -214,6 +212,25 @@ public final class BeanProgressService {
               rs.getLong("gold"),
               rs.getInt("games_played"),
               rs.getInt("games_won"));
+        }
+      }
+    }
+    if (fallback.loginUsername() != null && !fallback.loginUsername().isEmpty()) {
+      try (PreparedStatement q =
+          c.prepareStatement(
+              "SELECT id, external_id, username, avatar, gold, games_played, games_won FROM users WHERE external_id=? LIMIT 1")) {
+        q.setString(1, fallback.loginUsername());
+        try (ResultSet rs = q.executeQuery()) {
+          if (rs.next()) {
+            return new UserRow(
+                rs.getLong("id"),
+                rs.getString("external_id"),
+                rs.getString("username"),
+                rs.getString("avatar"),
+                rs.getLong("gold"),
+                rs.getInt("games_played"),
+                rs.getInt("games_won"));
+          }
         }
       }
     }
@@ -322,6 +339,27 @@ public final class BeanProgressService {
 
   private static long dayBucketUtc() {
     return System.currentTimeMillis() / 86_400_000L;
+  }
+
+  private void creditUserGold(Connection c, AuthService.UserProfileSnapshot snap, int delta) throws Exception {
+    int updated = 0;
+    try (PreparedStatement up = c.prepareStatement("UPDATE users SET gold=gold+? WHERE id=?")) {
+      up.setInt(1, delta);
+      up.setLong(2, snap.userId());
+      updated = up.executeUpdate();
+    }
+    if (updated > 0) return;
+    if (snap.loginUsername() == null || snap.loginUsername().isEmpty()) return;
+    try (PreparedStatement up = c.prepareStatement("UPDATE users SET gold=gold+? WHERE external_id=?")) {
+      up.setInt(1, delta);
+      up.setString(2, snap.loginUsername());
+      up.executeUpdate();
+    }
+  }
+
+  private long baseGoldFromMemoryOrSnapshot(long userId, long snapshotGold) {
+    Long g = memoryGold.get(userId);
+    return g == null ? snapshotGold : g;
   }
 
   private static String tier(long beans) {
