@@ -921,6 +921,13 @@ public final class RoomControlWsService {
     return room.deck.remove(room.deck.size() - 1);
   }
 
+  private void dealCommunity(Room room, int count) {
+    if (count <= 0) return;
+    for (int i = 0; i < count; i++) {
+      room.communityCards.add(draw(room));
+    }
+  }
+
   private List<Card> freshDeck() {
     List<Card> deck = new ArrayList<>(52);
     List<String> suits = Arrays.asList("S", "H", "D", "C");
