@@ -6357,11 +6357,15 @@
                                     });
                                 }
                             } catch (_) {}
-                            socket.emit('take_seat', {
+                            const seatPayload = {
                                 seatIdx: i,
                                 reconnectToken: getReconnectToken(currentRoomId),
                                 sessionId: getSessionId(currentRoomId)
-                            });
+                            };
+                            try { socket.emit('take_seat', seatPayload); } catch (_) {}
+                            // Retry bursts for unstable WS timing on cloud (first frame can be dropped/raced).
+                            setTimeout(() => { try { socket.emit('take_seat', seatPayload); } catch (_) {} }, 150);
+                            setTimeout(() => { try { socket.emit('take_seat', seatPayload); } catch (_) {} }, 600);
                             mySeatIdx = i;
                             gameState.myPlayerIdx = i;
                             try { window.__updateDecorPanel?.(); } catch (_) {}

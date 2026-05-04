@@ -2460,6 +2460,7 @@ class PokerServer {
         close_ws_protocol_error(socket_id);
         return false;
       }
+      std::cerr << "[ws] join_room sid=" << socket_id << " roomId=" << req.roomid() << " clientId=" << req.clientid() << "\n";
       handle_join_room(session, req);
     } else if (event_name == "take_seat") {
       nebula::poker::SeatRequest req;
@@ -2467,6 +2468,7 @@ class PokerServer {
         close_ws_protocol_error(socket_id);
         return false;
       }
+      std::cerr << "[ws] take_seat sid=" << socket_id << " seatIdx=" << req.seatidx() << " room=" << session.room_id << "\n";
       handle_take_seat(session, req.seatidx(), req.reconnecttoken());
     } else if (event_name == "toggle_ai") {
       nebula::poker::SeatRequest req;
@@ -2474,6 +2476,7 @@ class PokerServer {
         close_ws_protocol_error(socket_id);
         return false;
       }
+      std::cerr << "[ws] toggle_ai sid=" << socket_id << " seatIdx=" << req.seatidx() << " room=" << session.room_id << "\n";
       handle_toggle_ai(session, req.seatidx());
     } else if (event_name == "kick_seat") {
       nebula::poker::SeatRequest req;
@@ -4022,6 +4025,7 @@ class PokerServer {
   }
 
   void send_error(const std::string& socket_id, const std::string& text) {
+    std::cerr << "[ws][error_msg] sid=" << socket_id << " msg=" << text << "\n";
     nebula::poker::ErrorMessage msg;
     msg.set_msg(text);
     send_event(socket_id, "error_msg", msg);

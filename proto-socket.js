@@ -115,6 +115,25 @@ function transformIncoming(eventName, raw) {
         lastSeenSeq: Number(raw?.lastSeenSeq ?? 0)
       };
     case "room_state":
+      {
+        const maxPlayers = Number(raw?.maxPlayers ?? 10);
+        const denseSeats = Array(Math.max(0, maxPlayers)).fill(null);
+        if (Array.isArray(raw?.seats)) {
+          for (const s of raw.seats) {
+            const idx = Number(s?.seatIdx ?? -1);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= denseSeats.length) continue;
+            denseSeats[idx] = {
+              type: s?.type || "player",
+              seatIdx: idx,
+              name: s?.name || "",
+              decor: s?.decor || "none",
+              socketId: s?.socketId || "",
+              clientId: s?.clientId || "",
+              aiManaged: !!s?.aiManaged,
+              disconnectedAt: Number(s?.disconnectedAt ?? 0)
+            };
+          }
+        }
       return {
         roomId: raw?.roomId || "",
         hostSocketId: raw?.hostSocketId || "",
@@ -125,19 +144,8 @@ function transformIncoming(eventName, raw) {
         roomCode: raw?.roomCode || "",
         visibility: raw?.visibility || "private",
         status: raw?.status || "waiting",
-        maxPlayers: Number(raw?.maxPlayers ?? 10),
-        seats: Array.isArray(raw?.seats)
-          ? raw.seats.map((s) => ({
-              type: s?.type || "player",
-              seatIdx: Number(s?.seatIdx ?? -1),
-              name: s?.name || "",
-              decor: s?.decor || "none",
-              socketId: s?.socketId || "",
-              clientId: s?.clientId || "",
-              aiManaged: !!s?.aiManaged,
-              disconnectedAt: Number(s?.disconnectedAt ?? 0)
-            }))
-          : [],
+        maxPlayers,
+        seats: denseSeats,
         settings: raw?.settings
           ? {
               totalHands: Number(raw.settings.totalHands ?? 0),
@@ -147,6 +155,7 @@ function transformIncoming(eventName, raw) {
             }
           : null
       };
+      }
     case "kicked":
     case "kicked_in_hand":
       return { seatIdx: Number(raw?.seatIdx ?? -1), msg: raw?.msg || "" };
