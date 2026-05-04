@@ -63,6 +63,7 @@ public final class GatewayMain {
     MatchmakingService matchmaking = new MatchmakingService(auth, bridge, matchDao);
     EngineService engine = new EngineService(auth, bridge);
     BridgeHealthService bridgeHealth = new BridgeHealthService(bridge);
+    BeanProgressService beanProgress = new BeanProgressService(auth);
     RoomControlWsService roomControl = new RoomControlWsService(auth);
 
     String bridgeSecret = env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me");
@@ -104,6 +105,10 @@ public final class GatewayMain {
           }
           if (path.startsWith("/api/system/bridge-health")) {
             bridgeHealth.handle(ctx);
+            return;
+          }
+          if (path.startsWith("/api/home/overview") || path.startsWith("/api/beans/")) {
+            beanProgress.handle(ctx);
             return;
           }
           proxyApi(ctx, bridge, auth);

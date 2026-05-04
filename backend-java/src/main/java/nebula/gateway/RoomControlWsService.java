@@ -17,6 +17,11 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
 
 /**
  * Java-owned room control + gameplay over WS text frames.
@@ -25,6 +30,7 @@ public final class RoomControlWsService {
   private static final int MAX_SEATS = 10;
   private static final int SMALL_BLIND = 50;
   private static final int BIG_BLIND = 100;
+  private static final int BET_UNIT = 50;
   private static final int MIN_PLAYERS_TO_START = 2;
   private static final long RECONNECT_GRACE_MS = 120_000L;
 
@@ -595,7 +601,7 @@ public final class RoomControlWsService {
         int raiseDelta = actor.currentBet - room.currentMaxBet;
         if (raiseDelta > 0) {
           room.currentMaxBet = actor.currentBet;
-          room.minRaise = Math.max(room.minRaise, raiseDelta);
+          room.minRaise = normalizeRaiseBy(Math.max(room.minRaise, raiseDelta), BET_UNIT);
           resetPendingAfterAggression(room, seatIdx);
           actionText = "ALL-IN $" + paid;
         } else {
@@ -608,12 +614,13 @@ public final class RoomControlWsService {
           sendActionError(room, seatIdx, "Insufficient chips to raise (all-in only).");
           return;
         }
-        int raiseBy = payload.has("raiseBy") ? Math.max(1, payload.get("raiseBy").getAsInt()) : room.minRaise;
+        int raiseByRaw = payload.has("raiseBy") ? Math.max(1, payload.get("raiseBy").getAsInt()) : room.minRaise;
+        int raiseBy = normalizeRaiseBy(raiseByRaw, room.minRaise);
         if (raiseBy < room.minRaise) {
           sendActionError(room, seatIdx, "Raise must be at least $" + room.minRaise + ".");
           return;
         }
-        int target = room.currentMaxBet + Math.max(room.minRaise, raiseBy);
+        int target = room.currentMaxBet + raiseBy;
         int need = Math.max(0, target - actor.currentBet);
         if (need >= actor.chips) {
           // degrade to all-in
@@ -624,7 +631,7 @@ public final class RoomControlWsService {
           int raiseDelta = actor.currentBet - room.currentMaxBet;
           if (raiseDelta > 0) {
             room.currentMaxBet = actor.currentBet;
-            room.minRaise = Math.max(room.minRaise, raiseDelta);
+            room.minRaise = normalizeRaiseBy(Math.max(room.minRaise, raiseDelta), BET_UNIT);
             resetPendingAfterAggression(room, seatIdx);
           }
           room.pot += paid;
@@ -637,7 +644,7 @@ public final class RoomControlWsService {
           int raiseDelta = actor.currentBet - room.currentMaxBet;
           if (raiseDelta > 0) {
             room.currentMaxBet = actor.currentBet;
-            room.minRaise = Math.max(room.minRaise, raiseDelta);
+            room.minRaise = normalizeRaiseBy(Math.max(room.minRaise, raiseDelta), BET_UNIT);
           }
           resetPendingAfterAggression(room, seatIdx);
           actionText = callNeed > 0 ? "RAISE $" + raiseDelta : "BET $" + raiseDelta;
@@ -789,6 +796,7 @@ public final class RoomControlWsService {
 
   private void maybeFinishMatch(Room room) {
     if (room.handNum < room.totalHands) return;
+    persistMatchProgress(room);
     room.started = false;
     room.round = "WAITING";
     List<Map<String, Object>> standings = new ArrayList<>();
@@ -818,6 +826,74 @@ public final class RoomControlWsService {
               "playedHands", room.handNum,
               "standings", standings,
               "hands", room.handHistory));
+    }
+  }
+
+  private void persistMatchProgress(Room room) {
+    if (room == null || !JdbcEnv.enabled()) return;
+    List<Integer> humanSeats = new ArrayList<>();
+    int bestChips = Integer.MIN_VALUE;
+    for (int seatIdx : activeSeatList(room)) {
+      Seat s = room.seats.get(seatIdx);
+      PlayerState p = room.players.get(seatIdx);
+      if (s == null || p == null) continue;
+      if (!"player".equals(s.type) || s.userId <= 0) continue;
+      humanSeats.add(seatIdx);
+      bestChips = Math.max(bestChips, p.chips);
+    }
+    if (humanSeats.isEmpty()) return;
+    try (Connection c = DriverManager.getConnection(JdbcEnv.jdbcUrl(), JdbcEnv.user(), JdbcEnv.password())) {
+      ensureMmrSchema(c);
+      for (int seatIdx : humanSeats) {
+        Seat s = room.seats.get(seatIdx);
+        PlayerState p = room.players.get(seatIdx);
+        if (s == null || p == null || s.userId <= 0) continue;
+        int net = p.chips - p.totalBuyIn;
+        boolean winner = p.chips == bestChips;
+        int mmrDelta = winner ? 16 : -8;
+        if (net > 0) mmrDelta += Math.min(10, net / 500);
+        if (net < 0) mmrDelta -= Math.min(10, Math.abs(net) / 700);
+        mmrDelta = Math.max(-30, Math.min(30, mmrDelta));
+
+        try (PreparedStatement up =
+            c.prepareStatement(
+                "UPDATE users SET gold=GREATEST(0, gold + ?), games_played=games_played+1, games_won=games_won+? WHERE id=?")) {
+          up.setInt(1, net);
+          up.setInt(2, winner ? 1 : 0);
+          up.setLong(3, s.userId);
+          up.executeUpdate();
+        }
+        int oldMmr = 1000;
+        try (PreparedStatement q = c.prepareStatement("SELECT mmr_score FROM user_mmr WHERE user_id=? LIMIT 1")) {
+          q.setLong(1, s.userId);
+          try (ResultSet rs = q.executeQuery()) {
+            if (rs.next()) oldMmr = rs.getInt(1);
+          }
+        }
+        int newMmr = Math.max(100, oldMmr + mmrDelta);
+        try (PreparedStatement upMmr =
+            c.prepareStatement(
+                "INSERT INTO user_mmr (user_id, mmr_score, updated_at_ms) VALUES (?,?,?) "
+                    + "ON DUPLICATE KEY UPDATE mmr_score=VALUES(mmr_score), updated_at_ms=VALUES(updated_at_ms)")) {
+          upMmr.setLong(1, s.userId);
+          upMmr.setInt(2, newMmr);
+          upMmr.setLong(3, System.currentTimeMillis());
+          upMmr.executeUpdate();
+        }
+      }
+    } catch (Exception e) {
+      System.err.println("[room-ws] persistMatchProgress failed: " + e.getMessage());
+    }
+  }
+
+  private void ensureMmrSchema(Connection c) throws Exception {
+    try (Statement st = c.createStatement()) {
+      st.executeUpdate(
+          "CREATE TABLE IF NOT EXISTS user_mmr ("
+              + "user_id BIGINT NOT NULL PRIMARY KEY,"
+              + "mmr_score INT NOT NULL DEFAULT 1000,"
+              + "updated_at_ms BIGINT NOT NULL DEFAULT 0"
+              + ")");
     }
   }
 
@@ -858,6 +934,11 @@ public final class RoomControlWsService {
     postBlind(room, bbSeat, BIG_BLIND);
     room.currentTurnSeatIdx = nextSeatFrom(room, bbSeat, seats);
     resetPendingForStreet(room);
+    room.currentTurnSeatIdx = firstActionSeatForStreet(room);
+    if (room.currentTurnSeatIdx < 0) {
+      // Nobody can act at hand start (e.g. zero-chip/folded edge cases) -> auto-advance.
+      settleStreetOrAdvanceTurn(room);
+    }
 
     // send private hands
     for (int seatIdx : seats) {
@@ -901,7 +982,7 @@ public final class RoomControlWsService {
 
       if (callNeed == 0) {
         if (p.chips > room.minRaise && handStrength + raiseBias > 0.58 && random.nextDouble() < (0.45 + raiseBias)) {
-          int raiseBy = Math.max(room.minRaise, room.minRaise + (int) (p.chips * Math.max(0.04, handStrength * 0.08)));
+          int raiseBy = normalizeRaiseBy(room.minRaise + (int) (p.chips * Math.max(0.04, handStrength * 0.08)), room.minRaise);
           aiAction.addProperty("type", "raise");
           aiAction.addProperty("raiseBy", raiseBy);
         } else {
@@ -915,7 +996,7 @@ public final class RoomControlWsService {
         } else if (foldScore > 0.48 && random.nextDouble() < Math.min(0.85, foldScore + 0.2)) {
           aiAction.addProperty("type", "fold");
         } else if (handStrength + raiseBias > 0.72 && p.chips > callNeed + room.minRaise && random.nextDouble() < 0.35) {
-          int raiseBy = Math.max(room.minRaise, (int) Math.round(Math.min(p.chips - callNeed, room.minRaise * (1.0 + handStrength))));
+          int raiseBy = normalizeRaiseBy((int) Math.round(Math.min(p.chips - callNeed, room.minRaise * (1.0 + handStrength))), room.minRaise);
           aiAction.addProperty("type", "raise");
           aiAction.addProperty("raiseBy", raiseBy);
         } else {
@@ -934,6 +1015,14 @@ public final class RoomControlWsService {
     p.currentBet += pay;
     room.pot += pay;
     if (p.chips == 0) p.allIn = true;
+  }
+
+  private int normalizeRaiseBy(int raiseBy, int minRaise) {
+    int unit = Math.max(1, BET_UNIT);
+    int floor = Math.max(minRaise, unit);
+    int v = Math.max(floor, raiseBy);
+    // Round up to betting unit so raises are always clean integers (50-step chips).
+    return ((v + unit - 1) / unit) * unit;
   }
 
   private void resetPendingForStreet(Room room) {

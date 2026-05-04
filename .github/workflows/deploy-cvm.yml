@@ -1,21 +1,30 @@
-# 推送到 main 后，SSH 登录腾讯云 CVM 执行 pull + docker compose。
+# CI 成功后，SSH 登录腾讯云 CVM 执行部署。
+# 手动触发（workflow_dispatch）同样可用。
 #
-# 在 GitHub 仓库 Settings → Secrets and variables → Actions 中新建：
+# 必需 Secrets（Settings → Secrets and variables → Actions）：
 #   CVM_HOST       服务器公网 IP 或域名
 #   CVM_USER       如 ubuntu
 #   CVM_SSH_KEY    用于登录的私钥全文（BEGIN … END）
-#
-# 可选：改下方 script 里的仓库路径（默认 /home/ubuntu/DEZHOU2）。
 name: Deploy to CVM
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["CI Java Gateway"]
+    types: [completed]
   workflow_dispatch:
 
 jobs:
   deploy:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: SSH pull & docker compose
         uses: appleboy/ssh-action@v1.2.0
@@ -25,7 +34,44 @@ jobs:
           key: ${{ secrets.CVM_SSH_KEY }}
           script_stop: true
           script: |
-            set -e
-            cd /home/ubuntu/DEZHOU2/deploy/docker
-            git pull origin main
+            set -euo pipefail
+
+            REPO_DIR="/home/ubuntu/DEZHOU2"
+            COMPOSE_DIR="$REPO_DIR/deploy/docker"
+
+            if [[ ! -d "$REPO_DIR/.git" ]]; then
+              echo "[deploy] missing git repo: $REPO_DIR" >&2
+              exit 1
+            fi
+            if [[ ! -d "$COMPOSE_DIR" ]]; then
+              echo "[deploy] missing compose dir: $COMPOSE_DIR" >&2
+              exit 1
+            fi
+
+            cd "$REPO_DIR"
+            git fetch origin main
+            git checkout main
+            git pull --ff-only origin main
+
+            cd "$COMPOSE_DIR"
+            if [[ ! -f ".env" ]]; then
+              echo "[deploy] missing .env in $COMPOSE_DIR" >&2
+              exit 1
+            fi
+
+            echo "[deploy] compose services:"
+            docker compose config --services
+
+            export NEBULA_BUILD_SCOPE="${NEBULA_BUILD_SCOPE:-gateway}"
             bash start-docker-only.sh
+
+            echo "[deploy] compose status:"
+            docker compose ps
+
+            echo "[deploy] health check:"
+            if ! curl -fsS --max-time 8 http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "[deploy] healthz failed, recent gateway logs:" >&2
+              docker compose logs gateway --tail 120 >&2 || true
+              exit 1
+            fi
+            echo "[deploy] healthz ok"

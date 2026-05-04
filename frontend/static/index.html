@@ -2509,6 +2509,36 @@
             }
         }
 
+        function toNumOr(v, fallback = 0) {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function applyBeanProfileToHome(beanProfile = {}, profile = {}) {
+            const beanBalance = toNumOr(beanProfile?.beanBalance ?? profile?.gold, 0);
+            const mmrRaw = beanProfile?.mmrScore ?? profile?.mmrScore;
+            const gamesPlayed = toNumOr(profile?.gamesPlayed, 0);
+            const gamesWon = toNumOr(profile?.gamesWon, 0);
+            const derivedMmr = Math.max(100, 1000 + gamesWon * 16 - Math.max(0, gamesPlayed - gamesWon) * 8);
+            const mmrScore =
+                (Number.isFinite(Number(mmrRaw)) && Number(mmrRaw) !== 1000)
+                    ? toNumOr(mmrRaw, 1000)
+                    : (gamesPlayed > 0 ? derivedMmr : 1000);
+            const tier = String(beanProfile?.tier ?? selectedBeanTier ?? '--');
+            const beanEl = document.getElementById('home-bean-balance');
+            const mmrEl = document.getElementById('home-mmr-score');
+            const tierEl = document.getElementById('home-bean-tier');
+            if (beanEl) beanEl.textContent = String(beanBalance);
+            if (mmrEl) mmrEl.textContent = String(mmrScore);
+            if (tierEl) tierEl.textContent = tier || '--';
+            if (tier) setSelectedBeanTier(tier);
+            if (beanProfile && Object.prototype.hasOwnProperty.call(beanProfile, 'dailyClaimAvailable')) {
+                const statusEl = document.getElementById('home-daily-status');
+                if (statusEl) statusEl.textContent = beanProfile.dailyClaimAvailable ? 'Claimable' : 'Claimed';
+            }
+            renderLobbyProfile(profile || currentAuthUser || {}, beanProfile || {});
+        }
+
         async function loadLobbyOverview() {
             const historyHost = document.getElementById('friend-room-history');
             if (!IS_MULTIPLAYER) {
@@ -2529,22 +2559,18 @@
                 return;
             }
             try {
+                const bust = `_ts=${Date.now()}`;
                 const [overview, leaderboard] = await Promise.all([
-                    apiGet('/api/home/overview'),
+                    apiGet(`/api/home/overview?${bust}`),
                     apiGet('/api/leaderboard?type=coins').catch(() => ({ entries: [] }))
                 ]);
                 const profile = overview?.profile || {};
                 const beanProfile = overview?.beanProfile || {};
-                document.getElementById('home-bean-balance').textContent = String(Number(beanProfile.beanBalance || profile.gold || 0));
-                document.getElementById('home-mmr-score').textContent = String(Number(beanProfile.mmrScore || profile.mmrScore || 1000));
-                document.getElementById('home-bean-tier').textContent = beanProfile.tier || '--';
-                setSelectedBeanTier(beanProfile.tier || selectedBeanTier);
-                document.getElementById('home-daily-status').textContent = beanProfile.dailyClaimAvailable ? 'Claimable' : 'Claimed';
+                applyBeanProfileToHome(beanProfile, profile);
                 renderLobbyTasks(overview?.dailyTasks || []);
                 renderLobbyLeaderboard(leaderboard?.entries || []);
                 renderLobbyTournaments(overview?.tournaments || []);
                 renderLobbyInventory(overview?.inventoryPreview || {});
-                renderLobbyProfile(profile, beanProfile);
                 if (historyHost) {
                     if (currentRoomMode === 'friend' && currentRoomId) {
                         try {
@@ -6415,7 +6441,8 @@
                         return;
                     }
                     try {
-                        await apiPost('/api/beans/claim-daily');
+                        const data = await apiPost('/api/beans/claim-daily');
+                        try { applyBeanProfileToHome(data?.beanProfile || {}, currentAuthUser || {}); } catch (_) {}
                         setLobbyFeedback('Daily beans claimed.');
                         await loadLobbyOverview();
                     } catch (e) {
@@ -6437,7 +6464,8 @@
                         return;
                     }
                     try {
-                        await apiPost('/api/beans/ad-reward');
+                        const data = await apiPost('/api/beans/ad-reward');
+                        try { applyBeanProfileToHome(data?.beanProfile || {}, currentAuthUser || {}); } catch (_) {}
                         setLobbyFeedback('Ad reward granted.');
                         await loadLobbyOverview();
                     } catch (e) {
@@ -6769,8 +6797,8 @@
                     return;
                 }
                 const occupiedCount = gameState.seatConfig.filter(s => s !== null).length;
-                if(occupiedCount < 3) {
-                    alert("At least 3 players (including AI) are needed to start!");
+                if(occupiedCount < 2) {
+                    alert("At least 2 players (including AI) are needed to start!");
                     return;
                 }
 
