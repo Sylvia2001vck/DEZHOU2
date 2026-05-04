@@ -27,6 +27,7 @@ jobs:
           host: ${{ secrets.CVM_HOST }}
           username: ${{ secrets.CVM_USER }}
           key: ${{ secrets.CVM_SSH_KEY }}
+          command_timeout: 30m
           script_stop: true
           script: |
             set -euo pipefail
@@ -62,10 +63,18 @@ jobs:
             # - only rebuild and restart gateway container
             echo "[deploy] ensure room-worker is up (no build)"
             docker compose up -d --no-build room-worker
-            echo "[deploy] build gateway only (no C++ rebuild)"
-            docker compose build gateway
-            echo "[deploy] restart gateway only"
-            docker compose up -d --no-deps gateway
+            AVAIL_MB="$(free -m | awk '/Mem:/ {print $7}')"
+            AVAIL_MB="${AVAIL_MB:-0}"
+            echo "[deploy] available memory: ${AVAIL_MB} MB"
+            if [[ "$AVAIL_MB" -lt 1200 ]]; then
+              echo "[deploy] low memory, skip gateway build to avoid OOM; restarting with existing image"
+              docker compose up -d --no-deps --no-build gateway
+            else
+              echo "[deploy] build gateway only (no C++ rebuild)"
+              docker compose build gateway
+              echo "[deploy] restart gateway only"
+              docker compose up -d --no-deps gateway
+            fi
 
             echo "[deploy] compose status:"
             docker compose ps
