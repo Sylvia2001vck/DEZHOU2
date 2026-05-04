@@ -226,19 +226,22 @@ public final class RoomControlWsService {
   }
 
   private void broadcastRoomState(Room room) {
-    Map<String, Object> payload = buildRoomState(room);
     for (String sid : room.socketIds) {
       Client cc = clients.get(sid);
       if (cc == null) continue;
+      Map<String, Object> payload = buildRoomState(room, sid);
       sendEvent(cc, "room_state", payload);
     }
   }
 
-  private Map<String, Object> buildRoomState(Room room) {
-    List<Map<String, Object>> seats = new ArrayList<>();
+  private Map<String, Object> buildRoomState(Room room, String forSocketId) {
+    List<Object> seats = new ArrayList<>();
     for (int i = 0; i < MAX_SEATS; i++) {
       Seat s = room.seats.get(i);
-      if (s == null) continue;
+      if (s == null) {
+        seats.add(null);
+        continue;
+      }
       Map<String, Object> one = new HashMap<>();
       one.put("seatIdx", i);
       one.put("type", s.type);
@@ -260,7 +263,7 @@ public final class RoomControlWsService {
     state.put("roomId", room.roomId);
     state.put("hostSocketId", nullToEmpty(room.hostSocketId));
     state.put("hostSeatIdx", findHostSeatIdx(room));
-    state.put("isHost", false);
+    state.put("isHost", forSocketId != null && forSocketId.equals(room.hostSocketId));
     state.put("started", room.started);
     state.put("ownerUserId", 0);
     state.put("roomCode", room.roomId);
