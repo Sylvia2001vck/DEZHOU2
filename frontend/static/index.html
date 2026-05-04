@@ -2838,6 +2838,7 @@
                 } catch (_) {}
             });
             socket.on('error_msg', ({msg}) => {
+                try { console.warn('[ws error_msg]', msg); } catch (_) {}
                 alert(msg);
                 // If we failed to join (e.g. room already started), return to lobby instead of getting stuck on seat screen.
                 if (pendingJoin && !joinedRoomOnce) {
@@ -6344,6 +6345,18 @@
                         e.stopPropagation();
                         if (IS_MULTIPLAYER) {
                             if (!ensureOnlineSession('take a seat')) return;
+                            // Defensive re-join: ensure server-side session has room context before take_seat.
+                            try {
+                                if (currentRoomId) {
+                                    socket.emit('join_room', {
+                                        roomId: currentRoomId,
+                                        name: currentUsername,
+                                        clientId: CLIENT_ID,
+                                        reconnectToken: getReconnectToken(currentRoomId),
+                                        sessionId: getSessionId(currentRoomId)
+                                    });
+                                }
+                            } catch (_) {}
                             socket.emit('take_seat', {
                                 seatIdx: i,
                                 reconnectToken: getReconnectToken(currentRoomId),
