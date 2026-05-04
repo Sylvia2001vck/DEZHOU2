@@ -46,11 +46,13 @@ public final class RoomControlWsService {
     c.loginUsername = gid == null ? "" : safe(gid.loginUsername);
     c.displayName = c.loginUsername.isEmpty() ? "Player" : c.loginUsername;
     clients.put(socketId, c);
+    System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
   }
 
   public void onClose(String socketId) {
     Client c = clients.remove(socketId);
     if (c == null) return;
+    System.err.println("[room-ws] close sid=" + socketId + " room=" + c.roomId + " seat=" + c.seatIdx);
     if (c.roomId == null || c.roomId.isEmpty()) return;
     Room room = rooms.get(c.roomId);
     if (room == null) return;
@@ -82,6 +84,7 @@ public final class RoomControlWsService {
       if (!"control_event".equals(type)) return;
       String eventName = msg.has("eventName") ? safe(msg.get("eventName").getAsString()) : "";
       JsonObject payload = msg.has("payload") && msg.get("payload").isJsonObject() ? msg.getAsJsonObject("payload") : new JsonObject();
+      System.err.println("[room-ws] recv sid=" + socketId + " event=" + eventName + " payload=" + payload);
       switch (eventName) {
         case "join_room" -> handleJoinRoom(c, payload);
         case "take_seat" -> handleTakeSeat(c, payload);
@@ -95,6 +98,7 @@ public final class RoomControlWsService {
         }
       }
     } catch (Exception e) {
+      System.err.println("[room-ws] parse error sid=" + socketId + " err=" + e.getMessage());
       sendEvent(c, "error_msg", mapOf("msg", "Invalid control message."));
     }
   }
