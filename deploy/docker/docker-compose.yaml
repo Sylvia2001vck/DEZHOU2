@@ -32,6 +32,8 @@ services:
       NEBULA_REPO_ROOT: /app
       NEBULA_ROOM_WORKER_BIND: "0.0.0.0"
       NEBULA_ROOM_WORKER_PORT: "3101"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "ss -ltn | grep -q ':3101 ' || exit 1"]
       interval: 5s
@@ -59,6 +61,8 @@ services:
       PORT: "8080"
       NEBULA_ROOM_WORKER_HOST: room-worker
       NEBULA_ROOM_WORKER_PORT: "3101"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
       interval: 30s
