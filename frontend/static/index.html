@@ -2834,6 +2834,10 @@
             if (!ensureOnlineSession('join a room')) return;
             const room = String(roomCode || '').trim().toUpperCase();
             if (!room) throw new Error('Room code is required.');
+            const rebound = await rebindSocketToCurrentSession('enter-room');
+            if (!rebound) {
+                throw new Error('Session is syncing. Please retry in 1-2 seconds.');
+            }
             currentRoomId = room;
             updateRoomContextUI();
             pendingJoin = true;
