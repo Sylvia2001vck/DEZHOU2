@@ -33,6 +33,9 @@ public final class RoomControlWsService {
   private static final int BET_UNIT = 50;
   private static final int MIN_PLAYERS_TO_START = 2;
   private static final long RECONNECT_GRACE_MS = 120_000L;
+  private static final boolean WS_VERBOSE_LOG =
+      "1".equals(System.getenv("NEBULA_WS_VERBOSE_LOG"))
+          || "true".equalsIgnoreCase(System.getenv("NEBULA_WS_VERBOSE_LOG"));
 
   private final AuthService auth;
   private final Gson gson = new Gson();
@@ -53,13 +56,17 @@ public final class RoomControlWsService {
     c.loginUsername = gid == null ? "" : safe(gid.loginUsername);
     c.displayName = c.loginUsername.isEmpty() ? "Player" : c.loginUsername;
     clients.put(socketId, c);
-    System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
+    if (WS_VERBOSE_LOG) {
+      System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
+    }
   }
 
   public void onClose(String socketId) {
     Client c = clients.remove(socketId);
     if (c == null) return;
-    System.err.println("[room-ws] close sid=" + socketId + " room=" + c.roomId + " seat=" + c.seatIdx);
+    if (WS_VERBOSE_LOG) {
+      System.err.println("[room-ws] close sid=" + socketId + " room=" + c.roomId + " seat=" + c.seatIdx);
+    }
     if (c.roomId == null || c.roomId.isEmpty()) return;
     Room room = rooms.get(c.roomId);
     if (room == null) return;
@@ -92,7 +99,9 @@ public final class RoomControlWsService {
       if (!"control_event".equals(type)) return;
       String eventName = msg.has("eventName") ? safe(msg.get("eventName").getAsString()) : "";
       JsonObject payload = msg.has("payload") && msg.get("payload").isJsonObject() ? msg.getAsJsonObject("payload") : new JsonObject();
-      System.err.println("[room-ws] recv sid=" + socketId + " event=" + eventName + " payload=" + payload);
+      if (WS_VERBOSE_LOG) {
+        System.err.println("[room-ws] recv sid=" + socketId + " event=" + eventName + " payload=" + payload);
+      }
       switch (eventName) {
         case "join_room" -> handleJoinRoom(c, payload);
         case "take_seat" -> handleTakeSeat(c, payload);

@@ -26,6 +26,7 @@ services:
     restart: unless-stopped
     cpus: "0.60"
     mem_limit: "512m"
+    memswap_limit: "512m"
     networks:
       - nebula
     env_file:
@@ -42,6 +43,11 @@ services:
       timeout: 2s
       retries: 5
       start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   gateway:
     build:
@@ -51,6 +57,7 @@ services:
     restart: unless-stopped
     cpus: "1.00"
     mem_limit: "768m"
+    memswap_limit: "768m"
     networks:
       - nebula
     depends_on:
@@ -74,3 +81,8 @@ services:
       timeout: 3s
       retries: 5
       start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
