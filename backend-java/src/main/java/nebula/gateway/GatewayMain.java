@@ -172,7 +172,15 @@ public final class GatewayMain {
     String cookie = ctx.header("Cookie");
     byte[] body = ctx.bodyAsBytes();
     GatewayIdentity gid = auth.resolveFromCookie(cookie == null ? "" : cookie).orElse(null);
-    ApiProxyResult r = bridge.apiProxy(ctx.method().name(), uri, body, cookie == null ? "" : cookie, 60_000, gid);
+    long timeoutMs = ("/healthz".equals(ctx.path()) || "/readyz".equals(ctx.path())) ? 3_000 : 60_000;
+    ApiProxyResult r =
+        bridge.apiProxy(
+            ctx.method().name(),
+            uri,
+            body,
+            cookie == null ? "" : cookie,
+            timeoutMs,
+            gid);
     ctx.status(r.getStatus());
     if (!r.getContentType().isEmpty()) {
       ctx.contentType(r.getContentType());

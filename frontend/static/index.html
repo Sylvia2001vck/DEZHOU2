@@ -1195,6 +1195,8 @@
         let currentUsername = '';
         let currentAuthUser = null;
         let matchmakingPollTimer = null;
+        let matchmakingPollInFlight = false;
+        let matchmakingPollActive = false;
         let mpWired = false;
         let pendingJoin = false;
         let joinedRoomOnce = false;
@@ -1216,6 +1218,8 @@
         let opponentPlaceholderToken = 0;
         let lastOpponentPlaceholderHandNum = null;
         let authBusy = false;
+        let rebindSocketPromise = null;
+        let takeSeatAttemptNonce = 0;
         let nextHandPending = false;
         const cardRaycaster = new THREE.Raycaster();
         const cardPointerNdc = new THREE.Vector2();
@@ -2361,26 +2365,32 @@
 
         async function rebindSocketToCurrentSession(reason = '') {
             if (!IS_MULTIPLAYER) return true;
+            if (rebindSocketPromise) return rebindSocketPromise;
             const uid = Number(currentAuthUser?.userId || 0);
             if (uid <= 0) return false;
             if (socket && socket.connected && socketBoundAuthUserId === uid) return true;
-            try {
-                if (!createProtoSocketFactory) {
-                    const mod = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
-                    createProtoSocketFactory = mod?.createProtoSocket || null;
+            rebindSocketPromise = (async () => {
+                try {
+                    if (!createProtoSocketFactory) {
+                        const mod = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
+                        createProtoSocketFactory = mod?.createProtoSocket || null;
+                    }
+                    if (!createProtoSocketFactory) return false;
+                    try { socket?.disconnect?.(); } catch (_) {}
+                    mpWired = false;
+                    socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
+                    wireMultiplayer();
+                    const ok = await waitSocketConnected(4500);
+                    if (ok) socketBoundAuthUserId = uid;
+                    return ok;
+                } catch (e) {
+                    console.warn(`[auth-ws] rebind failed (${reason || 'unknown'})`, e);
+                    return false;
+                } finally {
+                    rebindSocketPromise = null;
                 }
-                if (!createProtoSocketFactory) return false;
-                try { socket?.disconnect?.(); } catch (_) {}
-                mpWired = false;
-                socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
-                wireMultiplayer();
-                const ok = await waitSocketConnected(4500);
-                if (ok) socketBoundAuthUserId = uid;
-                return ok;
-            } catch (e) {
-                console.warn(`[auth-ws] rebind failed (${reason || 'unknown'})`, e);
-                return false;
-            }
+            })();
+            return rebindSocketPromise;
         }
 
         function updateLobbyAccountCard(user) {
@@ -2786,10 +2796,12 @@
         }
 
         function stopMatchmakingPolling() {
+            matchmakingPollActive = false;
             if (matchmakingPollTimer) {
-                clearInterval(matchmakingPollTimer);
+                clearTimeout(matchmakingPollTimer);
                 matchmakingPollTimer = null;
             }
+            matchmakingPollInFlight = false;
             const cancelBtn = document.getElementById('cancel-match-btn');
             if (cancelBtn) cancelBtn.style.display = 'none';
         }
@@ -2816,9 +2828,16 @@
 
         function startMatchmakingPolling() {
             stopMatchmakingPolling();
+            matchmakingPollActive = true;
             const cancelBtn = document.getElementById('cancel-match-btn');
             if (cancelBtn) cancelBtn.style.display = 'block';
-            matchmakingPollTimer = setInterval(async () => {
+            const pollOnce = async () => {
+                if (!matchmakingPollActive) return;
+                if (matchmakingPollInFlight) {
+                    matchmakingPollTimer = setTimeout(pollOnce, 1200);
+                    return;
+                }
+                matchmakingPollInFlight = true;
                 try {
                     const data = await apiGet('/api/matchmaking/status');
                     if (data?.state === 'matched' && data?.roomCode) {
@@ -2826,8 +2845,15 @@
                     } else if (data?.state === 'queued') {
                         setLobbyFeedback(`Matchmaking... ${Number(data.queuedPlayers || 0)} / ${Number(data.threshold || 0)} players`);
                     }
-                } catch (_) {}
-            }, 2000);
+                } catch (_) {
+                } finally {
+                    matchmakingPollInFlight = false;
+                    if (matchmakingPollActive) {
+                        matchmakingPollTimer = setTimeout(pollOnce, 2000);
+                    }
+                }
+            };
+            matchmakingPollTimer = setTimeout(pollOnce, 0);
         }
 
         async function enterLobbyRoom(roomCode) {
@@ -6821,10 +6847,26 @@
                                 reconnectToken: getReconnectToken(currentRoomId),
                                 sessionId: getSessionId(currentRoomId)
                             };
-                            try { socket.emit('take_seat', seatPayload); } catch (_) {}
-                            // Retry bursts for unstable WS timing on cloud (first frame can be dropped/raced).
-                            setTimeout(() => { try { socket.emit('take_seat', seatPayload); } catch (_) {} }, 150);
-                            setTimeout(() => { try { socket.emit('take_seat', seatPayload); } catch (_) {} }, 600);
+                            const attemptNonce = ++takeSeatAttemptNonce;
+                            const emitTakeSeat = () => {
+                                try { socket.emit('take_seat', seatPayload); } catch (_) {}
+                            };
+                            const seatConfirmed = () => {
+                                const seat = lastRoomState?.seats?.[i];
+                                return !!(seat && seat.socketId && socket?.id && seat.socketId === socket.id);
+                            };
+                            emitTakeSeat();
+                            // Keep lightweight retries for jitter, avoid fixed burst spam.
+                            setTimeout(() => {
+                                if (attemptNonce !== takeSeatAttemptNonce) return;
+                                if (seatConfirmed()) return;
+                                emitTakeSeat();
+                            }, 350);
+                            setTimeout(() => {
+                                if (attemptNonce !== takeSeatAttemptNonce) return;
+                                if (seatConfirmed()) return;
+                                emitTakeSeat();
+                            }, 900);
                             mySeatIdx = i;
                             gameState.myPlayerIdx = i;
                             try { window.__updateDecorPanel?.(); } catch (_) {}
