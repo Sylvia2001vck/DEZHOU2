@@ -24,6 +24,8 @@ services:
         ROOM_WORKER_BUILD_JOBS: "${ROOM_WORKER_BUILD_JOBS:-1}"
     image: nebula-room-worker:latest
     restart: unless-stopped
+    cpus: "0.60"
+    mem_limit: "512m"
     networks:
       - nebula
     env_file:
@@ -36,10 +38,10 @@ services:
       - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "ss -ltn | grep -q ':3101 ' || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 20s
+      interval: 20s
+      timeout: 2s
+      retries: 5
+      start_period: 30s
 
   gateway:
     build:
@@ -47,6 +49,8 @@ services:
       dockerfile: deploy/docker/Dockerfile.gateway
     image: nebula-gateway:latest
     restart: unless-stopped
+    cpus: "1.00"
+    mem_limit: "768m"
     networks:
       - nebula
     depends_on:
@@ -61,11 +65,12 @@ services:
       PORT: "8080"
       NEBULA_ROOM_WORKER_HOST: room-worker
       NEBULA_ROOM_WORKER_PORT: "3101"
+      JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:MaxMetaspaceSize=192m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -sf --max-time 2 http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 45s
+      timeout: 3s
+      retries: 5
+      start_period: 90s
