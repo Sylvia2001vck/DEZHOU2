@@ -17,6 +17,8 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -59,6 +61,7 @@ public final class RoomControlWsService {
     if (WS_VERBOSE_LOG) {
       System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
     }
+    emitAuthState(c, gid);
   }
 
   public void onClose(String socketId) {
@@ -122,6 +125,7 @@ public final class RoomControlWsService {
 
   private void handleJoinRoom(Client c, JsonObject payload) {
     if (c.userId <= 0) {
+      emitAuthState(c, null);
       sendEvent(c, "error_msg", mapOf("msg", "Please log in before joining a room."));
       return;
     }
@@ -506,6 +510,39 @@ public final class RoomControlWsService {
       c.ctx.send(out.toString());
     } catch (Exception ignored) {
     }
+  }
+
+  private void emitAuthState(Client c, GatewayIdentity gid) {
+    if (c == null) return;
+    boolean authenticated = gid != null && gid.userId > 0;
+    if (!authenticated) {
+      sendEvent(c, "auth_state", mapOf("authenticated", false, "profile", null));
+      return;
+    }
+    Map<String, Object> profile = new HashMap<>();
+    profile.put("userId", gid.userId);
+    profile.put("externalId", gid.loginUsername);
+    profile.put("loginUsername", gid.loginUsername);
+    profile.put("displayName", gid.loginUsername);
+    profile.put("username", gid.loginUsername);
+    profile.put("avatar", "");
+    profile.put("gold", 0);
+    profile.put("gamesPlayed", 0);
+    profile.put("gamesWon", 0);
+    try {
+      if (gid.profileB64 != null && !gid.profileB64.isEmpty()) {
+        String decoded = new String(Base64.getDecoder().decode(gid.profileB64), StandardCharsets.UTF_8);
+        JsonObject po = JsonParser.parseString(decoded).getAsJsonObject();
+        if (po.has("displayName") && !po.get("displayName").isJsonNull()) profile.put("displayName", safe(po.get("displayName").getAsString()));
+        if (po.has("username") && !po.get("username").isJsonNull()) profile.put("username", safe(po.get("username").getAsString()));
+        if (po.has("avatar") && !po.get("avatar").isJsonNull()) profile.put("avatar", safe(po.get("avatar").getAsString()));
+        if (po.has("gold") && !po.get("gold").isJsonNull()) profile.put("gold", po.get("gold").getAsLong());
+        if (po.has("gamesPlayed") && !po.get("gamesPlayed").isJsonNull()) profile.put("gamesPlayed", po.get("gamesPlayed").getAsInt());
+        if (po.has("gamesWon") && !po.get("gamesWon").isJsonNull()) profile.put("gamesWon", po.get("gamesWon").getAsInt());
+      }
+    } catch (Exception ignored) {
+    }
+    sendEvent(c, "auth_state", mapOf("authenticated", true, "profile", profile));
   }
 
   private void broadcastPlayerAction(Room room, int seatIdx, String text) {

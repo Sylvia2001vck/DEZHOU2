@@ -1127,6 +1127,7 @@
         let socket = null;
         let createProtoSocketFactory = null;
         let socketBoundAuthUserId = 0;
+        let wsAuthenticatedUserId = 0;
         if (IS_MULTIPLAYER) {
             try {
                 const { createProtoSocket } = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
@@ -2363,12 +2364,34 @@
             });
         }
 
+        async function waitSocketAuthUser(userId, timeoutMs = 3500) {
+            const uid = Number(userId || 0);
+            if (!IS_MULTIPLAYER || !socket || uid <= 0) return false;
+            if (Number(wsAuthenticatedUserId || 0) === uid) return true;
+            return await new Promise((resolve) => {
+                let done = false;
+                const finish = (ok) => {
+                    if (done) return;
+                    done = true;
+                    try { socket.off('auth_state', onAuthState); } catch (_) {}
+                    clearTimeout(timer);
+                    resolve(!!ok);
+                };
+                const onAuthState = ({ authenticated, profile } = {}) => {
+                    const authUid = authenticated ? Number(profile?.userId || 0) : 0;
+                    if (authUid === uid) finish(true);
+                };
+                const timer = setTimeout(() => finish(Number(wsAuthenticatedUserId || 0) === uid), timeoutMs);
+                try { socket.on('auth_state', onAuthState); } catch (_) {}
+            });
+        }
+
         async function rebindSocketToCurrentSession(reason = '') {
             if (!IS_MULTIPLAYER) return true;
             if (rebindSocketPromise) return rebindSocketPromise;
             const uid = Number(currentAuthUser?.userId || 0);
             if (uid <= 0) return false;
-            if (socket && socket.connected && socketBoundAuthUserId === uid) return true;
+            if (socket && socket.connected && socketBoundAuthUserId === uid && wsAuthenticatedUserId === uid) return true;
             rebindSocketPromise = (async () => {
                 try {
                     if (!createProtoSocketFactory) {
@@ -2376,13 +2399,22 @@
                         createProtoSocketFactory = mod?.createProtoSocket || null;
                     }
                     if (!createProtoSocketFactory) return false;
-                    try { socket?.disconnect?.(); } catch (_) {}
-                    mpWired = false;
-                    socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
-                    wireMultiplayer();
-                    const ok = await waitSocketConnected(4500);
-                    if (ok) socketBoundAuthUserId = uid;
-                    return ok;
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                        try { socket?.disconnect?.(); } catch (_) {}
+                        wsAuthenticatedUserId = 0;
+                        mpWired = false;
+                        socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
+                        wireMultiplayer();
+                        const connected = await waitSocketConnected(4500);
+                        if (!connected) continue;
+                        const authed = await waitSocketAuthUser(uid, 3500);
+                        if (authed) {
+                            socketBoundAuthUserId = uid;
+                            return true;
+                        }
+                        await new Promise((r) => setTimeout(r, 300 + attempt * 250));
+                    }
+                    return false;
                 } catch (e) {
                     console.warn(`[auth-ws] rebind failed (${reason || 'unknown'})`, e);
                     return false;
@@ -2395,7 +2427,10 @@
 
         function updateLobbyAccountCard(user) {
             currentAuthUser = user || null;
-            socketBoundAuthUserId = user ? socketBoundAuthUserId : 0;
+            if (!user) {
+                socketBoundAuthUserId = 0;
+                wsAuthenticatedUserId = 0;
+            }
             const displayName = user?.displayName || user?.username || '';
             const loginUsername = user?.loginUsername || '';
             currentUsername = displayName || loginUsername || '';
@@ -3048,12 +3083,15 @@
                 }
             });
             socket.on('auth_state', ({ authenticated, profile }) => {
+                wsAuthenticatedUserId = authenticated ? Number(profile?.userId || 0) : 0;
+                if (authenticated) socketBoundAuthUserId = wsAuthenticatedUserId || socketBoundAuthUserId;
                 if (authenticated && profile) {
                     applyAuthenticatedLobby(profile);
                     loadLobbyOverview().catch(() => {});
                 }
             });
             socket.on('disconnect', () => {
+                wsAuthenticatedUserId = 0;
                 try { voiceLeaveAndCleanup(false); } catch(_) {}
                 setVoiceStatus('Voice: Disconnected');
                 if (matchmakingPollActive) {
@@ -3505,41 +3543,11 @@
                     }
                 } catch (_) {}
 
-                // Rebuy button: only for seated players who are busted, between hands
+                // Rebuy disabled: no top-up during a match.
                 try {
                     if (btnRebuy) {
-                        const meS = (s.players || []).find(pp => pp.seatIdx === mySeatIdx);
-                        const busted = !!meS && Number(meS.chips || 0) <= 0;
-                        const betweenHands = (s.round === 'HAND_OVER' || s.round === 'WAITING');
-                        btnRebuy.style.display = (IS_MULTIPLAYER && busted && betweenHands && !matchOverReceived) ? 'block' : 'none';
-                        btnRebuy.disabled = !(IS_MULTIPLAYER && busted && betweenHands);
-                    }
-                } catch (_) {}
-
-                // Auto prompt: if you are busted between hands, ask whether to rebuy and rejoin next hand
-                try {
-                    if (IS_MULTIPLAYER && !matchOverReceived) {
-                        const meS = (s.players || []).find(pp => pp.seatIdx === mySeatIdx);
-                        const busted = !!meS && Number(meS.chips || 0) <= 0;
-                        const betweenHands = (s.round === 'HAND_OVER' || s.round === 'WAITING');
-                        const handKey = `${s.handNum || 0}:${s.round || ''}`;
-                        if (busted && betweenHands && rebuyPromptedForHand !== handKey) {
-                            rebuyPromptedForHand = handKey;
-                            setTimeout(() => {
-                                const ok = confirm('You are out of chips.\n\nRebuy to re-enter next hand?');
-                                if (!ok) return;
-                                const def = Number.isFinite(Number(gameState.initialChips)) ? Number(gameState.initialChips) : 1000;
-                                const raw = prompt('Rebuy amount (>=1000 and multiple of 50):', String(def));
-                                if (raw === null) return;
-                                const amt = Number(raw);
-                                if (!Number.isFinite(amt) || amt < 1000 || (amt % 50) !== 0) {
-                                    alert('Rebuy amount must be >=1000 and a multiple of 50.');
-                                    return;
-                                }
-                                try { socket.emit('rebuy', { amount: amt }); } catch(_) {}
-                                addToHistory(`Rebuy: $${amt} (applies next hand)`);
-                            }, 50);
-                        }
+                        btnRebuy.style.display = 'none';
+                        btnRebuy.disabled = true;
                     }
                 } catch (_) {}
                 // 同步玩家筹码/弃牌
@@ -7126,18 +7134,7 @@
                 }
             };
             document.getElementById('btn-rebuy').onclick = () => {
-                if (!IS_MULTIPLAYER) return;
-                if (!(Number.isInteger(mySeatIdx) && mySeatIdx >= 0)) return;
-                const def = Number.isFinite(Number(gameState.initialChips)) ? Number(gameState.initialChips) : 1000;
-                const raw = prompt('Rebuy amount (>=1000 and multiple of 50):', String(def));
-                if (raw === null) return;
-                const amt = Number(raw);
-                if (!Number.isFinite(amt) || amt < 1000 || (amt % 50) !== 0) {
-                    alert('Rebuy amount must be >=1000 and a multiple of 50.');
-                    return;
-                }
-                try { socket.emit('rebuy', { amount: amt }); } catch(_) {}
-                addToHistory(`Rebuy: $${amt} (applies next hand)`);
+                alert('Rebuy is disabled in this mode. If you are out of chips, please wait for settlement.');
             };
             document.getElementById('btn-next').onclick = () => {
                 if (IS_MULTIPLAYER) {

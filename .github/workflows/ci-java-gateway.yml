@@ -2,6 +2,10 @@
 # CD（自动部署到你的云）在 Railway/Render/VPS 等平台另行绑定分支并配置环境变量。
 name: CI Java Gateway
 
+permissions:
+  contents: read
+  packages: write
+
 on:
   push:
     branches: [main, master]
@@ -26,3 +30,44 @@ jobs:
 
       - name: Package (shade JAR)
         run: mvn -B -ntp -DskipTests package
+
+  publish_gateway_image:
+    if: ${{ github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master') }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive GHCR image name
+      id: vars
+      run: |
+        OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+        echo "image=ghcr.io/${OWNER_LC}/dezhou-gateway" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.vars.outputs.image }}
+        tags: |
+          type=raw,value=latest
+          type=sha
+
+      - name: Build and push gateway image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: deploy/docker/Dockerfile.gateway
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}

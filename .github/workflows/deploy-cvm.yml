@@ -1,20 +1,33 @@
-# push 到 main/master 后，SSH 登录腾讯云 CVM 执行部署。
+# CI 成功后，SSH 登录腾讯云 CVM 拉取最新镜像并重启 gateway。
 # 手动触发（workflow_dispatch）同样可用；并发部署会自动互斥。
 #
 # 必需 Secrets（Settings → Secrets and variables → Actions）：
 #   CVM_HOST       服务器公网 IP 或域名
 #   CVM_USER       如 ubuntu
 #   CVM_SSH_KEY    用于登录的私钥全文（BEGIN … END）
+#   GHCR_USER      有 packages:read 的 GitHub 用户名（通常就是你的账号）
+#   GHCR_TOKEN     该用户 PAT（至少 read:packages）
 name: Deploy to CVM
 
 on:
-  push:
-    branches: [main, master]
+  workflow_run:
+    workflows: ["CI Java Gateway"]
+    types: [completed]
   workflow_dispatch:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          (
+            github.event.workflow_run.head_branch == 'main' ||
+            github.event.workflow_run.head_branch == 'master'
+          )
+        )
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -55,26 +68,32 @@ jobs:
               exit 1
             fi
 
+            OWNER_RAW="${{ github.repository_owner }}"
+            OWNER_LC="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
+            export GATEWAY_IMAGE="ghcr.io/${OWNER_LC}/dezhou-gateway:latest"
+            echo "[deploy] gateway image: ${GATEWAY_IMAGE}"
+
+            GHCR_USER="${{ secrets.GHCR_USER }}"
+            GHCR_TOKEN="${{ secrets.GHCR_TOKEN }}"
+            if [[ -z "$GHCR_USER" || -z "$GHCR_TOKEN" ]]; then
+              echo "[deploy] missing GHCR_USER or GHCR_TOKEN secret" >&2
+              exit 1
+            fi
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
             echo "[deploy] compose services:"
             docker compose config --services
 
-            # Low-memory safe deploy:
-            # - never rebuild room-worker (C++)
-            # - only rebuild and restart gateway container
+            # Deploy path (no compile on CVM):
+            # - keep room-worker running
+            # - pull latest gateway image from GHCR
+            # - restart gateway container only
             echo "[deploy] ensure room-worker is up (no build)"
             docker compose up -d --no-build room-worker
-            AVAIL_MB="$(free -m | awk '/Mem:/ {print $7}')"
-            AVAIL_MB="${AVAIL_MB:-0}"
-            echo "[deploy] available memory: ${AVAIL_MB} MB"
-            if [[ "$AVAIL_MB" -lt 1200 ]]; then
-              echo "[deploy] low memory, skip gateway build to avoid OOM; restarting with existing image"
-              docker compose up -d --no-deps --no-build gateway
-            else
-              echo "[deploy] build gateway only (no C++ rebuild)"
-              docker compose build gateway
-              echo "[deploy] restart gateway only"
-              docker compose up -d --no-deps gateway
-            fi
+            echo "[deploy] pull latest gateway image from GHCR"
+            docker compose pull gateway
+            echo "[deploy] restart gateway only"
+            docker compose up -d --no-deps --no-build gateway
 
             echo "[deploy] compose status:"
             docker compose ps

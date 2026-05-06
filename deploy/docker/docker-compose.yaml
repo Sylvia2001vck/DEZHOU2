@@ -53,7 +53,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.gateway
-    image: nebula-gateway:latest
+    image: "${GATEWAY_IMAGE:-nebula-gateway:latest}"
     restart: unless-stopped
     cpus: "1.00"
     mem_limit: "768m"
