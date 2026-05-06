@@ -2833,6 +2833,11 @@
             if (cancelBtn) cancelBtn.style.display = 'block';
             const pollOnce = async () => {
                 if (!matchmakingPollActive) return;
+                // WS-first: when realtime channel is healthy, skip HTTP status polling.
+                if (socket && socket.connected) {
+                    matchmakingPollTimer = setTimeout(pollOnce, document.hidden ? 15000 : 8000);
+                    return;
+                }
                 if (matchmakingPollInFlight) {
                     matchmakingPollTimer = setTimeout(pollOnce, 1200);
                     return;
@@ -2849,7 +2854,8 @@
                 } finally {
                     matchmakingPollInFlight = false;
                     if (matchmakingPollActive) {
-                        matchmakingPollTimer = setTimeout(pollOnce, 2000);
+                        const nextDelay = document.hidden ? 12000 : 2500;
+                        matchmakingPollTimer = setTimeout(pollOnce, nextDelay);
                     }
                 }
             };
@@ -3029,6 +3035,17 @@
                     } catch (_) {}
                 }
                 voiceJoinIfPossible();
+                if (matchmakingPollActive) {
+                    // WS recovered -> suspend fallback HTTP polling pressure.
+                    if (matchmakingPollTimer) {
+                        clearTimeout(matchmakingPollTimer);
+                        matchmakingPollTimer = null;
+                    }
+                    matchmakingPollInFlight = false;
+                    matchmakingPollTimer = setTimeout(() => {
+                        if (matchmakingPollActive) startMatchmakingPolling();
+                    }, 1000);
+                }
             });
             socket.on('auth_state', ({ authenticated, profile }) => {
                 if (authenticated && profile) {
@@ -3039,6 +3056,17 @@
             socket.on('disconnect', () => {
                 try { voiceLeaveAndCleanup(false); } catch(_) {}
                 setVoiceStatus('Voice: Disconnected');
+                if (matchmakingPollActive) {
+                    // Realtime channel lost -> enable HTTP fallback promptly.
+                    if (matchmakingPollTimer) {
+                        clearTimeout(matchmakingPollTimer);
+                        matchmakingPollTimer = null;
+                    }
+                    matchmakingPollInFlight = false;
+                    matchmakingPollTimer = setTimeout(() => {
+                        if (matchmakingPollActive) startMatchmakingPolling();
+                    }, 200);
+                }
             });
 
             socket.on('you_state', ({ seatIdx, isHost: hostFlag }) => {

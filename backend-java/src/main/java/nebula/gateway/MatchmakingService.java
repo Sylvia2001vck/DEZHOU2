@@ -6,15 +6,18 @@ import com.google.gson.JsonParser;
 import io.javalin.http.Context;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Bean / quick matchmaking. With {@code REDIS_HOST} + MySQL, matched groups are written to
@@ -24,6 +27,12 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class MatchmakingService {
   // Quick match starts as soon as 2 players are available.
   private static final int THRESHOLD = 2;
+  private static final long QUEUE_ENTRY_TTL_MS = 15 * 60_000L;
+  private static final long STATUS_CACHE_TTL_MS = 1200L;
+  private static final long STATUS_RATE_WINDOW_MS = 10_000L;
+  private static final int STATUS_RATE_PER_USER = 8;
+  private static final int STATUS_RATE_PER_IP = 40;
+  private static final long STATUS_RATE_BUCKET_TTL_MS = 5 * 60_000L;
 
   private final AuthService auth;
   private final RoomWorkerBridge bridge;
@@ -35,6 +44,9 @@ public final class MatchmakingService {
   private final Map<Long, AuthService.UserProfileSnapshot> queueMeta = new ConcurrentHashMap<>();
   private final Map<Long, PendingMatch> pending = new ConcurrentHashMap<>();
   private final Set<Long> classicQueued = ConcurrentHashMap.newKeySet();
+  private final Map<Long, StatusCache> statusCache = new ConcurrentHashMap<>();
+  private final Map<Long, SlidingWindowRateLimiter> statusRateByUser = new ConcurrentHashMap<>();
+  private final Map<String, SlidingWindowRateLimiter> statusRateByIp = new ConcurrentHashMap<>();
 
   public MatchmakingService(AuthService auth, RoomWorkerBridge bridge, MatchMessageDao matchDao) {
     this.auth = auth;
@@ -70,6 +82,7 @@ public final class MatchmakingService {
   }
 
   private void queueBean(Context ctx) throws Exception {
+    pruneStaleQueueState();
     Optional<AuthService.UserProfileSnapshot> prof = auth.snapshotFromCookie(ctx.header("Cookie"));
     if (prof.isEmpty()) {
       json(ctx, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
@@ -87,11 +100,12 @@ public final class MatchmakingService {
       String tier = form.getOrDefault("tier", beanTier(prof.get().gold()));
       removeFromAllQueues(prof.get().userId());
       pending.remove(prof.get().userId());
+      statusCache.remove(prof.get().userId());
       clearPendingRedis(prof.get().userId(), redis);
       BeanEntry e =
           new BeanEntry(
               prof.get().userId(), prof.get().gold(), beanMmr(prof.get().userId()), System.currentTimeMillis());
-      beanQueues.computeIfAbsent(tier, t -> new ArrayList<>()).add(e);
+      beanQueues.computeIfAbsent(tier, t -> new CopyOnWriteArrayList<>()).add(e);
       queueMeta.put(prof.get().userId(), prof.get());
       maybeMatchBeans(tier);
       respondQueueState(ctx, prof.get().userId(), tier);
@@ -101,6 +115,7 @@ public final class MatchmakingService {
   }
 
   private void queueDefault(Context ctx) throws Exception {
+    pruneStaleQueueState();
     Optional<AuthService.UserProfileSnapshot> prof = auth.snapshotFromCookie(ctx.header("Cookie"));
     if (prof.isEmpty()) {
       json(ctx, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
@@ -117,11 +132,12 @@ public final class MatchmakingService {
       String tier = beanTier(prof.get().gold());
       removeFromAllQueues(prof.get().userId());
       pending.remove(prof.get().userId());
+      statusCache.remove(prof.get().userId());
       clearPendingRedis(prof.get().userId(), redis);
       BeanEntry e =
           new BeanEntry(
               prof.get().userId(), prof.get().gold(), beanMmr(prof.get().userId()), System.currentTimeMillis());
-      beanQueues.computeIfAbsent(tier, t -> new ArrayList<>()).add(e);
+      beanQueues.computeIfAbsent(tier, t -> new CopyOnWriteArrayList<>()).add(e);
       queueMeta.put(prof.get().userId(), prof.get());
       classicQueued.add(prof.get().userId());
       maybeMatchBeans(tier);
@@ -136,6 +152,7 @@ public final class MatchmakingService {
   }
 
   private void cancel(Context ctx) {
+    pruneStaleQueueState();
     Optional<AuthService.UserProfileSnapshot> prof = auth.snapshotFromCookie(ctx.header("Cookie"));
     if (prof.isEmpty()) {
       json(ctx, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
@@ -147,16 +164,30 @@ public final class MatchmakingService {
     pending.remove(prof.get().userId());
     clearPendingRedis(prof.get().userId(), redis);
     queueMeta.remove(prof.get().userId());
+    statusCache.remove(prof.get().userId());
     json(ctx, 200, "{\"ok\":true,\"state\":\"idle\"}");
   }
 
   private void status(Context ctx) {
+    pruneStaleQueueState();
     Optional<AuthService.UserProfileSnapshot> prof = auth.snapshotFromCookie(ctx.header("Cookie"));
     if (prof.isEmpty()) {
       json(ctx, 401, "{\"ok\":false,\"message\":\"Login required.\"}");
       return;
     }
     long uid = prof.get().userId();
+    long now = System.currentTimeMillis();
+    String ip = safeIp(ctx.ip());
+    if (!allowStatusRate(uid, ip, now)) {
+      ctx.header("Retry-After", "2");
+      json(ctx, 429, "{\"ok\":false,\"message\":\"Too many status requests. Please retry shortly.\"}");
+      return;
+    }
+    StatusCache cached = statusCache.get(uid);
+    if (cached != null && now - cached.atMs <= STATUS_CACHE_TTL_MS) {
+      json(ctx, 200, cached.body);
+      return;
+    }
     PendingMatch pm = pendingFromRedisOrMemory(uid);
     BeanEntry bean = findBeanEntry(uid);
     boolean queuedClassic = classicQueued.contains(uid);
@@ -186,7 +217,9 @@ public final class MatchmakingService {
       out.append(",\"roomCode\":\"").append(esc(pm.roomCode)).append("\"");
     }
     out.append("}");
-    json(ctx, 200, out.toString());
+    String body = out.toString();
+    statusCache.put(uid, new StatusCache(now, body));
+    json(ctx, 200, body);
   }
 
   private PendingMatch pendingFromRedisOrMemory(long uid) {
@@ -203,6 +236,52 @@ public final class MatchmakingService {
       return null;
     }
     return pm;
+  }
+
+  private void pruneStaleQueueState() {
+    long now = System.currentTimeMillis();
+    long queueCutoff = now - QUEUE_ENTRY_TTL_MS;
+    for (List<BeanEntry> q : beanQueues.values()) {
+      q.removeIf(
+          e -> {
+            boolean stale = e.queuedAt < queueCutoff;
+            if (stale) {
+              queueMeta.remove(e.userId);
+              classicQueued.remove(e.userId);
+              pending.remove(e.userId);
+              statusCache.remove(e.userId);
+            }
+            return stale;
+          });
+    }
+    pending.entrySet().removeIf(
+        en -> {
+          boolean expired = en.getValue() != null && now > en.getValue().expiresAtMs;
+          if (expired) {
+            statusCache.remove(en.getKey());
+          }
+          return expired;
+        });
+    long cacheCutoff = now - (STATUS_CACHE_TTL_MS * 5);
+    statusCache.entrySet().removeIf(en -> en.getValue() == null || en.getValue().atMs < cacheCutoff);
+    long rateCutoff = now - STATUS_RATE_BUCKET_TTL_MS;
+    statusRateByUser.entrySet().removeIf(en -> en.getValue() == null || en.getValue().lastSeenMs() < rateCutoff);
+    statusRateByIp.entrySet().removeIf(en -> en.getValue() == null || en.getValue().lastSeenMs() < rateCutoff);
+  }
+
+  private boolean allowStatusRate(long uid, String ip, long nowMs) {
+    SlidingWindowRateLimiter userLimiter =
+        statusRateByUser.computeIfAbsent(uid, k -> new SlidingWindowRateLimiter());
+    SlidingWindowRateLimiter ipLimiter =
+        statusRateByIp.computeIfAbsent(ip, k -> new SlidingWindowRateLimiter());
+    boolean userOk = userLimiter.allow(nowMs, STATUS_RATE_WINDOW_MS, STATUS_RATE_PER_USER);
+    boolean ipOk = ipLimiter.allow(nowMs, STATUS_RATE_WINDOW_MS, STATUS_RATE_PER_IP);
+    return userOk && ipOk;
+  }
+
+  private static String safeIp(String ip) {
+    if (ip == null || ip.isEmpty()) return "unknown";
+    return ip;
   }
 
   private void respondQueueState(Context ctx, long userId, String tier) throws Exception {
@@ -418,6 +497,28 @@ public final class MatchmakingService {
     PendingMatch(String roomCode, long expiresAtMs) {
       this.roomCode = roomCode;
       this.expiresAtMs = expiresAtMs;
+    }
+  }
+
+  private record StatusCache(long atMs, String body) {}
+
+  private static final class SlidingWindowRateLimiter {
+    private final Deque<Long> hits = new ArrayDeque<>();
+    private long lastSeen = 0L;
+
+    synchronized boolean allow(long nowMs, long windowMs, int maxHits) {
+      this.lastSeen = nowMs;
+      long cutoff = nowMs - windowMs;
+      while (!hits.isEmpty() && hits.peekFirst() < cutoff) {
+        hits.pollFirst();
+      }
+      if (hits.size() >= maxHits) return false;
+      hits.addLast(nowMs);
+      return true;
+    }
+
+    synchronized long lastSeenMs() {
+      return lastSeen;
     }
   }
 }
