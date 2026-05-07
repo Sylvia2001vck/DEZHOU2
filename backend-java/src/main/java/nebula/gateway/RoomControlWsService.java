@@ -150,6 +150,7 @@ public final class RoomControlWsService {
   }
 
   private void handleJoinRoom(Client c, JsonObject payload) {
+    refreshClientAuthFromCookie(c);
     if (c.userId <= 0) {
       emitAuthState(c, null);
       sendEvent(c, "error_msg", mapOf("msg", "Please log in before joining a room."));
@@ -1398,6 +1399,21 @@ public final class RoomControlWsService {
 
   private static String nullToEmpty(String s) {
     return s == null ? "" : s;
+  }
+
+  private void refreshClientAuthFromCookie(Client c) {
+    if (c == null || c.ctx == null) return;
+    GatewayIdentity gid = auth.resolveFromCookie(nullToEmpty(c.ctx.header("Cookie"))).orElse(null);
+    if (gid == null || gid.userId <= 0) return;
+    boolean changed = c.userId != gid.userId || !safe(gid.loginUsername).equals(c.loginUsername);
+    c.userId = gid.userId;
+    c.loginUsername = safe(gid.loginUsername);
+    if (c.displayName == null || c.displayName.isEmpty() || "Player".equals(c.displayName)) {
+      c.displayName = c.loginUsername.isEmpty() ? "Player" : c.loginUsername;
+    }
+    if (changed) {
+      emitAuthState(c, gid);
+    }
   }
 
   private void reattachSeatIfMatched(Client c, Room room, long now) {
