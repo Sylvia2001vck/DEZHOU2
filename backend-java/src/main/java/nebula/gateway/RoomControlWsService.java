@@ -6,7 +6,9 @@ import com.google.gson.JsonParser;
 import io.javalin.websocket.WsContext;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -17,6 +19,9 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.Base64;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -35,6 +40,11 @@ public final class RoomControlWsService {
   private static final int BET_UNIT = 50;
   private static final int MIN_PLAYERS_TO_START = 2;
   private static final long RECONNECT_GRACE_MS = 120_000L;
+  private static final long ROOM_SWEEP_INTERVAL_SEC = 30L;
+  private static final long JOIN_DEBOUNCE_MS = 1200L;
+  private static final long JOIN_FLAP_WINDOW_MS = 12_000L;
+  private static final int JOIN_FLAP_MAX_HITS = 16;
+  private static final long ORPHAN_CLIENT_TTL_MS = 10 * 60_000L;
   private static final boolean WS_VERBOSE_LOG =
       "1".equals(System.getenv("NEBULA_WS_VERBOSE_LOG"))
           || "true".equalsIgnoreCase(System.getenv("NEBULA_WS_VERBOSE_LOG"));
@@ -44,9 +54,18 @@ public final class RoomControlWsService {
   private final Random random = new Random();
   private final Map<String, Client> clients = new ConcurrentHashMap<>();
   private final Map<String, Room> rooms = new ConcurrentHashMap<>();
+  private final Map<String, String> activeSocketBySession = new ConcurrentHashMap<>();
+  private final ScheduledExecutorService janitor =
+      Executors.newSingleThreadScheduledExecutor(
+          r -> {
+            Thread t = new Thread(r, "room-ws-janitor");
+            t.setDaemon(true);
+            return t;
+          });
 
   public RoomControlWsService(AuthService auth) {
     this.auth = auth;
+    janitor.scheduleWithFixedDelay(this::sweepRoomsSafely, 15, ROOM_SWEEP_INTERVAL_SEC, TimeUnit.SECONDS);
   }
 
   public void onConnect(String socketId, WsContext ctx) {
@@ -57,6 +76,7 @@ public final class RoomControlWsService {
     c.userId = gid == null ? 0L : gid.userId;
     c.loginUsername = gid == null ? "" : safe(gid.loginUsername);
     c.displayName = c.loginUsername.isEmpty() ? "Player" : c.loginUsername;
+    c.lastSeenAtMs = System.currentTimeMillis();
     clients.put(socketId, c);
     if (WS_VERBOSE_LOG) {
       System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
@@ -67,6 +87,7 @@ public final class RoomControlWsService {
   public void onClose(String socketId) {
     Client c = clients.remove(socketId);
     if (c == null) return;
+    clearSessionBinding(c, socketId);
     if (WS_VERBOSE_LOG) {
       System.err.println("[room-ws] close sid=" + socketId + " room=" + c.roomId + " seat=" + c.seatIdx);
     }
@@ -96,6 +117,7 @@ public final class RoomControlWsService {
   public void onTextMessage(String socketId, String raw) {
     Client c = clients.get(socketId);
     if (c == null) return;
+    c.lastSeenAtMs = System.currentTimeMillis();
     try {
       JsonObject msg = JsonParser.parseString(raw).getAsJsonObject();
       String type = msg.has("type") ? safe(msg.get("type").getAsString()) : "";
@@ -123,6 +145,10 @@ public final class RoomControlWsService {
     }
   }
 
+  public void close() {
+    janitor.shutdownNow();
+  }
+
   private void handleJoinRoom(Client c, JsonObject payload) {
     if (c.userId <= 0) {
       emitAuthState(c, null);
@@ -139,10 +165,19 @@ public final class RoomControlWsService {
     c.clientId = safe(payload.has("clientId") ? payload.get("clientId").getAsString() : c.clientId);
     c.reconnectToken = safe(payload.has("reconnectToken") ? payload.get("reconnectToken").getAsString() : c.reconnectToken);
     c.sessionId = safe(payload.has("sessionId") ? payload.get("sessionId").getAsString() : c.sessionId);
+    long now = System.currentTimeMillis();
+    if (!allowJoinAttempt(c, roomId, now)) {
+      if (WS_VERBOSE_LOG) {
+        System.err.println("[room-ws] join throttle sid=" + c.socketId + " room=" + roomId + " userId=" + c.userId);
+      }
+      sendEvent(c, "error_msg", mapOf("msg", "Too many join attempts. Please wait 1 second and retry."));
+      return;
+    }
+    c.lastSeenAtMs = now;
+    bindExclusiveSession(c, roomId);
 
     Room room = rooms.computeIfAbsent(roomId, Room::new);
     synchronized (room) {
-      long now = System.currentTimeMillis();
       pruneExpiredDisconnectedSeats(room, now);
       if (c.roomId != null && !c.roomId.isEmpty() && !roomId.equals(c.roomId)) {
         Room prev = rooms.get(c.roomId);
@@ -509,6 +544,8 @@ public final class RoomControlWsService {
       out.add("payload", gson.toJsonTree(payload));
       c.ctx.send(out.toString());
     } catch (Exception ignored) {
+      // Some network failures do not trigger onClose immediately; detach proactively.
+      forceDetachSocket(c.socketId, "send failed");
     }
   }
 
@@ -1412,6 +1449,124 @@ public final class RoomControlWsService {
     normalizeHostOwnership(room);
   }
 
+  private void sweepRoomsSafely() {
+    try {
+      sweepRooms();
+    } catch (Exception e) {
+      System.err.println("[room-ws] janitor error: " + e.getMessage());
+    }
+  }
+
+  private void sweepRooms() {
+    long now = System.currentTimeMillis();
+    for (Map.Entry<String, Room> en : rooms.entrySet()) {
+      Room room = en.getValue();
+      if (room == null) continue;
+      synchronized (room) {
+        pruneExpiredDisconnectedSeats(room, now);
+        if (room.socketIds.isEmpty() && !hasRecoverableDisconnectedSeat(room, now)) {
+          rooms.remove(en.getKey(), room);
+        }
+      }
+    }
+    sweepOrphanClients(now);
+  }
+
+  private boolean allowJoinAttempt(Client c, String roomId, long now) {
+    if (c == null) return false;
+    if (roomId.equals(c.lastJoinRoomId) && now - c.lastJoinAcceptedAtMs < JOIN_DEBOUNCE_MS) {
+      return false;
+    }
+    long cutoff = now - JOIN_FLAP_WINDOW_MS;
+    while (!c.joinHitAtMs.isEmpty() && c.joinHitAtMs.peekFirst() < cutoff) {
+      c.joinHitAtMs.pollFirst();
+    }
+    if (c.joinHitAtMs.size() >= JOIN_FLAP_MAX_HITS) {
+      return false;
+    }
+    c.joinHitAtMs.addLast(now);
+    c.lastJoinAcceptedAtMs = now;
+    c.lastJoinRoomId = roomId;
+    return true;
+  }
+
+  private void bindExclusiveSession(Client c, String roomId) {
+    if (c == null || c.userId <= 0) return;
+    String sessionKey = sessionKey(c.userId, c.clientId, c.sessionId, roomId);
+    if (sessionKey.isEmpty()) return;
+    String oldSid = activeSocketBySession.put(sessionKey, c.socketId);
+    c.sessionBindingKey = sessionKey;
+    if (oldSid == null || oldSid.equals(c.socketId)) return;
+    forceDetachSocket(oldSid, "superseded session");
+  }
+
+  private void clearSessionBinding(Client c, String socketId) {
+    if (c == null) return;
+    String key = nullToEmpty(c.sessionBindingKey);
+    if (!key.isEmpty()) {
+      activeSocketBySession.remove(key, socketId);
+      c.sessionBindingKey = "";
+    }
+  }
+
+  private static String sessionKey(long userId, String clientId, String sessionId, String roomId) {
+    if (userId <= 0) return "";
+    String cid = nullToEmpty(clientId).trim();
+    String sid = nullToEmpty(sessionId).trim();
+    String rid = nullToEmpty(roomId).trim().toUpperCase();
+    if (cid.isEmpty() || sid.isEmpty() || rid.isEmpty()) return "";
+    return userId + "|" + cid + "|" + sid + "|" + rid;
+  }
+
+  private void forceDetachSocket(String socketId, String reason) {
+    Client stale = clients.remove(socketId);
+    if (stale == null) return;
+    clearSessionBinding(stale, socketId);
+    try {
+      sendEvent(stale, "error_msg", mapOf("msg", "Session moved to a newer connection (" + reason + ")."));
+    } catch (Exception ignored) {
+    }
+    if (stale.roomId == null || stale.roomId.isEmpty()) return;
+    Room room = rooms.get(stale.roomId);
+    if (room == null) return;
+    synchronized (room) {
+      long now = System.currentTimeMillis();
+      room.socketIds.remove(socketId);
+      for (int i = 0; i < MAX_SEATS; i++) {
+        Seat s = room.seats.get(i);
+        if (s != null && "player".equals(s.type) && socketId.equals(s.socketId)) {
+          s.socketId = "";
+          s.disconnectedAt = now;
+        }
+      }
+      pruneExpiredDisconnectedSeats(room, now);
+      normalizeHostOwnership(room);
+      if (room.socketIds.isEmpty() && !hasRecoverableDisconnectedSeat(room, now)) {
+        rooms.remove(room.roomId);
+      } else {
+        broadcastRoomState(room);
+      }
+    }
+  }
+
+  private void sweepOrphanClients(long now) {
+    for (Map.Entry<String, Client> en : clients.entrySet()) {
+      String sid = en.getKey();
+      Client c = en.getValue();
+      if (c == null) continue;
+      boolean detached = c.roomId == null || c.roomId.isEmpty();
+      if (!detached) {
+        Room room = rooms.get(c.roomId);
+        detached = room == null || !room.socketIds.contains(sid);
+      }
+      if (!detached) continue;
+      if (now - c.lastSeenAtMs < ORPHAN_CLIENT_TTL_MS) continue;
+      if (clients.remove(sid, c)) {
+        clearSessionBinding(c, sid);
+      }
+    }
+  }
+
   private void snapshotBankroll(Room room, int seatIdx, Seat seat) {
     if (room == null || seat == null || seat.userId <= 0) return;
     PlayerState p = room.players.get(seatIdx);
@@ -1462,6 +1617,11 @@ public final class RoomControlWsService {
     int seatIdx = -1;
     String reconnectToken = "";
     String sessionId = "";
+    String sessionBindingKey = "";
+    String lastJoinRoomId = "";
+    long lastJoinAcceptedAtMs = 0L;
+    long lastSeenAtMs = 0L;
+    final Deque<Long> joinHitAtMs = new ArrayDeque<>();
   }
 
   private static final class Seat {

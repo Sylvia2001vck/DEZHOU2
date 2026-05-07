@@ -158,6 +158,7 @@ public final class GatewayMain {
                   if (workerRef != null) {
                     workerRef.shutdown();
                   }
+                  roomControl.close();
                   bridge.close();
                   NebulaRedis.shutdown();
                 }));

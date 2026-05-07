@@ -165,6 +165,7 @@ public final class MatchmakingService {
     clearPendingRedis(prof.get().userId(), redis);
     queueMeta.remove(prof.get().userId());
     statusCache.remove(prof.get().userId());
+    mmr.remove(prof.get().userId());
     json(ctx, 200, "{\"ok\":true,\"state\":\"idle\"}");
   }
 
@@ -250,6 +251,7 @@ public final class MatchmakingService {
               classicQueued.remove(e.userId);
               pending.remove(e.userId);
               statusCache.remove(e.userId);
+              mmr.remove(e.userId);
             }
             return stale;
           });
@@ -361,6 +363,7 @@ public final class MatchmakingService {
           for (Long uid : matchedUsers) {
             queueMeta.remove(uid);
             classicQueued.remove(uid);
+            mmr.remove(uid);
           }
           matchedAny = true;
           break;
@@ -391,6 +394,7 @@ public final class MatchmakingService {
           for (Long uid : matchedUsers) {
             pending.put(uid, new PendingMatch(roomCode, exp));
             classicQueued.remove(uid);
+            mmr.remove(uid);
           }
           notifyCppMatch(roomCode, matchedUsers, THRESHOLD, tier, queue.size());
           matchedAny = true;
