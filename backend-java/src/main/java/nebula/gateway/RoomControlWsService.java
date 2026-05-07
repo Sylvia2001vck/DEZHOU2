@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Base64;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -45,6 +46,7 @@ public final class RoomControlWsService {
   private static final long JOIN_FLAP_WINDOW_MS = 12_000L;
   private static final int JOIN_FLAP_MAX_HITS = 16;
   private static final long ORPHAN_CLIENT_TTL_MS = 10 * 60_000L;
+  private static final long STATS_LOG_INTERVAL_MS = 60_000L;
   private static final boolean WS_VERBOSE_LOG =
       "1".equals(System.getenv("NEBULA_WS_VERBOSE_LOG"))
           || "true".equalsIgnoreCase(System.getenv("NEBULA_WS_VERBOSE_LOG"));
@@ -55,6 +57,9 @@ public final class RoomControlWsService {
   private final Map<String, Client> clients = new ConcurrentHashMap<>();
   private final Map<String, Room> rooms = new ConcurrentHashMap<>();
   private final Map<String, String> activeSocketBySession = new ConcurrentHashMap<>();
+  private final AtomicLong forceDetachCount = new AtomicLong();
+  private final AtomicLong joinThrottleCount = new AtomicLong();
+  private volatile long lastStatsLogAtMs = 0L;
   private final ScheduledExecutorService janitor =
       Executors.newSingleThreadScheduledExecutor(
           r -> {
@@ -1486,11 +1491,13 @@ public final class RoomControlWsService {
       }
     }
     sweepOrphanClients(now);
+    maybeLogRuntimeStats(now);
   }
 
   private boolean allowJoinAttempt(Client c, String roomId, long now) {
     if (c == null) return false;
     if (roomId.equals(c.lastJoinRoomId) && now - c.lastJoinAcceptedAtMs < JOIN_DEBOUNCE_MS) {
+      joinThrottleCount.incrementAndGet();
       return false;
     }
     long cutoff = now - JOIN_FLAP_WINDOW_MS;
@@ -1498,6 +1505,7 @@ public final class RoomControlWsService {
       c.joinHitAtMs.pollFirst();
     }
     if (c.joinHitAtMs.size() >= JOIN_FLAP_MAX_HITS) {
+      joinThrottleCount.incrementAndGet();
       return false;
     }
     c.joinHitAtMs.addLast(now);
@@ -1537,6 +1545,7 @@ public final class RoomControlWsService {
   private void forceDetachSocket(String socketId, String reason) {
     Client stale = clients.remove(socketId);
     if (stale == null) return;
+    forceDetachCount.incrementAndGet();
     clearSessionBinding(stale, socketId);
     try {
       sendEvent(stale, "error_msg", mapOf("msg", "Session moved to a newer connection (" + reason + ")."));
@@ -1581,6 +1590,22 @@ public final class RoomControlWsService {
         clearSessionBinding(c, sid);
       }
     }
+  }
+
+  private void maybeLogRuntimeStats(long now) {
+    if (now - lastStatsLogAtMs < STATS_LOG_INTERVAL_MS) return;
+    lastStatsLogAtMs = now;
+    System.err.println(
+        "[room-ws] stats rooms="
+            + rooms.size()
+            + " clients="
+            + clients.size()
+            + " activeSessions="
+            + activeSocketBySession.size()
+            + " forceDetach="
+            + forceDetachCount.get()
+            + " throttleHits="
+            + joinThrottleCount.get());
   }
 
   private void snapshotBankroll(Room room, int seatIdx, Seat seat) {

@@ -1203,6 +1203,8 @@
         let joinedRoomOnce = false;
         let joiningMatchedRoom = false;
         let joinRoomTimeoutTimer = null;
+        let joinRoomSingleflight = null;
+        let joinRoomSingleflightRoom = '';
         let lastHandledMatchRoom = '';
         let lastHandledMatchAt = 0;
         let mySeatIdx = -1;
@@ -1211,7 +1213,7 @@
         const pendingPrivateHands = new Map(); // seatIdx -> hand
         const privateHandRenderToken = new Map(); // seatIdx -> number (cancel in-flight renders)
         let lastActionSeatIdx = null;
-        let rebuyPromptedForHand = null;
+        let bustWaitNoticeHand = null;
         let lastHandOverNum = null;
         let potChipFX = []; // transient chips currently settled/flying in the pot area
         let matchOverReceived = false;
@@ -2841,6 +2843,56 @@
             if (cancelBtn) cancelBtn.style.display = 'none';
         }
 
+        function delayMs(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function isLikelyRebuyMessage(msg) {
+            const text = String(msg || '').toLowerCase();
+            return text.includes('rebuy') || text.includes('top-up') || text.includes('top up') || text.includes('补码') || text.includes('补钱');
+        }
+
+        async function emitJoinRoomWithBackoff(room, reason = 'manual') {
+            const normalizedRoom = String(room || '').trim().toUpperCase();
+            if (!normalizedRoom) throw new Error('Room code is required.');
+            if (joinRoomSingleflight && joinRoomSingleflightRoom === normalizedRoom) {
+                return joinRoomSingleflight;
+            }
+            const maxAttempts = 4;
+            joinRoomSingleflightRoom = normalizedRoom;
+            joinRoomSingleflight = (async () => {
+                let waitMs = 250;
+                for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                    if (!pendingJoin && reason !== 'reconnect') {
+                        return false;
+                    }
+                    const rebound = await rebindSocketToCurrentSession(`join-${reason}-${attempt}`);
+                    if (rebound) {
+                        const connected = await waitSocketConnected(Math.min(4500 + (attempt - 1) * 800, 7000));
+                        if (connected && socket) {
+                            socket.emit('join_room', {
+                                roomId: normalizedRoom,
+                                name: currentUsername,
+                                clientId: CLIENT_ID,
+                                reconnectToken: getReconnectToken(normalizedRoom),
+                                sessionId: getSessionId(normalizedRoom)
+                            });
+                            return true;
+                        }
+                    }
+                    if (attempt < maxAttempts) {
+                        await delayMs(waitMs);
+                        waitMs = Math.min(waitMs * 2, 2200);
+                    }
+                }
+                return false;
+            })().finally(() => {
+                joinRoomSingleflight = null;
+                joinRoomSingleflightRoom = '';
+            });
+            return joinRoomSingleflight;
+        }
+
         async function handleMatchFound(roomCode, source = 'queue') {
             if (!roomCode) return;
             const room = String(roomCode || '').trim().toUpperCase();
@@ -2901,29 +2953,18 @@
             if (!ensureOnlineSession('join a room')) return;
             const room = String(roomCode || '').trim().toUpperCase();
             if (!room) throw new Error('Room code is required.');
-            const rebound = await rebindSocketToCurrentSession('enter-room');
-            if (!rebound) {
-                throw new Error('Session is syncing. Please retry in 1-2 seconds.');
-            }
             currentRoomId = room;
             updateRoomContextUI();
             pendingJoin = true;
             joinedRoomOnce = false;
             wireMultiplayer();
             if (IS_MULTIPLAYER && socket) {
-                const connected = await waitSocketConnected(4500);
-                if (!connected) {
+                const emitted = await emitJoinRoomWithBackoff(room, 'manual');
+                if (!emitted) {
                     pendingJoin = false;
                     joiningMatchedRoom = false;
-                    throw new Error('Realtime connection is not ready. Please retry quick match.');
+                    throw new Error('Realtime connection is not ready. Please retry shortly.');
                 }
-                socket.emit('join_room', {
-                    roomId: room,
-                    name: currentUsername,
-                    clientId: CLIENT_ID,
-                    reconnectToken: getReconnectToken(room),
-                    sessionId: getSessionId(room)
-                });
                 if (joinRoomTimeoutTimer) clearTimeout(joinRoomTimeoutTimer);
                 joinRoomTimeoutTimer = setTimeout(() => {
                     if (!pendingJoin || joinedRoomOnce) return;
@@ -3059,15 +3100,7 @@
                 // Hard-reset table visuals to avoid duplicate cards after reconnect.
                 try { resetMultiplayerVisualState(); } catch(_) {}
                 if (joinedRoomOnce && currentRoomId && currentUsername) {
-                    try {
-                        socket.emit('join_room', {
-                            roomId: currentRoomId,
-                            name: currentUsername,
-                            clientId: CLIENT_ID,
-                            reconnectToken: getReconnectToken(currentRoomId),
-                            sessionId: getSessionId(currentRoomId)
-                        });
-                    } catch (_) {}
+                    emitJoinRoomWithBackoff(currentRoomId, 'reconnect').catch(() => {});
                 }
                 voiceJoinIfPossible();
                 if (matchmakingPollActive) {
@@ -3229,7 +3262,12 @@
                         btn.innerText = isHost ? t('next_round') : t('waiting_host');
                     }
                 } catch (_) {}
-                alert(msg);
+                if (isLikelyRebuyMessage(msg)) {
+                    addToHistory(msg || 'Rebuy request ignored.');
+                    setLobbyFeedback(msg || 'Rebuy request ignored.', true);
+                } else {
+                    alert(msg);
+                }
                 // If we failed to join (e.g. room already started), return to lobby instead of getting stuck on seat screen.
                 if (pendingJoin && !joinedRoomOnce) {
                     pendingJoin = false;
@@ -3272,19 +3310,7 @@
             });
 
             // Rebuy flow (host approves)
-            socket.on('rebuy_requested', ({ seatIdx, name, amount }) => {
-                addToHistory(`${name || 'Player'} requests REBUY $${Number(amount || 0)} (Seat ${Number(seatIdx) + 1}).`);
-                if (!isHost) return;
-                const ok = confirm(`Rebuy request:\n\n${name || 'Player'} (Seat ${Number(seatIdx) + 1}) wants to rebuy $${Number(amount || 0)}.\n\nApprove?`);
-                if (ok) {
-                    try { socket.emit('rebuy_approve', { seatIdx, amount }); } catch(_) {}
-                } else {
-                    try { socket.emit('rebuy_deny', { seatIdx, amount }); } catch(_) {}
-                }
-            });
-            socket.on('rebuy_denied', ({ msg }) => {
-                alert(msg || 'Rebuy denied by host.');
-            });
+            // Rebuy protocol is fully disabled. Do not register rebuy_* handlers.
 
             // voice wiring
             socket.on('voice_peers', async ({ peers }) => {
@@ -3540,6 +3566,20 @@
                             const betAmt = Math.max(Number(gameState.minRaise || 50), Number(currentRaiseInput || 0) || 0);
                             btnRaise.innerText = `${t('btn_bet')} $${betAmt}`;
                         }
+                    }
+                    const handNo = Number(s.handNum || 0);
+                    if (meS && Number(meS.chips || 0) <= 0 && s.round !== 'HAND_OVER' && s.round !== 'WAITING') {
+                        if (bustWaitNoticeHand !== handNo) {
+                            bustWaitNoticeHand = handNo;
+                            addToHistory(UI_LANG === 'zh'
+                                ? '你已没有筹码，等待本局结束后再继续观战。'
+                                : 'You are out of chips. Please wait for this hand to finish.');
+                            setLobbyFeedback(UI_LANG === 'zh'
+                                ? '你已没有筹码，请等待本局结束。'
+                                : 'You are out of chips. Please wait for this hand to finish.', true);
+                        }
+                    } else if (meS && Number(meS.chips || 0) > 0) {
+                        bustWaitNoticeHand = null;
                     }
                 } catch (_) {}
 
@@ -7134,7 +7174,12 @@
                 }
             };
             document.getElementById('btn-rebuy').onclick = () => {
-                alert('Rebuy is disabled in this mode. If you are out of chips, please wait for settlement.');
+                addToHistory(UI_LANG === 'zh'
+                    ? '补码协议已关闭：请等待本局结束。'
+                    : 'Rebuy is disabled: please wait for this hand to finish.');
+                setLobbyFeedback(UI_LANG === 'zh'
+                    ? '补码已关闭，请等待本局结束。'
+                    : 'Rebuy is disabled. Please wait for this hand to finish.', true);
             };
             document.getElementById('btn-next').onclick = () => {
                 if (IS_MULTIPLAYER) {
