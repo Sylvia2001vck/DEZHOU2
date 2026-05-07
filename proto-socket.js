@@ -54,6 +54,8 @@ const INCOMING_TYPES = {
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
 const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
 const USE_TEXT_CONTROL_WS = true;
+const RECONNECT_WINDOW_MS = 60_000;
+const RECONNECT_MAX_ATTEMPTS = 12;
 
 function bytesFromJson(value) {
   const text = JSON.stringify(value ?? {});
@@ -350,6 +352,7 @@ export async function createProtoSocket(options = {}) {
   let reconnectTimer = null;
   let reconnectDelay = 500;
   let hasConnectedOnce = false;
+  const reconnectAttemptAt = [];
   const pendingFrames = [];
   const stickyFrames = new Map();
 
@@ -400,8 +403,16 @@ export async function createProtoSocket(options = {}) {
         reconnectTimer = null;
       }
       ws?.close();
+      ws = null;
       if (host[SOCKET_SINGLETON_KEY]?.api === api) {
         host[SOCKET_SINGLETON_KEY] = null;
+      }
+    },
+    stopAutoReconnect() {
+      closedManually = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
     }
   };
@@ -419,6 +430,14 @@ export async function createProtoSocket(options = {}) {
   };
 
   const connect = () => {
+    if (closedManually) return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
 
@@ -471,8 +490,22 @@ export async function createProtoSocket(options = {}) {
       api.connected = false;
       dispatch("disconnect");
       if (!closedManually) {
-        reconnectTimer = setTimeout(connect, reconnectDelay);
-        reconnectDelay = Math.min(reconnectDelay * 2, 4000);
+        const now = Date.now();
+        while (reconnectAttemptAt.length && now - reconnectAttemptAt[0] > RECONNECT_WINDOW_MS) {
+          reconnectAttemptAt.shift();
+        }
+        reconnectAttemptAt.push(now);
+        if (reconnectAttemptAt.length > RECONNECT_MAX_ATTEMPTS) {
+          console.warn(
+            `[proto-socket] reconnect circuit opened: ${reconnectAttemptAt.length} attempts in ${RECONNECT_WINDOW_MS}ms`
+          );
+          closedManually = true;
+          return;
+        }
+        if (!reconnectTimer) {
+          reconnectTimer = setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 4000);
+        }
       }
     };
 

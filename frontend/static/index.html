@@ -1205,6 +1205,7 @@
         let joinRoomTimeoutTimer = null;
         let joinRoomSingleflight = null;
         let joinRoomSingleflightRoom = '';
+        let pendingReconnectJoin = false;
         let lastHandledMatchRoom = '';
         let lastHandledMatchAt = 0;
         let mySeatIdx = -1;
@@ -2852,6 +2853,11 @@
             return text.includes('rebuy') || text.includes('top-up') || text.includes('top up') || text.includes('补码') || text.includes('补钱');
         }
 
+        function isAuthRequiredMessage(msg) {
+            const text = String(msg || '').toLowerCase();
+            return text.includes('please log in before joining a room') || text.includes('login required') || text.includes('请先登录');
+        }
+
         async function emitJoinRoomWithBackoff(room, reason = 'manual') {
             const normalizedRoom = String(room || '').trim().toUpperCase();
             if (!normalizedRoom) throw new Error('Room code is required.');
@@ -3099,9 +3105,7 @@
                 try { voiceLeaveAndCleanup(false); } catch(_) {}
                 // Hard-reset table visuals to avoid duplicate cards after reconnect.
                 try { resetMultiplayerVisualState(); } catch(_) {}
-                if (joinedRoomOnce && currentRoomId && currentUsername) {
-                    emitJoinRoomWithBackoff(currentRoomId, 'reconnect').catch(() => {});
-                }
+                pendingReconnectJoin = !!(joinedRoomOnce && currentRoomId && currentUsername);
                 voiceJoinIfPossible();
                 if (matchmakingPollActive) {
                     // WS recovered -> suspend fallback HTTP polling pressure.
@@ -3121,10 +3125,26 @@
                 if (authenticated && profile) {
                     applyAuthenticatedLobby(profile);
                     loadLobbyOverview().catch(() => {});
+                    if (pendingReconnectJoin && currentRoomId) {
+                        pendingReconnectJoin = false;
+                        emitJoinRoomWithBackoff(currentRoomId, 'reconnect-auth')
+                            .catch(err => setLobbyFeedback(err?.message || 'Failed to rejoin room after reconnect.', true));
+                    }
+                } else if (pendingReconnectJoin) {
+                    // Stop reconnect->join loops when auth is invalid/expired.
+                    pendingReconnectJoin = false;
+                    pendingJoin = false;
+                    joiningMatchedRoom = false;
+                    joinedRoomOnce = false;
+                    try { socket?.stopAutoReconnect?.(); } catch (_) {}
+                    try { socket?.disconnect?.(); } catch (_) {}
+                    setLobbyMode('login');
+                    setLobbyFeedback('Session expired. Please log in again.', true);
                 }
             });
             socket.on('disconnect', () => {
                 wsAuthenticatedUserId = 0;
+                pendingReconnectJoin = !!(joinedRoomOnce && currentRoomId);
                 try { voiceLeaveAndCleanup(false); } catch(_) {}
                 setVoiceStatus('Voice: Disconnected');
                 if (matchmakingPollActive) {
@@ -3262,7 +3282,17 @@
                         btn.innerText = isHost ? t('next_round') : t('waiting_host');
                     }
                 } catch (_) {}
-                if (isLikelyRebuyMessage(msg)) {
+                if (isAuthRequiredMessage(msg)) {
+                    pendingReconnectJoin = false;
+                    pendingJoin = false;
+                    joiningMatchedRoom = false;
+                    joinedRoomOnce = false;
+                    try { socket?.stopAutoReconnect?.(); } catch (_) {}
+                    try { socket?.disconnect?.(); } catch (_) {}
+                    setLobbyMode('login');
+                    setLobbyFeedback('Session required. Please log in and retry.', true);
+                    stopMatchmakingPolling();
+                } else if (isLikelyRebuyMessage(msg)) {
                     addToHistory(msg || 'Rebuy request ignored.');
                     setLobbyFeedback(msg || 'Rebuy request ignored.', true);
                 } else {
