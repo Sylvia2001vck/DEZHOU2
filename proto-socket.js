@@ -56,6 +56,25 @@ const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
 const USE_TEXT_CONTROL_WS = true;
 const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
+const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+function debugWsLog(hypothesisId, location, message, data = {}) {
+  // #region agent log
+  fetch("http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "bb2dd5" },
+    body: JSON.stringify({
+      sessionId: "bb2dd5",
+      runId: DEBUG_RUN_ID,
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+}
 
 function bytesFromJson(value) {
   const text = JSON.stringify(value ?? {});
@@ -323,6 +342,13 @@ export async function createProtoSocket(options = {}) {
   // Keep one websocket per page runtime to avoid connection leaks.
   const host = typeof window !== "undefined" ? window : globalThis;
   const existing = host[SOCKET_SINGLETON_KEY];
+  // #region agent log
+  debugWsLog("H1", "proto-socket.js:createProtoSocket", "create called", {
+    hasExistingApi: !!existing?.api,
+    sameWsUrl: existing?.wsUrl === wsUrl,
+    sameProtoUrl: existing?.protoUrl === protoUrl
+  });
+  // #endregion
   if (existing?.api && existing.wsUrl === wsUrl && existing.protoUrl === protoUrl) {
     return existing.api;
   }
@@ -436,8 +462,20 @@ export async function createProtoSocket(options = {}) {
       reconnectTimer = null;
     }
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      // #region agent log
+      debugWsLog("H1", "proto-socket.js:connect", "connect skipped existing live ws", {
+        readyState: ws.readyState
+      });
+      // #endregion
       return;
     }
+    // #region agent log
+    debugWsLog("H1", "proto-socket.js:connect", "creating new websocket", {
+      closedManually,
+      reconnectDelay,
+      hadWsBefore: !!ws
+    });
+    // #endregion
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
 
@@ -445,6 +483,12 @@ export async function createProtoSocket(options = {}) {
       const isReconnect = hasConnectedOnce;
       hasConnectedOnce = true;
       api.connected = true;
+      // #region agent log
+      debugWsLog("H3", "proto-socket.js:onopen", "ws opened", {
+        isReconnect,
+        reconnectDelay
+      });
+      // #endregion
       dispatch("connect");
       reconnectDelay = 500;
       while (pendingFrames.length && ws?.readyState === WebSocket.OPEN) {
@@ -486,8 +530,17 @@ export async function createProtoSocket(options = {}) {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (evt) => {
       api.connected = false;
+      // #region agent log
+      debugWsLog("H2", "proto-socket.js:onclose", "ws closed", {
+        closedManually,
+        reconnectDelay,
+        code: Number(evt?.code || 0),
+        reason: evt?.reason || "",
+        wasClean: !!evt?.wasClean
+      });
+      // #endregion
       dispatch("disconnect");
       if (!closedManually) {
         const now = Date.now();

@@ -1206,6 +1206,7 @@
         let joinRoomSingleflight = null;
         let joinRoomSingleflightRoom = '';
         let pendingReconnectJoin = false;
+        const DEBUG_RUN_ID = `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         let lastHandledMatchRoom = '';
         let lastHandledMatchAt = 0;
         let mySeatIdx = -1;
@@ -2331,9 +2332,22 @@
             for (let i = 0; i <= retries; i++) {
                 try {
                     const data = await apiGet('/api/auth/me');
+                    // #region agent log
+                    debugClientLog('H5', 'index.html:syncAuthFromServer', 'auth me response', {
+                        attempt: i,
+                        ok: !!data?.ok,
+                        hasUser: !!data?.user
+                    });
+                    // #endregion
                     if (data?.ok && data?.user) return data.user;
                 } catch (e) {
                     lastErr = e;
+                    // #region agent log
+                    debugClientLog('H5', 'index.html:syncAuthFromServer', 'auth me failed', {
+                        attempt: i,
+                        error: e?.message || String(e)
+                    });
+                    // #endregion
                 }
                 if (i < retries) {
                     // Cookies/session propagation can be slightly delayed on some browsers.
@@ -2393,6 +2407,16 @@
             if (!IS_MULTIPLAYER) return true;
             if (rebindSocketPromise) return rebindSocketPromise;
             const uid = Number(currentAuthUser?.userId || 0);
+            // #region agent log
+            debugClientLog('H4', 'index.html:rebindSocketToCurrentSession', 'rebind enter', {
+                reason,
+                uid,
+                hasSocket: !!socket,
+                socketConnected: !!socket?.connected,
+                socketBoundAuthUserId,
+                wsAuthenticatedUserId
+            });
+            // #endregion
             if (uid <= 0) return false;
             if (socket && socket.connected && socketBoundAuthUserId === uid && wsAuthenticatedUserId === uid) return true;
             rebindSocketPromise = (async () => {
@@ -2403,6 +2427,12 @@
                     }
                     if (!createProtoSocketFactory) return false;
                     for (let attempt = 0; attempt < 3; attempt++) {
+                        // #region agent log
+                        debugClientLog('H4', 'index.html:rebindSocketToCurrentSession', 'rebind attempt start', {
+                            reason,
+                            attempt
+                        });
+                        // #endregion
                         try { socket?.disconnect?.(); } catch (_) {}
                         wsAuthenticatedUserId = 0;
                         mpWired = false;
@@ -2848,6 +2878,12 @@
             return new Promise((resolve) => setTimeout(resolve, ms));
         }
 
+        function debugClientLog(hypothesisId, location, message, data = {}) {
+            // #region agent log
+            fetch('http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bb2dd5'},body:JSON.stringify({sessionId:'bb2dd5',runId:DEBUG_RUN_ID,hypothesisId,location,message,data,timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
+        }
+
         function isLikelyRebuyMessage(msg) {
             const text = String(msg || '').toLowerCase();
             return text.includes('rebuy') || text.includes('top-up') || text.includes('top up') || text.includes('补码') || text.includes('补钱');
@@ -3121,6 +3157,14 @@
             });
             socket.on('auth_state', ({ authenticated, profile }) => {
                 wsAuthenticatedUserId = authenticated ? Number(profile?.userId || 0) : 0;
+                // #region agent log
+                debugClientLog('H3', 'index.html:socket.on(auth_state)', 'auth_state received', {
+                    authenticated: !!authenticated,
+                    profileUid: Number(profile?.userId || 0),
+                    pendingReconnectJoin: !!pendingReconnectJoin,
+                    currentRoomId: currentRoomId || ''
+                });
+                // #endregion
                 if (authenticated) socketBoundAuthUserId = wsAuthenticatedUserId || socketBoundAuthUserId;
                 if (authenticated && profile) {
                     applyAuthenticatedLobby(profile);
