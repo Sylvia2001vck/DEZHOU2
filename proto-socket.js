@@ -57,6 +57,7 @@ const USE_TEXT_CONTROL_WS = true;
 const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
 
 // #region agent log
 try {
@@ -368,6 +369,9 @@ export async function createProtoSocket(options = {}) {
 
   // Keep one websocket per page runtime to avoid connection leaks.
   const host = typeof window !== "undefined" ? window : globalThis;
+  if (!host[WS_DEBUG_COUNTER_KEY]) {
+    host[WS_DEBUG_COUNTER_KEY] = { active: 0, totalOpened: 0 };
+  }
   const existing = host[SOCKET_SINGLETON_KEY];
   // #region agent log
   debugWsLog("H1", "proto-socket.js:createProtoSocket", "create called", {
@@ -510,10 +514,14 @@ export async function createProtoSocket(options = {}) {
       const isReconnect = hasConnectedOnce;
       hasConnectedOnce = true;
       api.connected = true;
+      host[WS_DEBUG_COUNTER_KEY].active += 1;
+      host[WS_DEBUG_COUNTER_KEY].totalOpened += 1;
       // #region agent log
       debugWsLog("H3", "proto-socket.js:onopen", "ws opened", {
         isReconnect,
-        reconnectDelay
+        reconnectDelay,
+        activeWs: host[WS_DEBUG_COUNTER_KEY].active,
+        totalOpened: host[WS_DEBUG_COUNTER_KEY].totalOpened
       });
       // #endregion
       dispatch("connect");
@@ -559,13 +567,16 @@ export async function createProtoSocket(options = {}) {
 
     ws.onclose = (evt) => {
       api.connected = false;
+      host[WS_DEBUG_COUNTER_KEY].active = Math.max(0, host[WS_DEBUG_COUNTER_KEY].active - 1);
       // #region agent log
       debugWsLog("H2", "proto-socket.js:onclose", "ws closed", {
         closedManually,
         reconnectDelay,
         code: Number(evt?.code || 0),
         reason: evt?.reason || "",
-        wasClean: !!evt?.wasClean
+        wasClean: !!evt?.wasClean,
+        activeWs: host[WS_DEBUG_COUNTER_KEY].active,
+        totalOpened: host[WS_DEBUG_COUNTER_KEY].totalOpened
       });
       // #endregion
       dispatch("disconnect");
