@@ -58,6 +58,30 @@ const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+// #region agent log
+try {
+  console.info("[proto-socket-debug] module loaded", {
+    DEBUG_RUN_ID,
+    USE_TEXT_CONTROL_WS,
+    RECONNECT_WINDOW_MS,
+    RECONNECT_MAX_ATTEMPTS
+  });
+  fetch("http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "bb2dd5" },
+    body: JSON.stringify({
+      sessionId: "bb2dd5",
+      runId: DEBUG_RUN_ID,
+      hypothesisId: "H0",
+      location: "proto-socket.js:module",
+      message: "module loaded",
+      data: { USE_TEXT_CONTROL_WS, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+} catch (_) {}
+// #endregion
+
 function debugWsLog(hypothesisId, location, message, data = {}) {
   // #region agent log
   fetch("http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947", {

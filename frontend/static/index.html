@@ -1118,6 +1118,12 @@
         };
         
         const BUILD_TAG = `build-${new Date().toISOString()}`;
+        // #region agent log
+        try {
+            console.info('[ui-debug] index bootstrap loaded', { BUILD_TAG });
+            fetch('http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bb2dd5'},body:JSON.stringify({sessionId:'bb2dd5',runId:`boot-${Date.now()}`,hypothesisId:'H0',location:'index.html:bootstrap',message:'index bootstrap loaded',data:{BUILD_TAG},timestamp:Date.now()})}).catch(()=>{});
+        } catch (_) {}
+        // #endregion
         const urlParams = new URLSearchParams(location.search);
         try {
             localStorage.removeItem('nebula_prefer_offline');
@@ -1137,12 +1143,9 @@
                     buildTag: BUILD_TAG
                 });
                 // #endregion
-                socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
+                // Delay socket creation until auth is confirmed to avoid unauthenticated reconnect storms.
                 // #region agent log
-                debugClientLog('H1', 'index.html:bootstrap-import', 'created socket from factory', {
-                    hasSocket: !!socket,
-                    connected: !!socket?.connected
-                });
+                debugClientLog('H1', 'index.html:bootstrap-import', 'deferred socket creation until auth success', {});
                 // #endregion
             } catch (e) {
                 console.warn('[bootstrap] multiplayer init failed; fallback to offline mode', e);
@@ -2359,6 +2362,11 @@
                         error: e?.message || String(e)
                     });
                     // #endregion
+                    const msg = String(e?.message || e || '');
+                    if (msg.includes('401') || /unauthorized/i.test(msg)) {
+                        // Unauthorized is terminal for this cycle; do not retry-loop.
+                        break;
+                    }
                 }
                 if (i < retries) {
                     // Cookies/session propagation can be slightly delayed on some browsers.
@@ -3127,6 +3135,12 @@
 
         function wireMultiplayer() {
             if(!IS_MULTIPLAYER) return;
+            if (!socket) {
+                // #region agent log
+                debugClientLog('H1', 'index.html:wireMultiplayer', 'skip wiring because socket is null', {});
+                // #endregion
+                return;
+            }
             if (mpWired) return;
             mpWired = true;
 
