@@ -56,6 +56,7 @@ const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
 const USE_TEXT_CONTROL_WS = true;
 const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
 
@@ -407,11 +408,31 @@ export async function createProtoSocket(options = {}) {
   let ws = null;
   let closedManually = false;
   let reconnectTimer = null;
+  let heartbeatTimer = null;
   let reconnectDelay = 5000;
   let hasConnectedOnce = false;
   const reconnectAttemptAt = [];
   const pendingFrames = [];
   const stickyFrames = new Map();
+
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const startHeartbeat = () => {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      try {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (USE_TEXT_CONTROL_WS) {
+          ws.send(JSON.stringify({ type: "control_event", eventName: "ping", payload: {} }));
+        }
+      } catch (_) {}
+    }, HEARTBEAT_INTERVAL_MS);
+  };
 
   const api = {
     id: "",
@@ -459,6 +480,7 @@ export async function createProtoSocket(options = {}) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      stopHeartbeat();
       ws?.close();
       ws = null;
       if (host[SOCKET_SINGLETON_KEY]?.api === api) {
@@ -471,6 +493,7 @@ export async function createProtoSocket(options = {}) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      stopHeartbeat();
     }
   };
 
@@ -526,6 +549,7 @@ export async function createProtoSocket(options = {}) {
       // #endregion
       dispatch("connect");
       reconnectDelay = 5000;
+      startHeartbeat();
       while (pendingFrames.length && ws?.readyState === WebSocket.OPEN) {
         ws.send(pendingFrames.shift());
       }
@@ -580,6 +604,7 @@ export async function createProtoSocket(options = {}) {
       });
       // #endregion
       dispatch("disconnect");
+      stopHeartbeat();
       if (!closedManually) {
         const now = Date.now();
         while (reconnectAttemptAt.length && now - reconnectAttemptAt[0] > RECONNECT_WINDOW_MS) {

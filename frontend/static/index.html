@@ -2039,7 +2039,8 @@
             micOn: false,
             localStream: null,
             peers: new Map(), // peerSocketId -> { pc, audioEl }
-            audioContainer: null
+            audioContainer: null,
+            autoJoinBlocked: false
         };
 
         function setVoiceStatus(text) {
@@ -2168,6 +2169,7 @@
 
         async function voiceJoinIfPossible() {
             if (!IS_MULTIPLAYER || !socket) return;
+            if (voiceState.autoJoinBlocked) return;
             if (voiceState.connected) return;
             if (!(Number.isInteger(mySeatIdx) && mySeatIdx >= 0)) return; // must be seated
             try {
@@ -2186,6 +2188,9 @@
                     setVoiceStatus('Voice: No microphone detected');
                 } else {
                     setVoiceStatus('Voice: Mic unavailable');
+                }
+                if (name === 'NotSupportedError' || /not supported/i.test(String(e?.message || ''))) {
+                    voiceState.autoJoinBlocked = true;
                 }
                 console.warn('[voice] join failed', e);
                 if (!window.__voicePermHintShown) {
