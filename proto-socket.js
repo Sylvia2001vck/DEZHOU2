@@ -73,6 +73,9 @@ function debugWsLog(hypothesisId, location, message, data = {}) {
       timestamp: Date.now()
     })
   }).catch(() => {});
+  try {
+    console.debug(`[proto-socket-debug] ${location} ${message}`, { hypothesisId, ...data });
+  } catch (_) {}
   // #endregion
 }
 

@@ -1132,7 +1132,18 @@
             try {
                 const { createProtoSocket } = await import(`./proto-socket.js?v=${encodeURIComponent(BUILD_TAG)}`);
                 createProtoSocketFactory = createProtoSocket;
+                // #region agent log
+                debugClientLog('H1', 'index.html:bootstrap-import', 'imported proto-socket factory', {
+                    buildTag: BUILD_TAG
+                });
+                // #endregion
                 socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
+                // #region agent log
+                debugClientLog('H1', 'index.html:bootstrap-import', 'created socket from factory', {
+                    hasSocket: !!socket,
+                    connected: !!socket?.connected
+                });
+                // #endregion
             } catch (e) {
                 console.warn('[bootstrap] multiplayer init failed; fallback to offline mode', e);
                 IS_MULTIPLAYER = false;
@@ -2436,6 +2447,12 @@
                         try { socket?.disconnect?.(); } catch (_) {}
                         wsAuthenticatedUserId = 0;
                         mpWired = false;
+                        // #region agent log
+                        debugClientLog('H4', 'index.html:rebindSocketToCurrentSession', 'creating fresh socket in rebind', {
+                            reason,
+                            attempt
+                        });
+                        // #endregion
                         socket = await createProtoSocketFactory({ protoUrl: '/proto/poker.proto' });
                         wireMultiplayer();
                         const connected = await waitSocketConnected(4500);
@@ -2881,6 +2898,7 @@
         function debugClientLog(hypothesisId, location, message, data = {}) {
             // #region agent log
             fetch('http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bb2dd5'},body:JSON.stringify({sessionId:'bb2dd5',runId:DEBUG_RUN_ID,hypothesisId,location,message,data,timestamp:Date.now()})}).catch(()=>{});
+            try { console.debug(`[ui-debug] ${location} ${message}`, { hypothesisId, ...data }); } catch (_) {}
             // #endregion
         }
 
