@@ -99,6 +99,26 @@ docker compose exec gateway curl -sv http://host.docker.internal:3101/ 2>&1 | he
 #   - /opt/nebula/ifcan.mp3:/app/frontend/static/assets/ifcan.mp3:ro
 ```
 
+## 网关镜像里的前端（打不进镜像就会「线上没变」）
+
+`Dockerfile.gateway` 会把下面路径拷进 **`/app/frontend/static`**（或作为单一来源再被网关同步）——**除此以外的前端改动不会进网关容器**：
+
+| 仓库路径 | 说明 |
+|---------|------|
+| `frontend/static/index.html` | 入口 HTML；**不是**仓库根目录的 `index.html` |
+| `frontend/src/**` | 模块图里 `./frontend/src/...`（如 `SyncManager.js`） |
+| 根目录 `proto-socket.js` | → 镜像内 `/app/proto-socket.js`，启动时再同步到 `frontend/static/proto-socket.js` |
+| `backend-cpp/proto/poker.proto` | 浏览器请求的 `/proto/poker.proto` |
+
+**容易踩坑：**
+
+1. **两个 `index.html`**：仓库里还有根目录 **`/index.html`**，与 **`frontend/static/index.html` 已是不同版本** 时不应混淆。网关 / CI 构建镜像时**只打包后者**。若你只改了根目录那份，发到线上会「像没部署」——要么改 **`frontend/static/index.html`**，要么先跑 **`scripts/cloud/sync-frontend-static.sh`** 再提交（脚本会把根目录页同步到 static，使用前请确认哪一份才是你希望保留的正本）。
+2. **`assets/ifcan.mp3`**：镜像里只有空目录占位；不进仓库或未挂载时背景音乐 URL 可能 404，见上文 BGM 挂载。
+3. **CDN 资源**：`three`、`gsap`、`protobuf.min.js` 走公网 CDN，不归 Docker 镜像管。
+4. **C++ 房间逻辑**：改 `backend-cpp/` 后要重建 **`room-worker`** 镜像，不是只拉 gateway。
+
+GitHub Actions 在构建镜像 **前不会自动执行** `sync-frontend-static.sh`；以 **`frontend/static/` 里已提交内容** 为准。
+
 ## 从仓库根目录调用（可选）
 
 ```bash
