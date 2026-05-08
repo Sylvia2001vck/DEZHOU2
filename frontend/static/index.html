@@ -2365,6 +2365,11 @@
                     const msg = String(e?.message || e || '');
                     if (msg.includes('401') || /unauthorized/i.test(msg)) {
                         // Unauthorized is terminal for this cycle; do not retry-loop.
+                        // #region agent log
+                        debugClientLog('H5', 'index.html:syncAuthFromServer', 'auth me unauthorized terminal break', {
+                            attempt: i
+                        });
+                        // #endregion
                         break;
                     }
                 }
@@ -3069,7 +3074,7 @@
                 return;
             }
             try {
-                const user = await syncAuthFromServer({ retries: 2, allowDowngrade: true });
+                const user = await syncAuthFromServer({ retries: 0, allowDowngrade: true });
                 if (user) {
                     applyAuthenticatedLobby(user, 'Signed in and ready.');
                     await rebindSocketToCurrentSession('bootstrap');
@@ -7033,22 +7038,13 @@
                             const emitTakeSeat = () => {
                                 try { socket.emit('take_seat', seatPayload); } catch (_) {}
                             };
-                            const seatConfirmed = () => {
-                                const seat = lastRoomState?.seats?.[i];
-                                return !!(seat && seat.socketId && socket?.id && seat.socketId === socket.id);
-                            };
                             emitTakeSeat();
-                            // Keep lightweight retries for jitter, avoid fixed burst spam.
-                            setTimeout(() => {
-                                if (attemptNonce !== takeSeatAttemptNonce) return;
-                                if (seatConfirmed()) return;
-                                emitTakeSeat();
-                            }, 350);
-                            setTimeout(() => {
-                                if (attemptNonce !== takeSeatAttemptNonce) return;
-                                if (seatConfirmed()) return;
-                                emitTakeSeat();
-                            }, 900);
+                            // #region agent log
+                            debugClientLog('H2', 'index.html:take_seat', 'single take_seat emit', {
+                                seatIdx: i,
+                                attemptNonce
+                            });
+                            // #endregion
                             mySeatIdx = i;
                             gameState.myPlayerIdx = i;
                             try { window.__updateDecorPanel?.(); } catch (_) {}

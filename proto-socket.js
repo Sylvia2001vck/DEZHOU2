@@ -403,7 +403,7 @@ export async function createProtoSocket(options = {}) {
   let ws = null;
   let closedManually = false;
   let reconnectTimer = null;
-  let reconnectDelay = 500;
+  let reconnectDelay = 5000;
   let hasConnectedOnce = false;
   const reconnectAttemptAt = [];
   const pendingFrames = [];
@@ -517,7 +517,7 @@ export async function createProtoSocket(options = {}) {
       });
       // #endregion
       dispatch("connect");
-      reconnectDelay = 500;
+      reconnectDelay = 5000;
       while (pendingFrames.length && ws?.readyState === WebSocket.OPEN) {
         ws.send(pendingFrames.shift());
       }
@@ -584,7 +584,7 @@ export async function createProtoSocket(options = {}) {
         }
         if (!reconnectTimer) {
           reconnectTimer = setTimeout(connect, reconnectDelay);
-          reconnectDelay = Math.min(reconnectDelay * 2, 4000);
+          reconnectDelay = Math.min(reconnectDelay * 2, 12000);
         }
       }
     };
