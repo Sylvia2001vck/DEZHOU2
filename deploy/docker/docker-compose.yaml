@@ -1,54 +1,16 @@
-# 腾讯云 CVM：在主机上安装 Docker + Compose V2 后
+# 默认：仅 Java 网关（无 C++ room-worker）。健康检查 /healthz、/readyz 由网关进程直接响应。
+# MySQL / Redis：在 .env 里填内网地址。
+#
 #   cd deploy/docker && cp env.example .env && nano .env
-#   docker compose build && docker compose up -d
+#   docker compose up -d --build
 #
-# MySQL / Redis：容器内用 host.docker.internal 访问宿主机上的服务（勿用 127.0.0.1）。
-#
-# C++ 使用 host 网络在宿主机上监听 3101，避免 compose 内嵌 DNS 不解析容器名（UnknownHostException）。
-# 网关通过 host.docker.internal:3101 连 C++（已配 extra_hosts: host-gateway）。
-# 若仍失败，可把网关的 NEBULA_ROOM_WORKER_HOST 改成宿主机内网 IP（如 172.19.0.5），与 `ip -4 route` 里默认网卡一致。
-# 安全组请勿对公网放行 3101。宿主机端口用 GATEWAY_PUBLISH_PORT（默认 8080，与常见安全组一致）；若与宿主机 java -jar 冲突再改成 8088 等。
-# 勿 export NEBULA_ROOM_WORKER_HOST=127.0.0.1（在网关容器内 127.0.0.1 是自己）。
+# 若在宿主机上仍需 C++ worker，请另起进程或自行加回 compose 服务，并取消设置 NEBULA_ROOM_WORKER_DISABLED。
 
 networks:
   nebula:
     driver: bridge
 
 services:
-  room-worker:
-    container_name: nebula-room-worker
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile.room-worker
-      args:
-        ROOM_WORKER_BUILD_JOBS: "${ROOM_WORKER_BUILD_JOBS:-1}"
-    image: nebula-room-worker:latest
-    restart: unless-stopped
-    cpus: "0.60"
-    mem_limit: "512m"
-    memswap_limit: "512m"
-    networks:
-      - nebula
-    env_file:
-      - .env
-    environment:
-      NEBULA_REPO_ROOT: /app
-      NEBULA_ROOM_WORKER_BIND: "0.0.0.0"
-      NEBULA_ROOM_WORKER_PORT: "3101"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    healthcheck:
-      test: ["CMD-SHELL", "ss -ltn | grep -q ':3101 ' || exit 1"]
-      interval: 20s
-      timeout: 2s
-      retries: 5
-      start_period: 30s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-
   gateway:
     build:
       context: ../..
@@ -60,9 +22,6 @@ services:
     memswap_limit: "768m"
     networks:
       - nebula
-    depends_on:
-      room-worker:
-        condition: service_healthy
     ports:
       - "${GATEWAY_PUBLISH_PORT:-8080}:8080"
     env_file:
@@ -70,8 +29,8 @@ services:
     environment:
       NEBULA_REPO_ROOT: /app
       PORT: "8080"
-      NEBULA_ROOM_WORKER_HOST: room-worker
-      NEBULA_ROOM_WORKER_PORT: "3101"
+      # 不向 C++ 建 TCP 桥；静态页 + /ws 房间控制仍为 Java
+      NEBULA_ROOM_WORKER_DISABLED: "1"
       JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:MaxMetaspaceSize=192m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -80,7 +39,7 @@ services:
       interval: 45s
       timeout: 3s
       retries: 5
-      start_period: 90s
+      start_period: 40s
     logging:
       driver: "json-file"
       options:

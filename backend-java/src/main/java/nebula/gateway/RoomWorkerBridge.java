@@ -26,6 +26,10 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class RoomWorkerBridge implements AutoCloseable {
 
+  private static final byte[] BODY_DISABLED_JSON =
+      "{\"ok\":false,\"message\":\"C++ room worker disabled (set NEBULA_ROOM_WORKER_DISABLED unset to enable)\"}"
+          .getBytes(StandardCharsets.UTF_8);
+
   public interface ClientSink {
     void sendBinary(byte[] data);
 
@@ -34,6 +38,7 @@ public final class RoomWorkerBridge implements AutoCloseable {
 
   private final String host;
   private final int port;
+  private final boolean disabled;
   private final AtomicBoolean running = new AtomicBoolean(true);
   private final AtomicLong rpcId = new AtomicLong(1);
   private final Map<Long, CompletableFuture<ApiProxyResult>> pendingRpc = new ConcurrentHashMap<>();
@@ -48,11 +53,25 @@ public final class RoomWorkerBridge implements AutoCloseable {
   private volatile DataOutputStream out;
 
   public RoomWorkerBridge(String host, int port) {
+    this(host, port, false);
+  }
+
+  public RoomWorkerBridge(String host, int port, boolean disabled) {
     this.host = Objects.requireNonNull(host);
     this.port = port;
+    this.disabled = disabled;
+  }
+
+  /** When true: no TCP to C++; {@link #apiProxy} returns 503; health checks use Java-local handlers in {@code GatewayMain}. */
+  public boolean roomWorkerDisabled() {
+    return disabled;
   }
 
   public void start() {
+    if (disabled) {
+      System.err.println("[bridge] room worker disabled (NEBULA_ROOM_WORKER_DISABLED)");
+      return;
+    }
     io.submit(this::runLoop);
   }
 
@@ -185,6 +204,9 @@ public final class RoomWorkerBridge implements AutoCloseable {
   public ApiProxyResult apiProxy(
       String method, String uri, byte[] body, String cookieHeader, long timeoutMs, GatewayIdentity gatewayIdentity)
       throws Exception {
+    if (disabled) {
+      return new ApiProxyResult(503, "application/json; charset=utf-8", BODY_DISABLED_JSON, "");
+    }
     long id = rpcId.getAndIncrement();
     CompletableFuture<ApiProxyResult> f = new CompletableFuture<>();
     pendingRpc.put(id, f);

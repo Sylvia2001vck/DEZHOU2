@@ -37,17 +37,6 @@ if [[ -f .env ]]; then
   fi
 fi
 
-WORKER_PORT=3101
-if [[ -f .env ]]; then
-  wline="$(grep -E '^NEBULA_ROOM_WORKER_PORT=' .env | tail -1 || true)"
-  if [[ -n "$wline" ]]; then
-    WORKER_PORT="${wline#*=}"
-    WORKER_PORT="${WORKER_PORT//\"/}"
-    WORKER_PORT="${WORKER_PORT//\'/}"
-    WORKER_PORT="${WORKER_PORT// /}"
-  fi
-fi
-
 #region agent log
 dbg_log "H1" "script_start" "{\"port\":\"${PORT}\",\"pwd\":\"$(pwd)\"}"
 #endregion
@@ -100,11 +89,6 @@ kill_on_port_by_comm java
 kill_on_port_by_comm docker-proxy
 port_snapshot "after_kill"
 
-echo "[nebula] killing stale room-worker listeners on :${WORKER_PORT}..."
-kill_on_port_by_comm nebula-poker-server "${WORKER_PORT}"
-sleep 1
-kill_on_port_by_comm nebula-poker-server "${WORKER_PORT}"
-
 for p in $(sudo ss -tlnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u); do
   [[ -z "$p" ]] && continue
   comm="$(ps -p "$p" -o comm= 2>/dev/null | tr -d ' ' || true)"
@@ -119,18 +103,14 @@ dbg_log "H3" "before_up_port_snapshot" "{\"ss\":\"$(sudo ss -tlnp 2>/dev/null | 
 #endregion
 
 # Build strategy:
-# - default: rebuild gateway only (fast, low-memory)
-# - set NEBULA_BUILD_SCOPE=all to rebuild room-worker + gateway
+# - default: rebuild gateway only (Compose stack is Java gateway only)
+# - set NEBULA_BUILD_SCOPE=all synonym for rebuilding gateway (legacy name)
 # - set NEBULA_BUILD_SCOPE=none to skip rebuild and reuse local images
 BUILD_SCOPE="${NEBULA_BUILD_SCOPE:-gateway}"
-if [[ "${NEBULA_BUILD_ROOM_WORKER:-0}" == "1" ]]; then
-  BUILD_SCOPE="all"
-fi
-
 case "$BUILD_SCOPE" in
   all)
-    echo "[nebula] build scope: all (room-worker + gateway)"
-    docker compose build room-worker gateway
+    echo "[nebula] build scope: all → gateway image only (no C++ in compose)"
+    docker compose build gateway
     ;;
   gateway)
     echo "[nebula] build scope: gateway (default, safer on low-memory CVM)"

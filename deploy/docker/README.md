@@ -1,24 +1,25 @@
 # Docker 部署（腾讯云 CVM）
 
-双进程：**gateway**（Java，桥接网络，**宿主机端口 = `GATEWAY_PUBLISH_PORT`，默认 8080 → 容器内 8080**）+ **room-worker**（C++，**host 网络**，在**宿主机**上监听 `3101`）。
+**默认单容器**：只有 **gateway**（Java），宿主端口 = **`.env` 里 `GATEWAY_PUBLISH_PORT`**（默认 **8080** → 容器内 8080）。  
+`/healthz`、`/readyz` 由 Java 应答，不要求 C++; 房间控制走 **`/ws`**（Java `RoomControlWsService`）。
+
+若需可选的 **legacy C++ room worker**：自行在宿主运行或把 `Dockerfile.room-worker` 等服务加回 `docker-compose.yaml`，并 **取消** 环境变量 **`NEBULA_ROOM_WORKER_DISABLED`**，配置 `NEBULA_ROOM_WORKER_HOST` / `PORT`。
 
 ## 前置
 
 - CVM 安装 **Docker** 与 **Compose V2**（`docker compose version`）。
-- **安全组**：对公网放行与 **`.env` 里 `GATEWAY_PUBLISH_PORT` 一致**的端口（默认 **8080** 即可，不必再开 8088）；**不要**放行 **3101**。
-- 腾讯云 **MySQL / Redis** 与 CVM 同 VPC，使用**内网地址**；`NEBULA_BRIDGE_SECRET` 与线上一致。
+- **安全组**：公网放行 **`GATEWAY_PUBLISH_PORT`**（默认 TCP **8080**）。
+- **MySQL / Redis** 与同 VPC **内网** 连通；填写 `MYSQL_*`、`REDIS_*` 与 **`NEBULA_BRIDGE_SECRET`**。
 
 ## 配置
 
 ```bash
 cd deploy/docker
 cp env.example .env
-nano .env   # 填 REDIS_HOST、MYSQL_*、NEBULA_BRIDGE_SECRET 等
+nano .env   # REDIS_HOST、MYSQL_*、NEBULA_BRIDGE_SECRET 等
 ```
 
-- MySQL / Redis 若在 **CVM 宿主机**（监听 `127.0.0.1`），容器内需使用 `host.docker.internal`（compose 已配 `extra_hosts`，Linux 需 Docker 20.10+）：
-  - `MYSQL_HOST=host.docker.internal`
-  - `REDIS_HOST=host.docker.internal`
+- MySQL / Redis 若在 **宿主机本地**（`127.0.0.1`），容器内需写 **`host.docker.internal`**（网关镜像带 curl，可把 `MYSQL_HOST`、`REDIS_HOST` 设为该主机名）。
 
 ## 构建与启动
 
@@ -34,27 +35,20 @@ docker compose logs -f
 
 ## 健康检查
 
-- **room-worker**：检查本机是否监听 `3101`（`ss`），就绪后才会启动 **gateway**（避免桥未连上）。
-- **gateway**：`curl /healthz`（会代理到 C++）；桥断时也会失败。
+- **gateway**：`curl -fsS http://127.0.0.1:${GATEWAY_PUBLISH_PORT:-8080}/healthz` 应返回 **ok**（纯 Java，不依赖 C++）。
 
-### `[bridge] disconnected: …` / `room worker offline`
+### （可选）启用 C++ 桥时的排错
 
-表示 **Java 连不上 C++**（不是 MySQL 的典型报错）。常见原因：
+若你**未**设置 `NEBULA_ROOM_WORKER_DISABLED` 且运行了 C++ worker，仍出现 **`[bridge] disconnected`** / **`room worker offline`**：
 
-1. **宿主机上 `export NEBULA_ROOM_WORKER_HOST=127.0.0.1`** 或在 `.env` 里写死错误主机  
-   容器里 `127.0.0.1` 是**容器自己**，连不到宿主机上的 C++。  
-   **处理**：`unset NEBULA_ROOM_WORKER_HOST`，从 `.env` 中删除 `NEBULA_ROOM_WORKER_*`，依靠 compose 里默认的 **`host.docker.internal`**。
-2. **`host.docker.internal` 在你这台机上不生效**（少见）  
-   把 `docker-compose.yaml` 里 gateway 的 `NEBULA_ROOM_WORKER_HOST` 改成**宿主机内网 IP**（例如 `172.19.0.5`，与 `ip -4 addr` / `ip route` 一致），保存后 `docker compose up -d`。
-3. **C++ 未监听**  
-   `docker compose logs room-worker --tail 80`，应能看到 `listening on 0.0.0.0:3101`。宿主机执行 `ss -tlnp | grep 3101` 应有 `nebula-poker-server`。
-4. 改了 compose 网络或排查卡死容器时，可 **`docker compose down` 再 `up`**；**日常发版不必每次都 `down`**（见下文「down 与端口」）。
+1. 确认 `NEBULA_ROOM_WORKER_HOST` 在**容器内**能解析到 worker（不要用 `127.0.0.1` 指「宿主机上的 C++」除非用 host 网络或正确的主机名）。
+2. Worker 进程在约定端口监听；桥密钥等与线上一致。
 
 ---
 
 ## `down` 再 `up` 和「只 kill 8080 再起」为啥表现不一样？
 
-**不是** `unset`、`grep`、和 `grep` 后面那行注释有冲突；`grep NEBULA_ROOM .env` 只是查看 `.env`，不会改端口。
+**不是** `grep`、`unset` 这类命令会自动改端口；下面说的是 **端口占用 / 重建容器** 的差异。
 
 真正常见情况是：
 
@@ -74,20 +68,10 @@ docker compose logs -f
 ```bash
 # 日常推荐（少 down）
 cd ~/DEZHOU2/deploy/docker
-unset NEBULA_ROOM_WORKER_HOST
 git pull
 docker compose up -d --build
 docker compose logs gateway --tail 40
 ```
-
-`grep`、`unset` 只在 **`.env` 里误写了 `NEBULA_ROOM_WORKER_*`** 时需要；没有误配可以不用每次跑。
-
-```bash
-docker compose exec gateway curl -sv http://host.docker.internal:3101/ 2>&1 | head -5
-# 可能返回 404，有 HTTP 回应即说明 TCP 通
-```
-
-在网关容器内：`getent hosts host.docker.internal` 应有一行 IP。
 
 ## 静态资源 BGM
 
@@ -115,7 +99,7 @@ docker compose exec gateway curl -sv http://host.docker.internal:3101/ 2>&1 | he
 1. **两个 `index.html`**：仓库里还有根目录 **`/index.html`**，与 **`frontend/static/index.html` 已是不同版本** 时不应混淆。网关 / CI 构建镜像时**只打包后者**。若你只改了根目录那份，发到线上会「像没部署」——要么改 **`frontend/static/index.html`**，要么先跑 **`scripts/cloud/sync-frontend-static.sh`** 再提交（脚本会把根目录页同步到 static，使用前请确认哪一份才是你希望保留的正本）。
 2. **`assets/ifcan.mp3`**：镜像里只有空目录占位；不进仓库或未挂载时背景音乐 URL 可能 404，见上文 BGM 挂载。
 3. **CDN 资源**：`three`、`gsap`、`protobuf.min.js` 走公网 CDN，不归 Docker 镜像管。
-4. **C++ 房间逻辑**：改 `backend-cpp/` 后要重建 **`room-worker`** 镜像，不是只拉 gateway。
+4. **（可选 Legacy）**：若再走 C++/单独 `backend-cpp/`，自行维护 worker 与 Compose。
 
 GitHub Actions 在构建镜像 **前不会自动执行** `sync-frontend-static.sh`；以 **`frontend/static/` 里已提交内容** 为准。
 
@@ -165,7 +149,7 @@ systemctl list-units --type=service | grep -iE 'nebula|java|gateway'
    - `CVM_HOST`：服务器 IP  
    - `CVM_USER`：`ubuntu`  
    - `CVM_SSH_KEY`：私钥 `gh_deploy` 的**完整内容**  
-4. 推送后 Workflow **Deploy to CVM** 会 SSH 执行 `git pull` + `docker compose build/up`。  
+4. 推送后 Workflow **Deploy to CVM** 会 SSH：`git pull` + `compose pull gateway` + 重建网关容器。  
    路径默认为 `/home/ubuntu/DEZHOU2/deploy/docker`，若不同请改 [`.github/workflows/deploy-cvm.yml`](../../.github/workflows/deploy-cvm.yml)。
 
 仅想手动更新时，在 CVM 上也可：

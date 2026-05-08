@@ -41,6 +41,7 @@ public final class GatewayMain {
     String cppHost = env("NEBULA_ROOM_WORKER_HOST", "127.0.0.1");
     int cppPort = Integer.parseInt(env("NEBULA_ROOM_WORKER_PORT", "3101"));
     int httpPort = Integer.parseInt(env("PORT", "3000"));
+    boolean bridgeDisabled = roomWorkerBridgeDisabled();
     Path repoRoot =
         Paths.get(env("NEBULA_REPO_ROOT", new File(".").getAbsolutePath())).toAbsolutePath().normalize();
     Path staticDir =
@@ -58,7 +59,7 @@ public final class GatewayMain {
       matchDao = new MatchMessageDao();
     }
 
-    RoomWorkerBridge bridge = new RoomWorkerBridge(cppHost, cppPort);
+    RoomWorkerBridge bridge = new RoomWorkerBridge(cppHost, cppPort, bridgeDisabled);
     bridge.start();
 
     AuthService auth = new AuthService(NebulaRedis.commands());
@@ -70,10 +71,13 @@ public final class GatewayMain {
 
     String bridgeSecret = env("NEBULA_BRIDGE_SECRET", "dev-bridge-secret-change-me");
     MatchWorker matchWorker = null;
-    if (matchDao != null && NebulaRedis.available()) {
+    if (matchDao != null && NebulaRedis.available() && !bridgeDisabled) {
       matchWorker = new MatchWorker(matchDao, bridge, auth, bridgeSecret);
       matchWorker.start();
       System.err.println("[gateway] MatchWorker started (Redis + MYSQL_HOST: async match pipeline).");
+    } else if (bridgeDisabled && matchDao != null && NebulaRedis.available()) {
+      System.err.println(
+          "[gateway] MatchWorker not started: C++ bridge disabled (async match needs room worker).");
     } else {
       System.err.println(
           "[gateway] MatchWorker not started (needs non-empty REDIS_HOST and MYSQL_HOST together). Sync match still OK.");
@@ -165,10 +169,20 @@ public final class GatewayMain {
                   NebulaRedis.shutdown();
                 }));
     app.start(httpPort);
-    System.err.println("[gateway] listening on 0.0.0.0:" + httpPort + " → C++ " + cppHost + ":" + cppPort);
+    if (bridgeDisabled) {
+      System.err.println("[gateway] listening on 0.0.0.0:" + httpPort + " (C++ room worker disabled)");
+    } else {
+      System.err.println("[gateway] listening on 0.0.0.0:" + httpPort + " -> C++ " + cppHost + ":" + cppPort);
+    }
   }
 
   private static void proxyApi(Context ctx, RoomWorkerBridge bridge, AuthService auth) throws Exception {
+    String pathOnly = ctx.path();
+    if (bridge.roomWorkerDisabled() && ("/healthz".equals(pathOnly) || "/readyz".equals(pathOnly))) {
+      ctx.status(200).contentType("text/plain; charset=utf-8").result("ok");
+      return;
+    }
+
     String uri = ctx.path();
     String qs = ctx.queryString();
     if (qs != null && !qs.isEmpty()) uri = uri + "?" + qs;
@@ -198,6 +212,14 @@ public final class GatewayMain {
   private static String env(String k, String dflt) {
     String v = System.getenv(k);
     return v == null || v.isEmpty() ? dflt : v;
+  }
+
+  /** When set to 1/true/yes, no TCP bridge to C++; /healthz and /readyz are served by Java only. */
+  private static boolean roomWorkerBridgeDisabled() {
+    String v = System.getenv("NEBULA_ROOM_WORKER_DISABLED");
+    if (v == null || v.isEmpty()) return false;
+    String s = v.trim().toLowerCase();
+    return s.equals("1") || s.equals("true") || s.equals("yes");
   }
 
   /** Single source at {@code repoRoot/proto-socket.js} → served from static dir each boot (fixes stale bundles). */

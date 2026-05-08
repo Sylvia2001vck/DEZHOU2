@@ -21,6 +21,13 @@ public final class BridgeHealthService {
       ctx.status(404).result("Not Found");
       return;
     }
+    if (bridge.roomWorkerDisabled()) {
+      json(
+          ctx,
+          200,
+          "{\"ok\":true,\"disabled\":true,\"message\":\"C++ room worker disabled (NEBULA_ROOM_WORKER_DISABLED)\"}");
+      return;
+    }
     try {
       ApiProxyResult r = bridge.apiProxy("GET", "/readyz", new byte[0], "", 5000, null);
       boolean ok = r.getStatus() >= 200 && r.getStatus() < 300;
