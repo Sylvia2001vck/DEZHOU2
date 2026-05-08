@@ -1,3 +1,4 @@
+/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-lines-547-606-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
 /**
  * Binary WebSocket client: `nebula.poker.Envelope` encode/decode + event dispatch.
  * No Three.js here — keep protocol separate from view (see `frontend/src/utils/SyncManager.js`, `docs/three-smooth.md`).
@@ -59,25 +60,34 @@ const RECONNECT_MAX_ATTEMPTS = 12;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
+/** Expected DevTools lines for this checkout: WebSocket ctor ~547, ws.onclose ~606 */
+const PROTO_SOCKET_EXPECT_LINES = "connect-newWS~547-onclose~606";
 
 // #region agent log
 try {
-  console.info("[proto-socket-debug] module loaded", {
+  console.warn("[proto-socket-debug] module loaded", {
+    PROTO_SOCKET_EXPECT_LINES,
     DEBUG_RUN_ID,
     USE_TEXT_CONTROL_WS,
     RECONNECT_WINDOW_MS,
     RECONNECT_MAX_ATTEMPTS
   });
-  fetch("http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947", {
+  fetch("http://127.0.0.1:7941/ingest/87662800-8e2b-4add-b7e7-8e943ec06fef", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "bb2dd5" },
     body: JSON.stringify({
       sessionId: "bb2dd5",
       runId: DEBUG_RUN_ID,
-      hypothesisId: "H0",
+      hypothesisId: "H-STAMP",
       location: "proto-socket.js:module",
       message: "module loaded",
-      data: { USE_TEXT_CONTROL_WS, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS },
+      data: {
+        PROTO_SOCKET_EXPECT_LINES,
+        stamp: "bb2dd5-lines-547-606-20260509",
+        USE_TEXT_CONTROL_WS,
+        RECONNECT_WINDOW_MS,
+        RECONNECT_MAX_ATTEMPTS
+      },
       timestamp: Date.now()
     })
   }).catch(() => {});
@@ -86,7 +96,7 @@ try {
 
 function debugWsLog(hypothesisId, location, message, data = {}) {
   // #region agent log
-  fetch("http://127.0.0.1:7344/ingest/cfa499ff-137d-458a-83e0-be08e7282947", {
+  fetch("http://127.0.0.1:7941/ingest/87662800-8e2b-4add-b7e7-8e943ec06fef", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "bb2dd5" },
     body: JSON.stringify({
@@ -95,7 +105,11 @@ function debugWsLog(hypothesisId, location, message, data = {}) {
       hypothesisId,
       location,
       message,
-      data,
+      data: {
+        PROTO_SOCKET_EXPECT_LINES,
+        stamp: "bb2dd5-lines-547-606-20260509",
+        ...data
+      },
       timestamp: Date.now()
     })
   }).catch(() => {});

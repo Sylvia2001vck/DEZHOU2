@@ -22,7 +22,8 @@ COPY --from=build /build/backend-java/target/nebula-gateway.jar /app/nebula-gate
 RUN mkdir -p /app/frontend/static/frontend/src /app/frontend/static/proto /app/frontend/static/assets
 COPY frontend/static/index.html /app/frontend/static/
 COPY frontend/src /app/frontend/static/frontend/src/
-COPY proto-socket.js /app/frontend/static/proto-socket.js
+# Canonical copy; GatewayMain syncs repoRoot/proto-socket.js → static on each boot
+COPY proto-socket.js /app/proto-socket.js
 COPY backend-cpp/proto/poker.proto /app/frontend/static/proto/poker.proto
 
 EXPOSE 8080

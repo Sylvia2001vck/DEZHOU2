@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Optional;
@@ -48,6 +49,7 @@ public final class GatewayMain {
             : Paths.get(env("NEBULA_STATIC_ROOT", "")).toAbsolutePath().normalize();
     Files.createDirectories(staticDir);
     String staticRoot = staticDir.toString();
+    syncProtoSocketJs(repoRoot, staticDir);
 
     NebulaRedis.init();
 
@@ -196,6 +198,107 @@ public final class GatewayMain {
   private static String env(String k, String dflt) {
     String v = System.getenv(k);
     return v == null || v.isEmpty() ? dflt : v;
+  }
+
+  /** Single source at {@code repoRoot/proto-socket.js} → served from static dir each boot (fixes stale bundles). */
+  private static void syncProtoSocketJs(Path repoRoot, Path staticDir) {
+    Path canonical = repoRoot.resolve("proto-socket.js").normalize();
+    Path served = staticDir.resolve("proto-socket.js").normalize();
+    try {
+      if (!Files.exists(canonical)) {
+        System.err.println(
+            "[gateway] proto-socket.js: canonical file missing at "
+                + canonical
+                + " (upgrade image or rebuild; static may be stale)");
+        appendBb2dd5(repoRoot, "H-SYNC", "canonical_missing", canonical.toString());
+        return;
+      }
+      Files.createDirectories(staticDir);
+      Files.copy(canonical, served, StandardCopyOption.REPLACE_EXISTING);
+      long nb = Files.size(served);
+      String head =
+          Files.lines(served, StandardCharsets.UTF_8).findFirst().orElse("(empty)");
+      String headBrief = head.length() > 180 ? head.substring(0, 180) + "…" : head;
+      System.err.println(
+          "[gateway] proto-socket.js synced " + canonical + " → " + served + " (" + nb + " bytes)");
+      System.err.println("[gateway] proto-socket.js first line: " + headBrief);
+      appendBb2dd5Synced(repoRoot, served, canonical, nb, headBrief);
+    } catch (Exception e) {
+      System.err.println("[gateway] proto-socket.js sync failed: " + e.getMessage());
+      appendBb2dd5(repoRoot, "H-SYNC", "sync_failed", e.getClass().getSimpleName());
+    }
+  }
+
+  /** Best-effort NDJSON for Cursor debug ingest file when repoRoot is writable (bind-mounted dev). */
+  private static void appendBb2dd5Synced(Path repoRoot, Path served, Path canonical, long bytes, String headBrief) {
+    try {
+      long ts = System.currentTimeMillis();
+      String escHead = bb2Escape(headBrief);
+      String escCanon = bb2Escape(canonical.toString());
+      String escServed = bb2Escape(served.toString());
+      String line =
+          "{\"sessionId\":\"bb2dd5\",\"hypothesisId\":\"H-SYNC\",\"location\":\"GatewayMain.syncProtoSocketJs\","
+              + "\"message\":\"proto_socket_synced\",\"data\":{\"canonical\":\""
+              + escCanon
+              + "\",\"served\":\""
+              + escServed
+              + "\",\"bytes\":"
+              + bytes
+              + ",\"head\":\""
+              + escHead
+              + "\"},\"timestamp\":"
+              + ts
+              + "}\n";
+      Files.writeString(
+          repoRoot.resolve("debug-bb2dd5.log"),
+          line,
+          StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.APPEND);
+    } catch (Exception ignored) {
+    }
+  }
+
+  private static void appendBb2dd5(Path repoRoot, String hypothesisId, String message, String detail) {
+    try {
+      long ts = System.currentTimeMillis();
+      String esc = bb2Escape(detail);
+      String line =
+          "{\"sessionId\":\"bb2dd5\",\"hypothesisId\":\""
+              + hypothesisId
+              + "\",\"location\":\"GatewayMain\",\"message\":\""
+              + message
+              + "\",\"data\":{\"detail\":\""
+              + esc
+              + "\"},\"timestamp\":"
+              + ts
+              + "}\n";
+      Files.writeString(
+          repoRoot.resolve("debug-bb2dd5.log"),
+          line,
+          StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.APPEND);
+    } catch (Exception ignored) {
+    }
+  }
+
+  private static String bb2Escape(String s) {
+    if (s == null) return "";
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '\\') {
+        sb.append("\\\\");
+      } else if (c == '"') {
+        sb.append("\\\"");
+      } else if (c < 32 && c != '\t') {
+        sb.append(' ');
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
   }
 
 }
