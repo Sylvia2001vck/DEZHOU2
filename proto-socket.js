@@ -1,4 +1,4 @@
-/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-heartbeat20s-jetty-ws-env-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
+/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-staleSockGuard-reconnect-dupefix-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
 /**
  * Binary WebSocket client: `nebula.poker.Envelope` encode/decode + event dispatch.
  * No Three.js here — keep protocol separate from view (see `frontend/src/utils/SyncManager.js`, `docs/three-smooth.md`).
@@ -62,7 +62,7 @@ const HEARTBEAT_INTERVAL_MS = 20_000;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
 /** Expected DevTools lines for this checkout: WebSocket ctor ~547, ws.onclose ~606 */
-const PROTO_SOCKET_EXPECT_LINES = "connect-newWS~547-onclose~606";
+const PROTO_SOCKET_EXPECT_LINES = "connect-newWS~527-onclose~645-staleSockGuard";
 
 // #region agent log
 try {
@@ -530,28 +530,33 @@ export async function createProtoSocket(options = {}) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      // #region agent log
-      debugWsLog("H1", "proto-socket.js:connect", "connect skipped existing live ws", {
-        readyState: ws.readyState
-      });
-      // #endregion
-      return;
-    }
-    // #region agent log
-    debugWsLog("H1", "proto-socket.js:connect", "creating new websocket", {
-      closedManually,
-      reconnectDelay,
-      hadWsBefore: !!ws
-    });
-    // #endregion
-    ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
 
-    ws.onopen = () => {
+    /**
+     * Abandon queued socket that's not usable (OPEN/CONNECTING). Avoid overlapping `new WebSocket`
+     * while CLOSING or without closing first — duplicates show as multiple HTTP 101 in DevTools.
+     */
+    const abandonIfStaleLive = () => {
+      const cur = ws;
+      if (!cur) return;
+      const st = cur.readyState;
+      if (st !== WebSocket.OPEN && st !== WebSocket.CONNECTING) return;
+      try {
+        cur.close();
+      } catch (_) {}
+    };
+
+    abandonIfStaleLive();
+
+    const sock = new WebSocket(wsUrl);
+    ws = sock;
+    sock.binaryType = "arraybuffer";
+
+    sock.onopen = () => {
+      if (ws !== sock) return;
       const isReconnect = hasConnectedOnce;
       hasConnectedOnce = true;
       api.connected = true;
+      sock.__nebulaCountedOpen = true;
       host[WS_DEBUG_COUNTER_KEY].active += 1;
       host[WS_DEBUG_COUNTER_KEY].totalOpened += 1;
       // #region agent log
@@ -577,7 +582,8 @@ export async function createProtoSocket(options = {}) {
       }
     };
 
-    ws.onmessage = (event) => {
+    sock.onmessage = (event) => {
+      if (ws !== sock) return;
       try {
         if (typeof event.data === "string") {
           const msg = JSON.parse(event.data);
@@ -604,11 +610,19 @@ export async function createProtoSocket(options = {}) {
       }
     };
 
-    ws.onclose = (evt) => {
-      api.connected = false;
-      host[WS_DEBUG_COUNTER_KEY].active = Math.max(0, host[WS_DEBUG_COUNTER_KEY].active - 1);
+    sock.onclose = (evt) => {
+      let counted = false;
+      if (sock.__nebulaCountedOpen) {
+        sock.__nebulaCountedOpen = false;
+        counted = true;
+        host[WS_DEBUG_COUNTER_KEY].active = Math.max(0, host[WS_DEBUG_COUNTER_KEY].active - 1);
+      }
+
+      const isCurrent = ws === sock;
       // #region agent log
       debugWsLog("H2", "proto-socket.js:onclose", "ws closed", {
+        stale: !isCurrent,
+        counted,
         closedManually,
         reconnectDelay,
         code: Number(evt?.code || 0),
@@ -618,6 +632,11 @@ export async function createProtoSocket(options = {}) {
         totalOpened: host[WS_DEBUG_COUNTER_KEY].totalOpened
       });
       // #endregion
+
+      /** Stale callbacks after `ws` was replaced — do not touch api state or reschedule reconnect */
+      if (!isCurrent) return;
+
+      api.connected = false;
       dispatch("disconnect");
       stopHeartbeat();
       if (!closedManually) {
@@ -640,8 +659,10 @@ export async function createProtoSocket(options = {}) {
       }
     };
 
-    ws.onerror = () => {
-      ws?.close();
+    sock.onerror = () => {
+      try {
+        sock.close();
+      } catch (_) {}
     };
   };
 
