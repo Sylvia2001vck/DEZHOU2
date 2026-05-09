@@ -19,8 +19,9 @@ COPY --from=build /build/backend-java/target/nebula-gateway.jar /app/nebula-gate
 
 # 静态资源：Javalin 根目录 = $NEBULA_REPO_ROOT/frontend/static
 # index 中引用 ./frontend/src/...、./proto-socket.js、/proto/poker.proto
-RUN mkdir -p /app/frontend/static/frontend/src /app/frontend/static/proto /app/frontend/static/assets
+RUN mkdir -p /app/frontend/static/frontend/src /app/frontend/static/proto /app/frontend/static/assets /app/frontend/static/vendor
 COPY frontend/static/index.html /app/frontend/static/
+COPY frontend/static/vendor/ /app/frontend/static/vendor/
 COPY frontend/src /app/frontend/static/frontend/src/
 # Canonical copy; GatewayMain syncs repoRoot/proto-socket.js → static on each boot
 COPY proto-socket.js /app/proto-socket.js
