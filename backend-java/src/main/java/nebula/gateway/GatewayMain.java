@@ -1,6 +1,7 @@
 package nebula.gateway;
 
 import io.javalin.Javalin;
+import io.javalin.config.JavalinConfig;
 import io.javalin.http.Context;
 import io.javalin.http.Handler;
 import io.javalin.http.staticfiles.Location;
@@ -11,8 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.Arrays;
-import java.util.Optional;
+import java.time.Duration;
 import java.util.UUID;
 
 /**
@@ -87,6 +87,7 @@ public final class GatewayMain {
         Javalin.create(
             config -> {
               config.showJavalinBanner = false;
+              applyJettyWsIdleTimeout(config);
               config.staticFiles.add(staticFiles -> {
                 staticFiles.hostedPath = "/";
                 staticFiles.directory = staticRoot;
@@ -212,6 +213,41 @@ public final class GatewayMain {
   private static String env(String k, String dflt) {
     String v = System.getenv(k);
     return v == null || v.isEmpty() ? dflt : v;
+  }
+
+  /**
+   * Jetty WS policy idle timeout for the servlet factory (default {@value #DEFAULT_JETTY_WS_IDLE_MS}). Must exceed
+   * proxy/CLB idle and heartbeat spacing; overrides Jetty defaults that could close tunnels too early behind CLB/nginx.
+   */
+  private static final long DEFAULT_JETTY_WS_IDLE_MS = 900_000L; // 15 min
+
+  private static void applyJettyWsIdleTimeout(JavalinConfig config) {
+    long idleMs = parseEnvUnsignedLong("NEBULA_JETTY_WS_IDLE_MS", DEFAULT_JETTY_WS_IDLE_MS);
+    try {
+      config.jetty.modifyWebSocketServletFactory(ws -> ws.setIdleTimeout(Duration.ofMillis(idleMs)));
+      System.err.println(
+          "[gateway] Jetty WebSocket policy idle timeout: "
+              + idleMs
+              + " ms (NEBULA_JETTY_WS_IDLE_MS; app heartbeats/proxy timeouts should remain below upstream idle).");
+    } catch (RuntimeException e) {
+      System.err.println("[gateway] Jetty WebSocket idle timeout config failed (continuing): " + e.getMessage());
+    }
+  }
+
+  private static long parseEnvUnsignedLong(String key, long defaultMs) {
+    String v = System.getenv(key);
+    if (v == null || v.isBlank()) return defaultMs;
+    try {
+      long n = Long.parseLong(v.trim());
+      if (n <= 0) {
+        System.err.println("[gateway] Invalid " + key + "=\"" + v + "\" (need > 0); using default " + defaultMs);
+        return defaultMs;
+      }
+      return n;
+    } catch (NumberFormatException e) {
+      System.err.println("[gateway] Invalid " + key + "=\"" + v + "\"; using default " + defaultMs);
+      return defaultMs;
+    }
   }
 
   /** When set to 1/true/yes, no TCP bridge to C++; /healthz and /readyz are served by Java only. */

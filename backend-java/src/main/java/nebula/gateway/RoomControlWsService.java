@@ -47,6 +47,9 @@ public final class RoomControlWsService {
   private static final int JOIN_FLAP_MAX_HITS = 16;
   private static final long ORPHAN_CLIENT_TTL_MS = 10 * 60_000L;
   private static final long STATS_LOG_INTERVAL_MS = 60_000L;
+  /** Disconnect when no inbound WS text for this long (app pings refresh lastSeenAtMs every ~20s normally). */
+  private static final long WS_IDLE_DISCONNECT_MS = parseWsIdleDisconnectMsEnv();
+  private static final AtomicLong idleDisconnectTotal = new AtomicLong();
   private static final boolean WS_VERBOSE_LOG =
       "1".equals(System.getenv("NEBULA_WS_VERBOSE_LOG"))
           || "true".equalsIgnoreCase(System.getenv("NEBULA_WS_VERBOSE_LOG"));
@@ -71,6 +74,12 @@ public final class RoomControlWsService {
   public RoomControlWsService(AuthService auth) {
     this.auth = auth;
     janitor.scheduleWithFixedDelay(this::sweepRoomsSafely, 15, ROOM_SWEEP_INTERVAL_SEC, TimeUnit.SECONDS);
+    if (WS_IDLE_DISCONNECT_MS > 0L) {
+      System.err.println(
+          "[room-ws] stale connection policy: inbound idle > "
+              + (WS_IDLE_DISCONNECT_MS / 1000L)
+              + "s triggers server closeSession (disable with NEBULA_WS_IDLE_DISCONNECT_MS=0)");
+    }
   }
 
   public void onConnect(String socketId, WsContext ctx) {
@@ -87,6 +96,7 @@ public final class RoomControlWsService {
       System.err.println("[room-ws] connect sid=" + socketId + " userId=" + c.userId);
     }
     emitAuthState(c, gid);
+    tryJettyWsAutoPing(ctx);
   }
 
   public void onClose(String socketId) {
@@ -133,6 +143,12 @@ public final class RoomControlWsService {
         System.err.println("[room-ws] recv sid=" + socketId + " event=" + eventName + " payload=" + payload);
       }
       switch (eventName) {
+        case "ping" -> {
+          /* lastSeen updated above; optionally ack lightweight pong for debugging */
+          if (WS_VERBOSE_LOG) {
+            System.err.println("[room-ws] ping sid=" + socketId + " latency probe ok");
+          }
+        }
         case "join_room" -> handleJoinRoom(c, payload);
         case "take_seat" -> handleTakeSeat(c, payload);
         case "toggle_ai" -> handleToggleAi(c, payload);
@@ -1491,7 +1507,70 @@ public final class RoomControlWsService {
       }
     }
     sweepOrphanClients(now);
+    sweepIdleStaleConnections(now);
     maybeLogRuntimeStats(now);
+  }
+
+  /** Close sessions with no inbound text for WS_IDLE_DISCONNECT_MS (zombie TCP / dead tabs). */
+  private void sweepIdleStaleConnections(long now) {
+    if (WS_IDLE_DISCONNECT_MS <= 0L) return;
+    java.util.ArrayList<Map.Entry<String, Client>> snapshot = new java.util.ArrayList<>(clients.entrySet());
+    for (Map.Entry<String, Client> en : snapshot) {
+      String sid = en.getKey();
+      Client c = en.getValue();
+      if (c == null || c.ctx == null) continue;
+      if (clients.get(sid) != c) continue;
+      long silent = now - c.lastSeenAtMs;
+      if (silent <= WS_IDLE_DISCONNECT_MS) continue;
+      try {
+        System.err.println(
+            "[room-ws] idle close sid="
+                + sid
+                + " silentMs="
+                + silent
+                + " (no inbound WS text)");
+        idleDisconnectTotal.incrementAndGet();
+        c.ctx.closeSession(4003, "server idle stale");
+      } catch (Exception ex) {
+        System.err.println("[room-ws] idle close failed sid=" + sid + " err=" + ex.getMessage());
+      }
+      // Prefer onClose for map/room cleanup; orphans eventually handled by orphan sweep / next heartbeat.
+    }
+  }
+
+  private static void tryJettyWsAutoPing(WsContext ctx) {
+    try {
+      long sec = parseLongEnv("NEBULA_WS_JETTY_PING_INTERVAL_SEC", 20L);
+      if (sec <= 0) return;
+      java.util.concurrent.TimeUnit tu = java.util.concurrent.TimeUnit.SECONDS;
+      ctx.enableAutomaticPings(sec, tu);
+      if (WS_VERBOSE_LOG) {
+        System.err.println("[room-ws] jetty websocket ping interval=" + sec + "s");
+      }
+    } catch (Throwable t) {
+      System.err.println("[room-ws] enableAutomaticPings skipped: " + t.getMessage());
+    }
+  }
+
+  private static long parseLongEnv(String key, long deflt) {
+    String v = System.getenv(key);
+    if (v == null || v.isBlank()) return deflt;
+    try {
+      return Long.parseLong(v.trim());
+    } catch (NumberFormatException e) {
+      return deflt;
+    }
+  }
+
+  private static long parseWsIdleDisconnectMsEnv() {
+    String v = System.getenv("NEBULA_WS_IDLE_DISCONNECT_MS");
+    if (v == null || v.isBlank()) return 180_000L; // 9× missed ~20s app pings ⇒ likely zombie
+    if ("0".equals(v.trim())) return 0L;
+    try {
+      return Long.parseLong(v.trim());
+    } catch (NumberFormatException e) {
+      return 180_000L;
+    }
   }
 
   private boolean allowJoinAttempt(Client c, String roomId, long now) {
@@ -1605,7 +1684,9 @@ public final class RoomControlWsService {
             + " forceDetach="
             + forceDetachCount.get()
             + " throttleHits="
-            + joinThrottleCount.get());
+            + joinThrottleCount.get()
+            + " idleServerClose="
+            + idleDisconnectTotal.get());
   }
 
   private void snapshotBankroll(Room room, int seatIdx, Seat seat) {

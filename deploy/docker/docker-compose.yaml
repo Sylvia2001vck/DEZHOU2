@@ -31,6 +31,10 @@ services:
       PORT: "8080"
       # 不向 C++ 建 TCP 桥；静态页 + /ws 房间控制仍为 Java
       NEBULA_ROOM_WORKER_DISABLED: "1"
+      # WebSocket/Jetty：云上默认拉满链路空闲阈值；同一目录 .env 可覆盖任一变量（Compose 插值）。
+      NEBULA_JETTY_WS_IDLE_MS: ${NEBULA_JETTY_WS_IDLE_MS:-900000}
+      NEBULA_WS_IDLE_DISCONNECT_MS: ${NEBULA_WS_IDLE_DISCONNECT_MS:-180000}
+      NEBULA_WS_JETTY_PING_INTERVAL_SEC: ${NEBULA_WS_JETTY_PING_INTERVAL_SEC:-20}
       JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:MaxMetaspaceSize=192m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
     extra_hosts:
       - "host.docker.internal:host-gateway"

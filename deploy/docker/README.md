@@ -20,6 +20,7 @@ nano .env   # REDIS_HOST、MYSQL_*、NEBULA_BRIDGE_SECRET 等
 ```
 
 - MySQL / Redis 若在 **宿主机本地**（`127.0.0.1`），容器内需写 **`host.docker.internal`**（网关镜像带 curl，可把 `MYSQL_HOST`、`REDIS_HOST` 设为该主机名）。
+- **WebSocket 空闲/心跳**：`docker-compose.yaml` 已对 `NEBULA_JETTY_WS_IDLE_MS` 等与 CLB/nginx 脱节场景设默认值，`.env` 里可覆盖。**（可选）腾讯云 CLS / 本地日志已够用**——CLS 在控制台配采集（如 LogListener 采 Docker 日志）；网关侧不配 CLS API 密钥亦常见。
 
 ## 构建与启动
 

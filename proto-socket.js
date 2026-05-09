@@ -1,4 +1,4 @@
-/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-lines-547-606-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
+/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-heartbeat20s-jetty-ws-env-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
 /**
  * Binary WebSocket client: `nebula.poker.Envelope` encode/decode + event dispatch.
  * No Three.js here — keep protocol separate from view (see `frontend/src/utils/SyncManager.js`, `docs/three-smooth.md`).
@@ -57,7 +57,8 @@ const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
 const USE_TEXT_CONTROL_WS = true;
 const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
-const HEARTBEAT_INTERVAL_MS = 10_000;
+/** Ping JSON control_frame interval; stay well below Nginx/CLB/Jetty idle (often ~30s) plus RTT slack. */
+const HEARTBEAT_INTERVAL_MS = 20_000;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
 /** Expected DevTools lines for this checkout: WebSocket ctor ~547, ws.onclose ~606 */
