@@ -1,4 +1,4 @@
-/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-staleSockGuard-reconnect-dupefix-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
+/*! NEBULA_PROTO_SOCKET_STAMP=bb2dd5-factory-lock-concurrent-await-20260509 — if DevTools stacks show ~422/~474, you are not running this file build. */
 /**
  * Binary WebSocket client: `nebula.poker.Envelope` encode/decode + event dispatch.
  * No Three.js here — keep protocol separate from view (see `frontend/src/utils/SyncManager.js`, `docs/three-smooth.md`).
@@ -54,6 +54,8 @@ const INCOMING_TYPES = {
 
 const STICKY_RECONNECT_EVENTS = ["join_room", "take_seat", "set_decor"];
 const SOCKET_SINGLETON_KEY = "__nebulaProtoSocketSingleton";
+/** Serialize concurrent `await createProtoSocket(...)` until singleton is installed (avoids parallel HTTP 101). */
+const SOCKET_FACTORY_LOCK_KEY = "__nebulaProtoSocketFactorySerial";
 const USE_TEXT_CONTROL_WS = true;
 const RECONNECT_WINDOW_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 12;
@@ -62,7 +64,7 @@ const HEARTBEAT_INTERVAL_MS = 20_000;
 const DEBUG_RUN_ID = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const WS_DEBUG_COUNTER_KEY = "__nebulaWsDebugCounter";
 /** Expected DevTools lines for this checkout: WebSocket ctor ~547, ws.onclose ~606 */
-const PROTO_SOCKET_EXPECT_LINES = "connect-newWS~527-onclose~645-staleSockGuard";
+const PROTO_SOCKET_EXPECT_LINES = "createProtoSocket-lock~380-staleSock~527-onclose~645";
 
 // #region agent log
 try {
@@ -388,7 +390,24 @@ export async function createProtoSocket(options = {}) {
   if (!host[WS_DEBUG_COUNTER_KEY]) {
     host[WS_DEBUG_COUNTER_KEY] = { active: 0, totalOpened: 0 };
   }
-  const existing = host[SOCKET_SINGLETON_KEY];
+
+  const guardPrev = host[SOCKET_FACTORY_LOCK_KEY] || Promise.resolve();
+  let releaseGuard = () => {};
+  host[SOCKET_FACTORY_LOCK_KEY] = guardPrev.then(
+    () => new Promise((resolve) => { releaseGuard = resolve; })
+  );
+  await guardPrev;
+
+  try {
+    if (
+      typeof location !== "undefined" &&
+      /(?:\?|&)neb_ws_trace=1(?:&|$)/.test(location.search)
+    ) {
+      console.warn("[nebula][ws-trace] createProtoSocket", { wsUrl, protoUrl });
+      console.trace("[nebula] createProtoSocket stack");
+    }
+
+    const existing = host[SOCKET_SINGLETON_KEY];
   // #region agent log
   debugWsLog("H1", "proto-socket.js:createProtoSocket", "create called", {
     hasExistingApi: !!existing?.api,
@@ -669,4 +688,9 @@ export async function createProtoSocket(options = {}) {
   connect();
   host[SOCKET_SINGLETON_KEY] = { api, wsUrl, protoUrl };
   return api;
+  } finally {
+    try {
+      releaseGuard();
+    } catch (_) {}
+  }
 }
